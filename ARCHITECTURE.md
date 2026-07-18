@@ -1,6 +1,6 @@
 # Werft — System Architecture
 
-**Status:** Groundwork specification, v1.1 (2026-07-18). This document is the buildable blueprint for Werft. It was produced by a multi-agent design process (7 parallel subsystem designs, each adversarially critiqued, then reconciled, then verified by 4 independent lenses), and revised to v1.1 after an additional independent external review whose findings — notably the oracle-mutability gap (§8.2/§13), the Docker-wait contradiction (§6.1), and the installation-token TTL bug (§6.6) — are incorporated below. The doctrine in [README.md](README.md) governs; where this document and the doctrine conflict, the doctrine wins and this document has a bug.
+**Status:** Groundwork specification, v1.2 (2026-07-18). This document is the buildable blueprint for Werft. It was produced by a multi-agent design process (7 parallel subsystem designs, each adversarially critiqued, then reconciled, then verified by 4 independent lenses); revised to v1.1 after a first independent external review (oracle-mutability gap §8.2/§13, Docker-wait contradiction §6.1, installation-token TTL bug §6.6); and revised to v1.2 after a second independent verification ([docs/lineage/architecture-verification.md](docs/lineage/architecture-verification.md), verdict "buildable with fixes", 5/5 doctrine PASS) whose two majors — stale footnote-² annotations on the `awaiting_ci/merging → failed` cells and a stale `docker wait` completion-authority phrase in §6.4 — are fixed below and locked in by `tests/architecture_spec.test.mjs`. The doctrine in [README.md](README.md) governs; where this document and the doctrine conflict, the doctrine wins and this document has a bug.
 
 **Scale target:** one operator (Ken), one dedicated Rocky Linux 9 VM, single-digit projects, tens of runs per day. Every component below justifies its operational cost to exactly one person. *Modular means enforced internal boundaries, not distributed systems.*
 
@@ -135,8 +135,8 @@ The five middle modules are mutually independent (may not import each other). No
                     ┌──────────────────────────────────────────────────┐
 queued ──► claimed ──► running ──► awaiting_ci ──► merging ──► merged ✓│
   ▲ ▲ │       │            │            │  ▲          │                │
-  │ │ │       │(lease/     │(attempt    │  └──────────┘ base moved ⁵   │
-  │ │ │       │ deadline)  │ ended)     │(ci red ³/⁴)  │(conflict ⁶)   │
+  │ │ │       │(lease¹,    │(attempt    │  └──────────┘ base moved ⁵   │
+  │ │ │       │ deadline²) │ ended)     │(ci red ³/⁴)  │(conflict ⁶)   │
   │ │ │       ▼            ▼            ▼              ▼               │
   │ │ └► parked ◄────── failed ────► parked        parked              │
   │ │      │ ▲            │  │                                         │
@@ -156,13 +156,13 @@ queued ──► claimed ──► running ──► awaiting_ci ──► mergi
 | queued | | ✓ | | | | ✓ᵃ | | ✓ᵇ | | ✓ |
 | claimed | ✓¹ | | ✓ | | | | ✓² | | | ✓ |
 | running | | | | ✓ | | | ✓ | | | ✓ |
-| awaiting_ci | ✓³ | | | | ✓ | | ✓² | ✓⁴ | | ✓ |
-| merging | | | | ✓⁵ | | | ✓² | ✓⁶ | ✓ | ✓ |
+| awaiting_ci | ✓³ | | | | ✓ | | ✓¹⁰ | ✓⁴ | | ✓ |
+| merging | | | | ✓⁵ | | | ✓¹⁰ | ✓⁶ | ✓ | ✓ |
 | blocked_quota | ✓ | | | | | | | | | ✓ |
 | failed | ✓⁷ | | | | | ✓ᵃ | | ✓⁸ | | ✓ |
 | parked | ✓⁹ | | | | | | | | | ✓ |
 
-¹ lease expired before container start; a `running` lease expiry (container vanished with no die event) uses the existing `running → failed` edge · ² hard-deadline sweep — bounds **agent execution only** (`claimed, running`); the deadline is set at each claim and cleared on every exit from those states, so CI queues, quota waits, and human inboxes are never force-failed. `awaiting_ci`/`merging` are governed by the separate `WERFT_CI_WAIT_TIMEOUT` (6 h) whose expiry parks via the existing ⁴/⁶ edges with reason `ci_timeout` — GitHub's latency never burns an agent retry · ³ CI red with retry budget left → fresh dispatch (red work never merges; see §1 step 5) · ⁴ CI red, budget spent · ⁵ base branch moved; branch re-updated, checks must re-run — **a rebased merge can never land without fresh green CI** · ⁶ merge conflict → human · ⁷ retry with backoff (`next_attempt_at`) · ⁸ chain-cycle budget exhausted (§5.3) · ⁹ human requeue · ᵃ every provider in the resolved chain is quota-exhausted — from `queued` at dispatch time (quota reservation happens **inside the claim transaction**, so a run is never `claimed` without quota in hand), or from `failed` after a mid-run exhaustion ends an attempt; wakes at `min(exhausted_until)` · ᵇ `PermanentError` at dispatch (invalid config, repo 404) parks without an attempt. Every other `PermanentError` parks via `failed → parked`.
+¹ lease expired before container start; a `running` lease expiry (container vanished with no die event) uses the existing `running → failed` edge · ² hard-deadline sweep — bounds **agent execution only** (`claimed, running`); the deadline is set at each claim and cleared on every exit from those states, so CI queues, quota waits, and human inboxes are never force-failed. `awaiting_ci`/`merging` are governed by the separate `WERFT_CI_WAIT_TIMEOUT` (6 h) whose expiry parks via the existing ⁴/⁶ edges with reason `ci_timeout` — GitHub's latency never burns an agent retry · ³ CI red with retry budget left → fresh dispatch (red work never merges; see §1 step 5) · ⁴ CI red, budget spent · ⁵ base branch moved; branch re-updated, checks must re-run — **a rebased merge can never land without fresh green CI** · ⁶ merge conflict → human · ⁷ retry with backoff (`next_attempt_at`) · ⁸ chain-cycle budget exhausted, or a `PermanentError` arriving via `failed` (no retry — §5.3) · ⁹ human requeue · ¹⁰ unrecoverable error observed **during** CI-wait/merge (PermanentError or infra failure: PR deleted out-of-band, repo gone, GitHub API contract violation) — **never** used for timeouts, which park via ⁴/⁶ with reason `ci_timeout` (second-external-review fix: these two cells wrongly carried ² in v1.1) · ᵃ every provider in the resolved chain is quota-exhausted — from `queued` at dispatch time (quota reservation happens **inside the claim transaction**, so a run is never `claimed` without quota in hand), or from `failed` after a mid-run exhaustion ends an attempt; wakes at `min(exhausted_until)` · ᵇ `PermanentError` at dispatch (invalid config, repo 404) parks without an attempt. Every other `PermanentError` parks via `failed → parked`.
 
 ### 4.3 Schema (authoritative tables; Alembic is the only DDL mechanism)
 
@@ -402,7 +402,7 @@ WerftError
 
 One `RetryPolicy` map (error class → budget, backoff) consulted in exactly one place in `orchestrator`. Handlers never contain inline `try/except-sleep-retry`. Every attempt writes its `run_attempts` row — the retry ledger *is* the outcome record (doctrine #4); no separate analytics table.
 
-**Attempt accounting — precise, because ambiguity here strands providers:** `run_attempts.attempt_no` is a monotonic per-dispatch counter. Provider fallthrough within the chain (`quota_exhausted`, `auth_failure`, `ProviderError`) does **not** consume the retry budget — the run simply steps to the next entry of `runs.provider_chain`. `runs.attempt_count` (vs `max_attempts`, default 3) counts **full chain cycles**: CI-red and agent-failure outcomes that exhaust or restart the chain. So the default 4-provider chain is always fully walkable — Ollama really is the overflow valve (doctrine #3) — and "budget exhausted" (§4.2 ⁸) always means "N genuine failed attempts", never "N providers were busy".
+**Attempt accounting — precise, because ambiguity here strands providers:** `run_attempts.attempt_no` is a monotonic per-dispatch counter. Provider fallthrough within the chain (`quota_exhausted`, `auth_failure`, `ProviderError`) does **not** consume the retry budget — the run simply steps to the next entry of `runs.provider_chain`. `runs.attempt_count` (vs `max_attempts`, default 3) counts **full chain cycles**: CI-red and agent-failure outcomes that exhaust or restart the chain. So the default 4-provider chain is always fully walkable — Ollama really is the overflow valve (doctrine #3) — and "budget exhausted" (§4.2 ⁸) always means "N genuine failed attempts", never "N providers were busy". **Fallthrough's legal path through the state machine is `running → failed → queued`** with `next_attempt_at = now()` (no backoff for a chain step) — there is deliberately no `running → claimed` shortcut; `failed` is a normal, momentary waypoint of healthy chain-stepping, the `run_attempts.outcome` value (`quota_exhausted`/`auth_failure`) marks it as a step rather than a defeat, and the dashboard renders it that way (second-external-review clarification, so implementers don't invent an illegal edge).
 
 ### 5.4 HTTP API (`/api/v1`, ~20 endpoints, deliberately complete)
 
@@ -467,7 +467,7 @@ Container hardening (applied on **every** create call; a unit test asserts the f
 | **exit code** | contract fulfillment: `0` ran-to-completion + valid result.json · `2` bad task.json · `3` clone failure · `4` push failure · `5` adapter crash | infra-failure classification; nonzero → excluded from provider statistics (the provider never got a fair shot) |
 | **result.json.status** | task outcome | routing outcome recording; `quota_exhausted` → chain fallthrough without penalizing stats |
 
-"The process finished" and "the task succeeded" are never one scalar — that conflation is exactly what v1's judgment gate exploited. The log file's `run_complete` line is **display-only**; completion authority is always `docker wait` + `result.json`.
+"The process finished" and "the task succeeded" are never one scalar — that conflation is exactly what v1's judgment gate exploited. The log file's `run_complete` line is **display-only**; completion authority is always the container's **`die` event (or reconciliation `inspect`) + the inspected exit code + `result.json`** (§6.1) — never a blocking `wait`, never log content. (The v1.1 text still said "`docker wait`" here after §6.1 had moved to events — the stale phrase the second external review caught as M2.)
 
 ### 6.5 Adapter runtime (Python 3.13, ~150 shared lines + 4 × ~100-line adapters)
 

@@ -26,8 +26,8 @@ const arch = load(ARCH);
 const readme = load(README);
 const verdict = load(VERDICT);
 
-test("ARCHITECTURE.md is the v1.1 groundwork blueprint", () => {
-  assert.match(arch, /Groundwork specification, v1\.1 \(2026-07-18\)/);
+test("ARCHITECTURE.md is the v1.2 groundwork blueprint", () => {
+  assert.match(arch, /Groundwork specification, v1\.2 \(2026-07-18\)/);
   assert.match(arch, /doctrine in \[README\.md\]/);
 });
 
@@ -185,25 +185,28 @@ test("footnote 2 prose routes CI timeout to park edges, not agent hard-deadline"
 });
 
 /**
- * Characterization trackers for open majors from architecture-verification.md.
- * These pass while the defect remains in the shipped doc; delete or invert when fixed.
+ * Regression locks for the two majors from architecture-verification.md,
+ * inverted from characterization trackers after the v1.2 fixes.
  */
-test("open major M2 characterization: §6.4 still names docker wait as completion authority", () => {
-  assert.match(
+test("M2 closed: §6.4 completion authority is the die-event/inspect mechanism, not docker wait", () => {
+  assert.doesNotMatch(
     arch,
     /completion authority is always `docker wait`/,
-    "M2 closed? Remove this tracker and keep the events/inspect completion rule only",
+    "M2 regressed: §6.4 names blocking docker wait as completion authority again",
   );
-  // Both halves of the contradiction must still be present for M2 to be open
+  assert.match(arch, /completion authority is always the container's \*\*`die` event/);
   assert.match(arch, /event-driven, never a per-run blocking call/);
 });
 
-test("open major M1 characterization: awaiting_ci and merging rows mark failed with footnote 2", () => {
+test("M1 closed: awaiting_ci/merging failed-cells carry footnote 10, and footnote 2 stays scoped", () => {
   const lines = arch.split(/\r?\n/);
   const awaiting = lines.find((l) => l.startsWith("| awaiting_ci |"));
   const merging = lines.find((l) => l.startsWith("| merging |"));
   assert.ok(awaiting, "awaiting_ci transition row missing");
   assert.ok(merging, "merging transition row missing");
-  assert.match(awaiting, /✓²|✓2/, `awaiting_ci row should show failed✓² (M1 open): ${awaiting}`);
-  assert.match(merging, /✓²|✓2/, `merging row should show failed✓² (M1 open): ${merging}`);
+  assert.doesNotMatch(awaiting, /✓²(?!⁰)/u, `M1 regressed — footnote ² back on awaiting_ci: ${awaiting}`);
+  assert.doesNotMatch(merging, /✓²(?!⁰)/u, `M1 regressed — footnote ² back on merging: ${merging}`);
+  assert.match(awaiting, /✓¹⁰/, `awaiting_ci → failed should carry footnote ¹⁰: ${awaiting}`);
+  assert.match(merging, /✓¹⁰/, `merging → failed should carry footnote ¹⁰: ${merging}`);
+  assert.match(arch, /¹⁰ unrecoverable error observed \*\*during\*\* CI-wait\/merge/);
 });

@@ -22,7 +22,7 @@ These five decisions came out of the v1 post-mortem and are load-bearing. Changi
 
 - **Manager service** — task queue, routing table, quota meter, dispatcher, promotion workflow. One engine, one language, one source of truth for run state (a run's status is a row; everything else derives from it).
 - **Runner containers** — one ephemeral Docker container per run: clone of the target repo + one provider CLI. Completion is a structured signal (exit code / result file), never prose-matching.
-- **CI oracle** — an existing runner (self-hosted Woodpecker/Gitea Actions, or GitHub Actions). Werft never implements verification; it only consumes green/red.
+- **CI oracle** — GitHub Actions on GitHub-hosted runners (keeps semi-untrusted, agent-authored execution off the Werft VM). Werft never implements verification; it only consumes green/red.
 - **Dashboard** — deliberately small. It observes the loop; it must never outgrow it.
 
 ## Deployment target
@@ -39,4 +39,4 @@ A **dedicated virtual machine** (Rocky Linux) running the full stack via Docker 
 
 ## Status
 
-**Groundwork specified.** The full system architecture — schema, state machine, runner contract, routing/quota, git topology, deployment — is in [ARCHITECTURE.md](ARCHITECTURE.md) (v1.0, adversarially verified). No implementation yet.
+**Groundwork specified.** The full system architecture — schema, state machine, runner contract, routing/quota, git topology, deployment — is in [ARCHITECTURE.md](ARCHITECTURE.md) (v1.2; verified by three independent adversarial passes, structurally locked by `tests/architecture_spec.test.mjs`). No implementation yet.
