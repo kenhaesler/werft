@@ -39,4 +39,4 @@ A **dedicated virtual machine** (Rocky Linux) running the full stack via Docker 
 
 ## Status
 
-**Design phase.** The architecture spec is being brainstormed; see `docs/superpowers/specs/` once written. No implementation yet.
+**Groundwork specified.** The full system architecture — schema, state machine, runner contract, routing/quota, git topology, deployment — is in [ARCHITECTURE.md](ARCHITECTURE.md) (v1.0, adversarially verified). No implementation yet.
