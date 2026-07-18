@@ -1,6 +1,6 @@
 # Werft — System Architecture
 
-**Status:** Groundwork specification, v1.0 (2026-07-18). This document is the buildable blueprint for Werft. It was produced by a multi-agent design process (7 parallel subsystem designs, each adversarially critiqued, then reconciled) and supersedes nothing — it is the first and canonical architecture document. The doctrine in [README.md](README.md) governs; where this document and the doctrine conflict, the doctrine wins and this document has a bug.
+**Status:** Groundwork specification, v1.1 (2026-07-18). This document is the buildable blueprint for Werft. It was produced by a multi-agent design process (7 parallel subsystem designs, each adversarially critiqued, then reconciled, then verified by 4 independent lenses), and revised to v1.1 after an additional independent external review whose findings — notably the oracle-mutability gap (§8.2/§13), the Docker-wait contradiction (§6.1), and the installation-token TTL bug (§6.6) — are incorporated below. The doctrine in [README.md](README.md) governs; where this document and the doctrine conflict, the doctrine wins and this document has a bug.
 
 **Scale target:** one operator (Ken), one dedicated Rocky Linux 9 VM, single-digit projects, tens of runs per day. Every component below justifies its operational cost to exactly one person. *Modular means enforced internal boundaries, not distributed systems.*
 
@@ -162,7 +162,7 @@ queued ──► claimed ──► running ──► awaiting_ci ──► mergi
 | failed | ✓⁷ | | | | | ✓ᵃ | | ✓⁸ | | ✓ |
 | parked | ✓⁹ | | | | | | | | | ✓ |
 
-¹ lease expired before container start · ² hard-deadline sweep — bounds **active execution only** (`claimed, running, awaiting_ci, merging`); the deadline is set at each claim and cleared on entry to `blocked_quota`/`parked`, so week-long quota waits and human inboxes are never force-failed · ³ CI red with retry budget left → fresh dispatch (red work never merges; see §1 step 5) · ⁴ CI red, budget spent · ⁵ base branch moved; branch re-updated, checks must re-run — **a rebased merge can never land without fresh green CI** · ⁶ merge conflict → human · ⁷ retry with backoff (`next_attempt_at`) · ⁸ chain-cycle budget exhausted (§5.3) · ⁹ human requeue · ᵃ every provider in the resolved chain is quota-exhausted — from `queued` at dispatch time (quota reservation happens **inside the claim transaction**, so a run is never `claimed` without quota in hand), or from `failed` after a mid-run exhaustion ends an attempt; wakes at `min(exhausted_until)` · ᵇ `PermanentError` at dispatch (invalid config, repo 404) parks without an attempt. Every other `PermanentError` parks via `failed → parked`.
+¹ lease expired before container start; a `running` lease expiry (container vanished with no die event) uses the existing `running → failed` edge · ² hard-deadline sweep — bounds **agent execution only** (`claimed, running`); the deadline is set at each claim and cleared on every exit from those states, so CI queues, quota waits, and human inboxes are never force-failed. `awaiting_ci`/`merging` are governed by the separate `WERFT_CI_WAIT_TIMEOUT` (6 h) whose expiry parks via the existing ⁴/⁶ edges with reason `ci_timeout` — GitHub's latency never burns an agent retry · ³ CI red with retry budget left → fresh dispatch (red work never merges; see §1 step 5) · ⁴ CI red, budget spent · ⁵ base branch moved; branch re-updated, checks must re-run — **a rebased merge can never land without fresh green CI** · ⁶ merge conflict → human · ⁷ retry with backoff (`next_attempt_at`) · ⁸ chain-cycle budget exhausted (§5.3) · ⁹ human requeue · ᵃ every provider in the resolved chain is quota-exhausted — from `queued` at dispatch time (quota reservation happens **inside the claim transaction**, so a run is never `claimed` without quota in hand), or from `failed` after a mid-run exhaustion ends an attempt; wakes at `min(exhausted_until)` · ᵇ `PermanentError` at dispatch (invalid config, repo 404) parks without an attempt. Every other `PermanentError` parks via `failed → parked`.
 
 ### 4.3 Schema (authoritative tables; Alembic is the only DDL mechanism)
 
@@ -221,10 +221,14 @@ CREATE TABLE runs (
     max_attempts        SMALLINT NOT NULL DEFAULT 3,
     next_attempt_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     lease_expires_at    TIMESTAMPTZ,
-    last_heartbeat_at   TIMESTAMPTZ,
+    last_heartbeat_at   TIMESTAMPTZ,                   -- written by the MANAGER's observation (docker events/inspect,
+                                                       -- log growth) — runners stay DB-blind; never written in-container
     hard_deadline_at    TIMESTAMPTZ,                   -- set in the claim CAS (now() + WERFT_RUN_DEADLINE, default 4h);
-                                                       -- cleared on entry to blocked_quota/parked. Bounds ACTIVE
-                                                       -- execution, never quota waits or human inboxes.
+                                                       -- bounds AGENT execution only (claimed/running) — cleared on
+                                                       -- entry to awaiting_ci/merging/blocked_quota/parked. CI wait
+                                                       -- has its own longer timeout (WERFT_CI_WAIT_TIMEOUT, 6h →
+                                                       -- parked/ci_timeout): GitHub's queue latency is never
+                                                       -- charged against the agent (external-review fix).
     branch_name         TEXT,                          -- werft/run-<id>
     base_sha            TEXT,
     container_id        TEXT,
@@ -232,8 +236,15 @@ CREATE TABLE runs (
     pr_number           INT,
     merge_commit_sha    TEXT,
     files_changed       INT, lines_added INT, lines_deleted INT,
-    parked_reason       TEXT CHECK (parked_reason IN ('ci_red','merge_conflict','agent_failure',
-                                                      'infra_failure','permanent_error','deadline')),
+    touches_tests       BOOLEAN NOT NULL DEFAULT false,  -- mechanical path match vs project test globs (§8.2);
+                                                         -- surfaced prominently in the promotion PR body
+    parked_reason       TEXT CHECK (parked_reason IN ('ci_red','merge_conflict','merge_blocked',
+                                                      'ci_timeout','agent_failure','infra_failure',
+                                                      'permanent_error','deadline')),
+                                     -- merge_blocked = GitHub protection rules refused the auto-merge
+                                     -- (e.g. code-owner review required on an oracle-touching PR) —
+                                     -- the protection mechanism firing BY DESIGN, classified as such
+                                     -- rather than surfacing as an anomaly
     result              JSONB,                         -- validated result.json; display-only
     error_message       TEXT,                          -- human display only; NEVER branched on
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -241,8 +252,8 @@ CREATE TABLE runs (
 );
 CREATE INDEX ix_runs_claimable      ON runs (priority DESC, created_at) WHERE status = 'queued';
 CREATE INDEX ix_runs_lease_reaper   ON runs (lease_expires_at)          WHERE status IN ('claimed','running');
-CREATE INDEX ix_runs_deadline       ON runs (hard_deadline_at)
-    WHERE status IN ('claimed','running','awaiting_ci','merging');
+CREATE INDEX ix_runs_deadline       ON runs (hard_deadline_at)  WHERE status IN ('claimed','running');
+CREATE INDEX ix_runs_ci_wait        ON runs (updated_at)        WHERE status IN ('awaiting_ci','merging');
 CREATE INDEX ix_runs_project_status ON runs (project_id, status);
 -- at most one live run per issue: the atomic replacement for v1's labels-as-locks
 CREATE UNIQUE INDEX ux_runs_one_active_per_item ON runs (backlog_item_id)
@@ -363,7 +374,7 @@ NOTIFY is a latency accelerator; a periodic reconciliation query is the correctn
 
 One container, one uvicorn worker, one asyncio event loop hosting both the HTTP API and the scheduler. A second worker would mean two schedulers — CAS makes that *safe* but it is *forbidden* anyway (one engine). If HTTP load ever demands a split, the same codebase deploys twice with `pg_try_advisory_lock` electing one scheduler — documented, **not built**.
 
-`app.py` lifespan owns one `asyncio.TaskGroup` containing: the LISTEN reader, the reconciliation tick, the GitHub poller, N worker coroutines (fixed pool, `MAX_CONCURRENT_RUNS`, default 4), and the retention/GC task. Supervised as a group: an unhandled exception restarts the group loudly rather than zombifying silently. SIGTERM → stop claiming, drain in-flight handlers (short by construction), 10 s grace, exit. Because nothing durable lives only in a coroutine, `kill -9` is equally safe — and **must be rehearsed, not assumed** (test: kill -9 mid-run, restart, assert reconciliation resumes the run).
+`app.py` lifespan owns one `asyncio.TaskGroup` containing: the LISTEN reader, the Docker events reader (§6.1), the reconciliation tick, the GitHub poller, N worker coroutines (fixed pool, `MAX_CONCURRENT_RUNS`, default 4), and the retention/GC task. These named readers/loops are the **only** sanctioned long-lived coroutines; the no-sleeping-coroutine rule below governs every `advance()` handler. Supervised as a group: an unhandled exception restarts the group loudly rather than zombifying silently. SIGTERM → stop claiming, drain in-flight handlers (short by construction), 10 s grace, exit. Because nothing durable lives only in a coroutine, `kill -9` is equally safe — and **must be rehearsed, not assumed** (test: kill -9 mid-run, restart, assert reconciliation resumes the run).
 
 ### 5.2 Scheduler: event-driven primary, tick reconciliation secondary
 
@@ -382,7 +393,9 @@ WerftError
 ├── ProviderError           # CLI contract violation / malformed result.json / auth_failure — next provider in chain
 ├── QuotaExhaustedError     # expected control flow → blocked_quota + wake at learned reset
 ├── GitConflictError        # conflict on branch-update/merge → parked. A clean base-move is NOT an
-│                           #   error: it loops merging → awaiting_ci for fresh CI (§8.2)
+│                           #   error: it loops merging → awaiting_ci for fresh CI (§8.2). A merge
+│                           #   REFUSED by protection rules (code-owner review demanded) parks with
+│                           #   reason merge_blocked — the oracle guarding itself, by design
 └── PermanentError          # bad config, repo 404, illegal transition → parks with no retry
                             #   (queued → parked pre-attempt; via failed → parked otherwise)
 ```
@@ -419,7 +432,7 @@ Auth: one static bearer token (env) for everything — single operator, no RBAC,
 
 ### 6.1 Lifecycle: cold-start ephemeral, no pools, no reuse
 
-`docker create` + `start` (never `--rm` — the exit code is load-bearing and auto-remove races it away; adversarial-review fix). The manager calls `POST /containers/{id}/wait` (blocking, returns the exit code reliably — no inspect-polling loop), reads `result.json` off the host bind mount, then explicitly removes the container. The `wait` call is **idempotent by design**: it can block up to the 90-minute ceiling, so the socket-proxy's HAProxy timeouts are pinned above that ceiling and the manager's httpx call sets no read timeout; on *any* disconnect (proxy restart, manager restart) the handler simply re-issues `wait` — an already-exited container answers immediately, and the reconciliation sweep re-drives the run after a crash. Cold-start cost is engineered down, not designed around:
+`docker create` + `start` (never `--rm` — the exit code is load-bearing and auto-remove races it away; adversarial-review fix). Completion detection is **event-driven, never a per-run blocking call**: the `runner` module owns one supervised background task consuming the Docker events stream (`GET /events`, filtered to `label=werft.run_id`) through the socket proxy — the same sanctioned long-lived-task category as the Postgres LISTEN reader (§5.2). A container `die` event enqueues the run for advancement; the handler then reads the exit code via `docker inspect` (persisted on the non-removed container), reads `result.json` off the host bind mount, and explicitly removes the container. The reconciliation tick covers the gap (events stream down, manager restart) by inspecting all `running` rows. The v1.0 draft used a per-run blocking `containers/{id}/wait`, which contradicted §5.2's no-long-lived-coroutine rule and could starve the worker pool — the external review caught this, and the events-stream design removes the contradiction structurally instead of excusing it. Cold-start cost is engineered down, not designed around:
 
 - Provider images pre-built and layer-cached locally (no registry pulls at run time).
 - Clones use a host-side bare mirror per project (`/srv/werft/mirrors/<slug>.git`, `gc.auto=0` — **never gc'd while runs are in flight**; a stale mirror is usable, a pruned-mid-clone one is corrupt). Fetch-on-dispatch with a 15 s timeout, falling through to existing objects on failure. `git clone --reference <mirror> --dissociate` → near-instant, fully independent working copy.
@@ -469,7 +482,7 @@ The adapter is PID 1. It launches the CLI with `setsid`, and implements tree-kil
 
 ### 6.6 Secrets: two trust models
 
-- **Git credentials — per-run, scoped, short.** The manager mints a GitHub App installation token (1 h TTL, one repo) per run, writes it to `secrets/git_token` (0400, chowned to the runner uid), mounts read-only at `/run/secrets/git_token`, wires it via `GIT_ASKPASS` (a 3-line helper — the only shell script in the runner). Never via `docker run -e`: env vars leak through `/proc/*/environ` to everything the CLI shells out to. Shredded on collection.
+- **Git credentials — per-run, scoped, short.** The manager mints a GitHub App installation token (1 h TTL, one repo) per run, writes it to `secrets/git_token` (0400, chowned to the runner uid), mounts read-only at `/run/secrets/git_token`, wires it via `GIT_ASKPASS` (a 3-line helper — the only shell script in the runner). Never via `docker run -e`: env vars leak through `/proc/*/environ` to everything the CLI shells out to. Shredded on collection. **TTL vs ceiling:** the 1 h token expires inside the 90-min task ceiling, so the orchestrator **re-mints and atomically rewrites the host-side token file at 45 min** for any still-running container — `GIT_ASKPASS` reads the file per git operation, so the refresh is invisible to the run (external-review fix: without this, every slow run 401s at push and burns a full retry as a phantom `infra_failure`). The adapter's log tee also **redacts the current token value** from `log.jsonl` — the one Werft-supplied secret in the container never lands in a log file even if a tool echoes it.
 - **Provider subscription auth — whole-account, long-lived, manual.** No provider offers per-task scoping; fighting that is effort against a wall. Ken runs each CLI's own login flow once, interactively, into a named volume (`werft-creds-<provider>`); runners mount the specific credential path read-only. Refresh is a deliberate human act on an ntfy reminder — credential provisioning stays entirely off the automated attack surface. Accepted risk: a prompt-injected run can abuse the mounted session within that provider's API only (egress-limited); it cannot read other providers' credentials or reach anything else.
 
 ### 6.7 Network: fail-closed by topology
@@ -530,11 +543,11 @@ RETURNING id;
 COMMIT;  -- zero rows returned → this provider unavailable → next chain candidate, same pattern
 ```
 
-One statement, all four caps, one lock, one insert — under the advisory lock the checks and the write are effectively serial per account, and the lock releases at commit. Rolling windows are **aggregates over the append-only ledger** — genuinely rolling, never tumbling buckets (the draft's `quota_window` bucket table was a doctrine violation and is not built). `NULL` caps mean unlimited (`COALESCE` guard — Ollama must always reserve). On completion the row is trued-up with `actual_wallclock_s`, so pessimistic ceilings don't permanently inflate the window. `UNIQUE (run_id, attempt_no)` makes retried reservations no-ops.
+One statement, all four caps, one lock, one insert — under the advisory lock the checks and the write are effectively serial per account, and the lock releases at commit. **One candidate per transaction, strictly:** if the reservation returns zero rows, the whole transaction (including the claim CAS) rolls back and the next chain candidate gets its own fresh transaction — advisory locks therefore never accumulate across accounts, which is what makes cross-run deadlock (chain A→B racing chain B→A) impossible (external-review fix). Rolling windows are **aggregates over the append-only ledger** — genuinely rolling, never tumbling buckets (the draft's `quota_window` bucket table was a doctrine violation and is not built). `NULL` caps mean unlimited (`COALESCE` guard — Ollama must always reserve). The row is trued-up with `actual_wallclock_s` on **every attempt end** — completion, cancel, deadline kill, infra failure alike — so pessimistic ceilings never linger against the window (external-review fix). `UNIQUE (run_id, attempt_no)` makes retried reservations no-ops. (Note: the session-concurrency check keys on `provider` while locks key on account — equivalent while each provider has one account; revisit alongside the multi-account trigger in §12.)
 
 ### 7.3 Exhaustion: estimate proactively, learn reactively
 
-Subscription CLIs enforce quotas opaquely and only tell you at the moment of rejection. So: the conservative local ledger (× 0.80 factor) avoids *most* rejections proactively; the CLI's own structured rate-limit rejection is the **authoritative** signal and writes `provider_accounts.exhausted_until` (with the provider's `resets_at` when supplied — from then on window timing is learned, not guessed). Runs blocked with every chain provider exhausted → `blocked_quota` with `next_attempt_at = min(exhausted_until)`; all-exhausted across a project triggers the queue-stalled alert. Observational token counts from the CLIs are stored for the dashboard and **never** feed any decision.
+Subscription CLIs enforce quotas opaquely and only tell you at the moment of rejection. So: the conservative local ledger (× 0.80 factor) avoids *most* rejections proactively; the CLI's own structured rate-limit rejection is the **authoritative** signal and writes `provider_accounts.exhausted_until` (with the provider's `resets_at` when supplied — from then on window timing is learned, not guessed). Runs blocked with every chain provider exhausted → `blocked_quota` with a wake time computed per account as **`exhausted_until` when known, else the window edge — the oldest ledger row inside the rolling window `+ window_hours`, i.e. the moment the local ledger frees a slot** (the estimate-based case is the common one and had a NULL hole in v1.0; external-review fix); `next_attempt_at = min` across the chain. All-exhausted across a project triggers the queue-stalled alert. Observational token counts from the CLIs are stored for the dashboard and **never** feed any decision.
 
 ### 7.4 Outcome recording without a feedback loop
 
@@ -566,10 +579,11 @@ Branch names derive from `runs.id` (UUIDv7 — one id type everywhere; the draft
 **Oracle self-protection** (the agent must not be able to weaken the gate that judges it):
 - A `CODEOWNERS` file assigns `/.github/workflows/` and `/CODEOWNERS` to Ken, and `unattended`'s branch protection enables **"Require review from Code Owners"** with required approvals at 0 — ordinary run PRs still auto-merge review-free, while any PR touching the oracle or CODEOWNERS itself demands Ken's review. (The draft cited a ruleset path-condition for review that GitHub does not offer; code-owner review is the mechanism that actually exists — verification-pass fix.)
 - Repo Actions settings: default `GITHUB_TOKEN` **read-only**; no repo/org secrets exposed to the oracle workflow. A same-repo PR *executes* its modified workflow before any review gate — that execution must have nothing worth stealing and no write power.
+- **The test suite itself is the softer half of the oracle** — an agent PR can weaken or delete the tests that judge it in the same diff, CI goes green on the weakened suite, and the promotion re-runs that same suite (the exact reward-hacking vector the v1 verdict cites; external-review finding #1). Full CODEOWNERS coverage of test directories would fix it but would force human review on *most legitimate PRs* — good PRs touch tests — killing unattended operation. The layered resolution instead: **(a)** every run records whether its diff touches configured test paths (`tests/`, `test_*`, `*_test.*` — per-project configurable; mechanical path match, no judgment) as `runs.touches_tests BOOLEAN`; **(b)** the promotion PR body **prominently flags every included run that touched test paths** — Ken's one human gate sees exactly the runs that could have moved the goalposts, with links; **(c)** projects are encouraged to include an executed coverage-floor/test-count-delta step in `werft-oracle.yml` (fails CI if coverage or test count drops beyond a threshold — deterministic, gameable-but-raising-the-bar); **(d)** per-project strict mode: `CODEOWNERS` on test directories for repos where Ken prefers safety over autonomy. Contamination is bounded by doctrine #2 regardless — a goalpost-moved merge reaches only the `unattended` lineage until the now-informed human promotes. Listed as accepted risk #8 (§13).
 
 ### 8.3 GitHub integration: polling, zero inbound listeners
 
-The VM exposes **no public port** (§10.3), so GitHub webhooks are not used. The poller (ETag conditional requests against installation-token rate limits) covers: `werft:ready` issues (60 s), open run-PR check/merge status (30 s), `unattended↔main` ahead/behind via the compare API (5 min — no local clone needed; feeds the divergence banner: > 20 commits or > 7 days unpromoted). All observed facts land via state-guarded CAS updates (`… WHERE status = 'awaiting_ci'`), so out-of-order or repeated observations can never double-apply. 30–60 s of latency is irrelevant for unattended background work; Tailscale Funnel + App webhooks is the documented escape hatch if that ever changes — documented, not built.
+The VM exposes **no public port** (§10.3), so GitHub webhooks are not used. The poller (ETag conditional requests against installation-token rate limits) covers: `werft:ready` issues (60 s), open run-PR check/merge status (30 s), `unattended↔main` ahead/behind via the compare API (5 min — no local clone needed; feeds the divergence banner: > 20 commits or > 7 days unpromoted). All observed facts land via state-guarded CAS updates (`… WHERE status = 'awaiting_ci'`), so out-of-order or repeated observations can never double-apply. PR creation is idempotent on **both** sides: `ux_runs_pr` dedupes the DB, and a re-driven handler that hits GitHub's 422 "PR already exists" (crash after create, before recording) **adopts** the existing PR — list PRs by head branch, record its number, continue (external-review fix). 30–60 s of latency is irrelevant for unattended background work; Tailscale Funnel + App webhooks is the documented escape hatch if that ever changes — documented, not built.
 
 ### 8.4 Sync-back: `main → unattended`, continuous, CI-gated
 
@@ -585,8 +599,8 @@ Onboarding is a **CLI flow, not a dashboard action** — it needs an interactive
 
 1. Create `unattended` from `main` if absent.
 2. Apply branch protections (§8.1), install `CODEOWNERS` + code-owner-review protection (§8.2), repo settings (auto-delete heads; squash + merge-commit enabled, rebase-merge disabled), labels (`werft:ready`, cosmetic `werft:parked` — **no label is ever a lock**), Actions token read-only. Check repo visibility: enable secret-scanning push protection where available (public repos; paid orgs), and warn loudly where it is not (§10.2).
-3. Verify `werft-oracle.yml` exists and names job `werft-oracle`; otherwise block with an actionable error.
-4. Register the project with the manager via `POST /projects/{id}/onboard-register` (bearer token over Tailscale).
+3. Verify `werft-oracle.yml` exists and names job `werft-oracle`; otherwise block with an actionable error. **Then the oracle-strength attestation** — the system mechanically cannot judge whether the oracle is real (an `echo ok` workflow satisfies every automated check and voids doctrine #1; external-review finding #2), so `werftctl onboard` walks a human checklist: *does the workflow build? run the actual test suite? lint? is the suite strong enough to catch a plausibly-wrong change?* — and records the attestation (`projects.oracle_attested_by/at`). Unattested projects show a standing dashboard warning and the v1 verdict's own prescription applies: **onboard only repositories with strong existing test suites.**
+4. Register the project with the manager via `POST /projects/{id}/onboard-register` (bearer token over Tailscale), including the test-path globs for `touches_tests` classification (§8.2).
 5. **Credentials for step 2:** the GitHub App deliberately holds no `administration:write` (a leaked App key must not be able to rewrite branch protection fleet-wide). `werftctl` prompts for a short-lived fine-grained PAT with admin on that one repo, applies the settings against GitHub directly, **verifies each as a post-condition**, and discards the token — the PAT never reaches the manager or any storage. The App holds `administration:read` to detect protection drift afterwards (dashboard banner if a human or bug weakens a rule).
 
 **App permission ceiling:** contents rw, pull_requests rw, issues rw, checks read, actions read, administration read, metadata read. Nothing may ever require more.
@@ -649,13 +663,14 @@ services:
                        # env: HTTPS_PROXY=http://egress-proxy:3128, NO_PROXY=postgres,docker-socket-proxy
                        # secrets: github_app_key · 1 cpu/2 GB
   docker-socket-proxy: # tecnativa image, digest-pinned · mounts /var/run/docker.sock:ro · nets: docker-proxy-net
-                       # CONTAINERS=1 IMAGES=1 NETWORKS=1 POST=1 DELETE=1
+                       # CONTAINERS=1 IMAGES=1 NETWORKS=1 EVENTS=1 POST=1 DELETE=1
                        # ALLOW_START=1 ALLOW_STOP=1 ALLOW_RESTARTS=1
                        # EXEC=0 VOLUMES=0 BUILD=0 SYSTEM=0
                        # (start/stop flags are required with POST=1, and DELETE=1 is required for the
                        #  explicit `docker rm` in §6.1 — each was missing in a draft and would have
                        #  broken dispatch or cleanup outright; the §6.3 unit test asserts this exact set)
-                       # HAProxy timeouts pinned > 90 min so the blocking containers/{id}/wait survives
+                       # HAProxy client/server timeouts raised for the long-lived /events stream (§6.1);
+                       # the events reader reconnects on any drop, tick reconciliation covers the gap
   egress-proxy:        # squid, digest-pinned, static allowlist config (§6.7)
                        # nets: runner_net, mgr_egress, internet
   ollama:              # optional · nets: runner_net (explicitly, so runners can reach it)
@@ -751,6 +766,7 @@ Each item stays out until a written revisit trigger fires (e.g. runs table > 100
 5. **Day-1 quota estimates are guesses** until each provider has rejected us once (then learned); the 0.80 factor bounds the damage.
 6. **Egress allowlist maintenance is manual toil** that grows with project ecosystems.
 7. **GitHub App key is a fleet-wide credential** (though without admin:write); stored as a Compose secret on one 0700 host path, rotated yearly — accepted at solo scale, stated rather than hidden.
+8. **The oracle's test suite is agent-editable** (external-review finding #1 — the reward-hacking vector v1's own verdict cites). Mitigated in layers, not eliminated: mechanical `touches_tests` flagging at the promotion gate, recommended executed coverage-floor checks, optional per-project CODEOWNERS strict mode, and doctrine-#2 containment (a goalpost-moved merge reaches only `unattended` until an informed human promotes). Full immunity would cost unattended operation itself — this is the system's most honest residual risk, accepted with eyes open.
 
 ## 14. The one-sentence test
 
@@ -768,7 +784,9 @@ Every future change to Werft must pass the question that v1 failed: **does this 
 | Reconciliation tick | 15 s | env `SCHEDULER_TICK_SECONDS` | §5.2 |
 | Retry backoff | 2^attempt × 30 s, cap 30 min | code (`RetryPolicy`) | §5.2 |
 | Claim lease / running lease / heartbeat | 2 min / 3 min / 30 s | env | §4.3 |
-| Active-execution hard deadline | 4 h (`WERFT_RUN_DEADLINE`) | env | §4.3 |
+| Agent-execution hard deadline | 4 h (`WERFT_RUN_DEADLINE`, claimed/running only) | env | §4.3 |
+| CI-wait timeout | 6 h (`WERFT_CI_WAIT_TIMEOUT` → parked/ci_timeout) | env | §4.3 |
+| Git-token re-mint | at 45 min of each active run | code | §6.6 |
 | Per-task wall-clock ceiling | 90 min hard, in-adapter | code | §6.3 |
 | Idle-output watchdog | 15 min | env → task.json | §6.5 |
 | Runner resources | 2 vCPU / 4 GB / pids 256 / 8 GB disk | routing.yaml override, code default | §6.3 |
