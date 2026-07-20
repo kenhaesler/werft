@@ -26,8 +26,8 @@ const arch = load(ARCH);
 const readme = load(README);
 const verdict = load(VERDICT);
 
-test("ARCHITECTURE.md is the v1.2 groundwork blueprint", () => {
-  assert.match(arch, /Groundwork specification, v1\.2 \(2026-07-18\)/);
+test("ARCHITECTURE.md is the v1.3 groundwork blueprint", () => {
+  assert.match(arch, /Groundwork specification, v1\.3 \(2026-07-20\)/);
   assert.match(arch, /doctrine in \[README\.md\]/);
 });
 
@@ -67,7 +67,7 @@ test("doctrine #2: unattended branch + human promotion", () => {
 });
 
 test("doctrine #3: process-layer providers + quota not tokens", () => {
-  assert.match(arch, /claude.*codex.*kimi.*ollama/i);
+  assert.match(arch, /claude.*codex.*kimi.*local/i);
   assert.match(arch, /rolling_window_hours/);
   assert.match(arch, /never.*feed any decision|never a quota input/i);
   assert.match(arch, /Observational token counts.*never.*decision/s);
@@ -209,4 +209,67 @@ test("M1 closed: awaiting_ci/merging failed-cells carry footnote 10, and footnot
   assert.match(awaiting, /✓¹⁰/, `awaiting_ci → failed should carry footnote ¹⁰: ${awaiting}`);
   assert.match(merging, /✓¹⁰/, `merging → failed should carry footnote ¹⁰: ${merging}`);
   assert.match(arch, /¹⁰ unrecoverable error observed \*\*during\*\* CI-wait\/merge/);
+});
+
+/**
+ * v1.3 2026/2027-currency-audit locks — each pins a load-bearing decision so it
+ * cannot silently regress (same discipline as the M1/M2 locks above).
+ */
+test("v1.3: header cites the currency audit and its lineage doc exists", () => {
+  assert.match(arch, /2026\/2027-currency-and-completeness audit/);
+  assert.match(arch, /architecture-2026-currency-audit\.md/);
+  assert.ok(
+    existsSync(join(ROOT, "docs", "lineage", "architecture-2026-currency-audit.md")),
+    "currency-audit lineage doc missing on disk",
+  );
+});
+
+test("v1.3: local overflow tier is backend-neutral OpenAI-compatible, not hardcoded Ollama", () => {
+  assert.match(arch, /OpenAI-compatible/);
+  assert.match(arch, /vLLM/);
+  assert.match(arch, /chain: \[claude, codex, kimi, local\]/);
+  // the provider code is 'local', enumerated in the providers table
+  assert.match(arch, /'claude' \| 'codex' \| 'kimi' \| 'local'/);
+});
+
+test("v1.3: operator usage ceilings are a hard cap on window units, never tokens", () => {
+  assert.match(arch, /CREATE TABLE usage_limits/);
+  assert.match(arch, /scope.*IN \('global','provider','model'\)/);
+  assert.match(arch, /### 7\.2a Usage ceilings/);
+  // doctrine #3 must remain intact: the cap is on plan units, tokens still not an input
+  assert.match(arch, /never tokens|not tokens|not 60 % of some token/i);
+});
+
+test("v1.3: DNS-exfiltration channel is closed, not just IP routing", () => {
+  assert.match(arch, /DNS side-channel is closed explicitly/);
+  assert.match(arch, /dns-guard/);
+  assert.match(arch, /CVE-2024-29018/);
+});
+
+test("v1.3: sync-back runs on a NON-strict context (inversion fixed)", () => {
+  assert.match(arch, /Strict "up-to-date" is asymmetric and MUST NOT gate this direction/);
+  assert.match(arch, /werft-syncback/);
+});
+
+test("v1.3: scoped provider credentials preferred over whole-account mount", () => {
+  assert.match(arch, /Scoped \/ short-lived credential \(preferred\)/);
+  assert.match(arch, /setup-token|apiKeyHelper/);
+  assert.match(arch, /whole-account session is the last resort/i);
+});
+
+test("v1.3: provider-ToS/account-suspension risk and A8 are recorded", () => {
+  assert.match(arch, /Terms-of-Service \/ account suspension/);
+  assert.match(arch, /A8 provider billing\/policy changed/);
+  assert.match(arch, /policy_block/);
+});
+
+test("v1.3: onboarding hardens the CI oracle (SHA-pin, zizmor, checkout v7)", () => {
+  assert.match(arch, /Oracle supply-chain hardening/);
+  assert.match(arch, /zizmor/);
+  assert.match(arch, /actions\/checkout` is \*\*v7/);
+});
+
+test("README doctrine #3 generalized to a local OpenAI-compatible tier", () => {
+  assert.match(readme, /Providers are subscription CLIs/); // unchanged doctrine header
+  assert.match(readme, /OpenAI-compatible endpoint: vLLM \/ LiteLLM \/ Ollama/);
 });
