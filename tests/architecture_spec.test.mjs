@@ -26,9 +26,15 @@ const arch = load(ARCH);
 const readme = load(README);
 const verdict = load(VERDICT);
 
-test("ARCHITECTURE.md is the v1.3 groundwork blueprint", () => {
-  assert.match(arch, /Groundwork specification, v1\.3 \(2026-07-20\)/);
+test("ARCHITECTURE.md is the v1.4 groundwork blueprint", () => {
+  assert.match(arch, /Groundwork specification, v1\.4 \(2026-07-25\)/);
   assert.match(arch, /doctrine in \[README\.md\]/);
+});
+
+test("v1.4: userns-remap is rejected outright, not deferred", () => {
+  assert.match(arch, /\*\*Docker `userns-remap`\*\* — rejected by operator decision/);
+  assert.doesNotMatch(arch, /CONSIDER `userns-remap`/);
+  assert.doesNotMatch(arch, /`userns-remap` is the deferred cheap hardening/);
 });
 
 test("README doctrine #1–#5 are present and load-bearing", () => {

@@ -39,4 +39,4 @@ A **dedicated virtual machine** (Rocky Linux) running the full stack via Docker 
 
 ## Status
 
-**Groundwork specified.** The full system architecture — schema, state machine, runner contract, routing/quota, git topology, deployment — is in [ARCHITECTURE.md](ARCHITECTURE.md) (v1.3; verified by three independent adversarial passes and a 2026/2027-currency-and-completeness audit — see [docs/lineage/architecture-2026-currency-audit.md](docs/lineage/architecture-2026-currency-audit.md) — structurally locked by `tests/architecture_spec.test.mjs`). No implementation yet.
+**Groundwork specified.** The full system architecture — schema, state machine, runner contract, routing/quota, git topology, deployment — is in [ARCHITECTURE.md](ARCHITECTURE.md) (v1.4; verified by three independent adversarial passes and a 2026/2027-currency-and-completeness audit — see [docs/lineage/architecture-2026-currency-audit.md](docs/lineage/architecture-2026-currency-audit.md) — structurally locked by `tests/architecture_spec.test.mjs`). No implementation yet.
