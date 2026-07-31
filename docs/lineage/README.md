@@ -9,6 +9,7 @@ Everything in this directory is **superseded and frozen**. It is kept because th
 | `architecture-2026-currency-audit.md` | The 2026/2027 currency-and-completeness audit that produced architecture v1.3. |
 | `ARCHITECTURE-v1.4.md` | The full groundwork specification, v1.4 — 119 KB, four adversarial passes. Superseded by SPEC.md; carries 10 verified defects catalogued in BUILD-PLAN-v1.0.md §14. |
 | `BUILD-PLAN-v1.0.md` | Ten-phase build plan derived from v1.4. Its §15 technology-currency research fed SPEC.md's stack pins. Superseded. |
+| `AMENDMENTS-v1.2-proposed.md` | Proposed, never-accepted amendment set against architecture v1.2 (from branch `amendments-v1.3`, commit f26174f) — superseded by v1.3/v1.4. Carries three self-declared unverified GitHub-behavior claims (A3/A5/A6); A6's CODEOWNERS-shadowing vector has no v1.4 counterpart — revisit when CODEOWNERS self-protection activates. |
 | `product-discovery/core-loop-proof-2026-07-26.md` | Question-at-a-time discovery log with the operator's verbatim answers; quota/evidence/continuity design. |
 | `product-discovery/containment-design-2026-07-27.md` | 39-agent containment analysis (16 on design consequences, 23 red-teaming invariant I-1). Its no-root recommendation was overturned by the 2026-07-31 realignment (capable dev boxes); the data-flow controls survive in SPEC.md. |
 | `product-discovery/agentic-os-gap-analysis-2026-07-27.md` | Gap analysis: "agentic OS" vs the dispatcher the spec described. Drove the realignment interview. |
