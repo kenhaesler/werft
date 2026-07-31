@@ -1,50 +1,44 @@
 # Werft
 
-**A self-hosted agentic OS for centrally managed, unattended coding projects.**
+**A self-hosted agentic operating system for one operator's software projects.**
 
-*Werft* (German: shipyard). Agents build in contained slips, every vessel passes sea trials, and only proven ships launch. Nothing moves on opinion.
+Werft (German: *shipyard*). You hand it a VM; the VM belongs to Werft. Agents build in capable, disposable containers; proven work merges; everything leaves an evidence trail.
 
-## What it is
+Werft is the successor to Claude Agent Station (v1, archived 2026-06-05) — rebuilt around the one lesson v1 died for, and realigned 2026-07-31 around what the operator actually wants ([the design record](docs/superpowers/specs/2026-07-31-werft-identity-realignment-design.md)).
 
-Werft is the successor to [Claude Agent Station](https://github.com/kenhaesler/claude-agent-station) (archived 2026-06-05 — see [the v1 verdict](docs/lineage/v1-verdict.md)). It runs coding agents unattended across multiple projects, dispatching work to whichever AI provider fits the task, and merges nothing that has not been proven by an executed oracle.
+## What it does
 
-## Doctrine (founding decisions)
+Werft runs coding agents unattended across projects, routes each kind of work to the model you chose on the subscriptions you already pay for, protects your quota using the providers' own reported limits, and merges nothing unproven: **code merges only on green CI executed against the merged result; everything else lands only when you accept it — until a work type earns automation.** Every run leaves a first-class evidence trail: what was done, what it cost, what the agent saw.
 
-These five decisions came out of the v1 post-mortem and are load-bearing. Changing one requires updating this section deliberately, not drifting.
+The dev factory is the spine; the OS-feel — capable environments, per-project memory, scheduled work, non-code work — is the body it grows.
 
-1. **Verification is executed, never judged.** The only merge gate is a green CI pipeline (tests + build + lint) run in a clean container against the merged result. No LLM verdict ever merges anything. Red or untestable work parks for a human. (v1 died here: its manager LLM read truncated diffs, executed nothing, and approved a branch with failing tests.)
-2. **Blast radius is contained by branch topology.** Agents branch off a long-lived `unattended` integration branch per project. Green CI auto-merges land there — never on `main`. Promotion `unattended → main` is a human-triggered, dashboard-visible batch PR that re-runs the full pipeline against `main`.
-3. **Providers are subscription CLIs, dispatched at the process layer.** Claude, Codex, and Kimi CLIs — plus a backend-neutral **local tier** (Aider pointed at a self-hosted OpenAI-compatible endpoint: vLLM / LiteLLM / Ollama) — run headless inside ephemeral runner containers behind thin adapters (~100 lines each: start task, stream log, exit code). The manager meters plan quotas (rolling windows, weekly caps, plus operator-set usage ceilings); the local tier is the free overflow. No gateway, no per-token billing in the core path (an optional per-provider credential gateway is a documented security choice, not the default — see ARCHITECTURE §6.6).
-4. **Routing is a static YAML table, plus outcome recording.** Task labels/language/size map to an ordered provider preference; quota exhaustion falls through the chain. Per-provider outcomes (CI pass rate, retries, duration) are recorded from day one, but no learned router is built unless the data proves the table wrong.
-5. **The backlog is human-fed only.** The manager works only issues you label for it. No self-generated work. (v1's analyst filed 89+ of its own issues and outran all verification capacity.)
+## Doctrine
 
-## Architecture (approach A — thin manager over provider CLIs)
+These six decisions are load-bearing. Every design choice traces back to one of them.
 
-- **Manager service** — task queue, routing table, quota meter, dispatcher, promotion workflow. One engine, one language, one source of truth for run state (a run's status is a row; everything else derives from it).
-- **Runner containers** — one ephemeral Docker container per run: clone of the target repo + one provider CLI. Completion is a structured signal (exit code / result file), never prose-matching.
-- **CI oracle** — GitHub Actions on GitHub-hosted runners (keeps semi-untrusted, agent-authored execution off the Werft VM). Werft never implements verification; it only consumes green/red.
-- **Dashboard** — deliberately small. It observes the loop; it must never outgrow it.
+1. **Verification is executed for code, human-gated for everything else.** The merge gate for code is green CI in a clean environment against the merged result. No LLM verdict ever merges code — v1 died here. Non-code work and bootstrap-phase projects pass through the operator's review queue, with a per-work-type path to automated acceptance once proven.
+2. **Blast radius is contained by branch topology plus disposable containers.** Agents work on branches off a long-lived `unattended` branch; green-CI merges land there, never on `main`. Promotion to `main` is a human-triggered batch PR. The container is the wall: capable dev boxes (root inside, installs, services, browser) with pragmatic hardening, scoped short-lived credentials, and per-run egress rules. Residual container-escape risk is accepted and written down, not engineered away.
+3. **Providers are subscription CLIs on the operator's personal accounts,** dispatched at the process layer. Claude Code first; Codex, Kimi, and a local OpenAI-compatible tier next; Grok and Gemini later. No gateway, no per-token billing in the core path.
+4. **Quota truth is provider-reported.** Each adapter reads its provider's own usage and limit signals, and those numbers rule dispatch admission; Werft's own metering ledger fills gaps and estimates between readings. Self-capping below the operator's ceiling is the #1 feature.
+5. **The backlog is human-approved.** Agents may propose issues; nothing is dispatched without the operator's label. v1's failure — self-dispatched work flooding verification capacity — stays structurally impossible.
+6. **Evidence is a product surface.** Runs collect artifacts by default — transcripts, diffs, screenshots, browser traces — into a per-run record with size caps.
 
-## Deployment target
+## How a run works
 
-A **dedicated virtual machine** (Rocky Linux) running the full stack via Docker Compose. Development happens here; the VM is the sole production environment, so the agents' blast radius ends at the VM boundary.
-
-## Anti-goals (lessons paid for in v1)
-
-- No second execution engine, ever. Port patterns, not parallel implementations.
-- No LLM-judgment gates anywhere in the merge path.
-- No agent-initiated replatforming of Werft's own substrate.
-- No state outside the database: no sentinel files, no labels-as-locks, no `/tmp` handoffs.
-- The dashboard serves the loop, not the other way around.
+1. You (or, later, an approved agent proposal) label a GitHub issue `werft:ready` — the only intake path.
+2. The manager claims the run and reserves quota in one transaction, prepares a workspace, and starts one ephemeral capable container with the chosen provider CLI.
+3. The agent works — installs what it needs, runs what it builds — commits, and pushes. The adapter reports completion by exit code and `result.json`; artifacts are collected.
+4. The manager opens a PR onto `unattended`. **Oracle-gated** projects wait for the executed CI check (`werft-oracle`) on the merged result: green auto-merges, red retries fresh while budget lasts, then parks. **Bootstrap** projects (no CI yet — their early runs exist to build it) wait in your review queue instead; first green CI flips the project to oracle-gated.
+5. You promote: a batch PR `unattended → main`, CI re-runs, you merge.
 
 ## Status
 
-**Groundwork specified; build plan written.** The full system architecture — schema, state machine, runner contract, routing/quota, git topology, deployment — is in [ARCHITECTURE.md](ARCHITECTURE.md) (v1.4; verified by three independent adversarial passes and a 2026/2027-currency-and-completeness audit — see [docs/lineage/architecture-2026-currency-audit.md](docs/lineage/architecture-2026-currency-audit.md) — structurally locked by `tests/architecture_spec.test.mjs`). No implementation yet.
+**Clean slate as of 2026-07-31.** The prior groundwork (architecture v1.4, ten-phase build plan, discovery record) is archived in [`docs/lineage/`](docs/lineage/README.md). The current buildable specification is [`SPEC.md`](SPEC.md), scoped to the thin loop: the greenfield Elastic log-analysis project goes from empty repository to its first oracle-gated merge, driven end-to-end by Werft. No implementation yet — the thin-loop issues on this repo are the build.
 
-**Start here to build:** [BUILD-PLAN.md](BUILD-PLAN.md) — ten phases from empty repo to working prototype, each with an executed acceptance test. Phase 4 is the milestone: the first merged run.
+## Anti-goals
 
-**Product decisions** live in `docs/product-discovery/`:
-
-- [`core-loop-proof-2026-07-26.md`](docs/product-discovery/core-loop-proof-2026-07-26.md) — what the first release is, and the quota/continuity/evidence model.
-- [`agentic-os-gap-analysis-2026-07-27.md`](docs/product-discovery/agentic-os-gap-analysis-2026-07-27.md) — what an agentic OS still needs; records the per-project-container decision and containment invariant **I-1**.
-- [`containment-design-2026-07-27.md`](docs/product-discovery/containment-design-2026-07-27.md) — the control set that satisfies I-1, from a six-vector adversarial red team.
+- No second execution engine; Postgres is the queue, the event bus, and the metrics store.
+- No LLM-judgment gates anywhere in the code-merge path.
+- No agent access to Werft's own substrate: Werft is never an onboarded project of itself, and only Werft controls the VM.
+- No state outside the database (plus the evidence files it indexes).
+- The dashboard serves the loop; it never becomes the product.
