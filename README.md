@@ -39,4 +39,12 @@ A **dedicated virtual machine** (Rocky Linux) running the full stack via Docker 
 
 ## Status
 
-**Groundwork specified.** The full system architecture — schema, state machine, runner contract, routing/quota, git topology, deployment — is in [ARCHITECTURE.md](ARCHITECTURE.md) (v1.4; verified by three independent adversarial passes and a 2026/2027-currency-and-completeness audit — see [docs/lineage/architecture-2026-currency-audit.md](docs/lineage/architecture-2026-currency-audit.md) — structurally locked by `tests/architecture_spec.test.mjs`). No implementation yet.
+**Groundwork specified; build plan written.** The full system architecture — schema, state machine, runner contract, routing/quota, git topology, deployment — is in [ARCHITECTURE.md](ARCHITECTURE.md) (v1.4; verified by three independent adversarial passes and a 2026/2027-currency-and-completeness audit — see [docs/lineage/architecture-2026-currency-audit.md](docs/lineage/architecture-2026-currency-audit.md) — structurally locked by `tests/architecture_spec.test.mjs`). No implementation yet.
+
+**Start here to build:** [BUILD-PLAN.md](BUILD-PLAN.md) — ten phases from empty repo to working prototype, each with an executed acceptance test. Phase 4 is the milestone: the first merged run.
+
+**Product decisions** live in `docs/product-discovery/`:
+
+- [`core-loop-proof-2026-07-26.md`](docs/product-discovery/core-loop-proof-2026-07-26.md) — what the first release is, and the quota/continuity/evidence model.
+- [`agentic-os-gap-analysis-2026-07-27.md`](docs/product-discovery/agentic-os-gap-analysis-2026-07-27.md) — what an agentic OS still needs; records the per-project-container decision and containment invariant **I-1**.
+- [`containment-design-2026-07-27.md`](docs/product-discovery/containment-design-2026-07-27.md) — the control set that satisfies I-1, from a six-vector adversarial red team.
