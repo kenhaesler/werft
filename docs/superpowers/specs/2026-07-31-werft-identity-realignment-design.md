@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-31
 **Status:** Approved by the operator (interview session, 2026-07-31)
-**Supersedes:** ARCHITECTURE.md v1.4, BUILD-PLAN.md v1.0, and the three `docs/product-discovery/` documents as sources of product truth. Those documents move to `docs/lineage/` as historical record and remain a reference mine (containment red-team findings, technology currency research) during implementation.
+**Supersedes:** ARCHITECTURE.md v1.4, BUILD-PLAN.md v1.0, and the three product-discovery documents (all now in `docs/lineage/`) as sources of product truth. Those documents move to `docs/lineage/` as historical record and remain a reference mine (containment red-team findings, technology currency research) during implementation.
 
 ## Why this document exists
 
