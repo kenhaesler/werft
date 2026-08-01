@@ -32,6 +32,9 @@ TEST_IMAGE_REF = "busybox:1.37"
 @pytest.fixture
 async def client():
     async with DockerClient() as docker:
+        # Step down to whatever this daemon serves — CI's runner is older than
+        # the SPEC §2 floor the manager targets in production.
+        await docker.negotiate()
         yield docker
 
 

@@ -7,6 +7,8 @@ import pytest
 
 from werft.runner.docker_api import (
     API_VERSION,
+    MAX_API_VERSION,
+    MIN_API_VERSION,
     DockerApiError,
     DockerClient,
     _build_transport,
@@ -16,13 +18,52 @@ from werft.runner.docker_api import (
 def client_with(handler) -> DockerClient:
     client = DockerClient(url="http://docker-test")
     client._client = httpx.AsyncClient(
-        transport=httpx.MockTransport(handler), base_url=f"http://docker-test/{API_VERSION}"
+        transport=httpx.MockTransport(handler), base_url="http://docker-test"
     )
     return client
 
 
-def test_api_version_is_pinned_to_the_engine_29_6_2_version():
+def test_api_version_ceiling_matches_engine_29_6_2():
+    assert MAX_API_VERSION == "1.52"
     assert API_VERSION == "v1.52"
+
+
+async def test_negotiate_steps_down_to_an_older_daemon():
+    """A hard pin turns a capable older daemon into an opaque 400."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/version", "GET /version must use the unversioned path"
+        return httpx.Response(200, json={"ApiVersion": "1.48"})
+
+    async with client_with(handler) as client:
+        assert await client.negotiate() == "1.48"
+        assert client.api_version == "1.48"
+
+
+async def test_negotiate_never_exceeds_our_verified_ceiling():
+    async with client_with(lambda r: httpx.Response(200, json={"ApiVersion": "1.99"})) as client:
+        assert await client.negotiate() == MAX_API_VERSION
+
+
+async def test_negotiate_refuses_a_daemon_below_the_floor():
+    async with client_with(lambda r: httpx.Response(200, json={"ApiVersion": "1.24"})) as client:
+        with pytest.raises(DockerApiError, match=f"below Werft's floor v{MIN_API_VERSION}"):
+            await client.negotiate()
+
+
+async def test_negotiated_version_is_used_in_request_paths():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"ApiVersion": "1.48"})
+        seen["path"] = request.url.path
+        return httpx.Response(201, json={"Id": "c1"})
+
+    async with client_with(handler) as client:
+        await client.negotiate()
+        await client.create_container("n", {})
+    assert seen["path"] == "/v1.48/containers/create"
 
 
 def test_unix_url_builds_a_uds_transport():
