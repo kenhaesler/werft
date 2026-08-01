@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","session_id":"ses_05","model":"claude-sonnet-5","cwd":"/work"}
+{"type":"result","subtype":"error_during_execution","is_error":true,"stop_reason":null,"num_turns":3,"duration_ms":15022,"session_id":"ses_05","total_cost_usd":0.031,"usage":{"input_tokens":9000,"output_tokens":400},"result":"An error occurred while executing a tool."}
