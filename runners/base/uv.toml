@@ -1,0 +1,4 @@
+# The uv equivalent of npm's dependency cooldown (SPEC §2).
+# uv's `exclude-newer` accepts a relative duration as of 2026, which is what
+# makes it a true cooldown rather than a frozen date.
+exclude-newer = "7 days"
