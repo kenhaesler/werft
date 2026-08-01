@@ -12,7 +12,8 @@ Hygiene, not containment: see the package docstring.
 import json
 import os
 import sys
-import time
+import threading
+from collections import deque
 from datetime import UTC, datetime
 
 from werft_adapter import (
@@ -51,30 +52,51 @@ def run_cli(
     ceiling_seconds: float,
     secrets: list[str] | None = None,
 ) -> tuple[int, str]:
-    """Run the CLI, tee a redacted transcript, return (exit code, stderr tail)."""
+    """Run the CLI, tee a redacted transcript, return (exit code, stderr tail).
+
+    stderr is drained by its own thread rather than after stdout: a child that
+    fills the 64 KiB stderr pipe buffer while we are blocked reading stdout would
+    deadlock, and `claude` writes account-level failures to stderr — precisely
+    the case the classifier depends on.
+
+    The ceiling likewise runs on a watchdog thread, because a child that prints
+    nothing at all never advances a deadline check placed in the stdout loop.
+    (Hygiene only — the manager enforces the real ceiling over the Docker API.)
+    """
     redact = Redactor(secrets or [])
-    deadline = time.monotonic() + ceiling_seconds
-    stderr_tail: list[str] = []
+    stderr_tail: deque[str] = deque(maxlen=50)
 
     try:
         process = start_in_own_process_group(argv, env, WORKSPACE)
     except OSError as exc:
         return EXIT_CLI_UNSTARTABLE, f"could not start {argv[0]!r}: {exc}"
 
+    def drain_stderr() -> None:
+        for line in process.stderr or ():
+            stderr_tail.append(redact(line))
+
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    finished = threading.Event()
+
+    def watchdog() -> None:
+        if not finished.wait(ceiling_seconds):
+            tree_kill(process)
+
+    threading.Thread(target=watchdog, daemon=True).start()
+
     try:
         with open(log_path, "a", encoding="utf-8") as log:
             for line in process.stdout or ():
                 log.write(redact(line))
                 log.flush()
-                if time.monotonic() > deadline:
-                    tree_kill(process)
-                    break
-        for line in process.stderr or ():
-            cleaned = redact(line)
-            stderr_tail.append(cleaned)
-            del stderr_tail[:-50]
-        return process.wait(), "".join(stderr_tail)
+        exit_code = process.wait()
+        finished.set()
+        stderr_thread.join(timeout=5)
+        return exit_code, "".join(stderr_tail)
     finally:
+        finished.set()
         tree_kill(process)
         reap_until_echild()
 

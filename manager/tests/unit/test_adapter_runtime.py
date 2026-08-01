@@ -22,6 +22,7 @@ from werft_adapter import (  # noqa: E402
     EXIT_WORKSPACE_GIT_FAILURE,
 )
 from werft_adapter.atomic import write_json_atomic  # noqa: E402
+from werft_adapter.main import run_cli  # noqa: E402
 from werft_adapter.process import (  # noqa: E402
     reap_until_echild,
     start_in_own_process_group,
@@ -156,3 +157,69 @@ def test_reap_until_echild_returns_when_there_are_no_children():
     """Must terminate rather than block — a hung reaper would hold the container
     open past the die event the manager is waiting for."""
     assert reap_until_echild() >= 0
+
+
+# --- run_cli: the two ways a naive implementation hangs -----------------------
+
+
+@pytest.mark.skipif(not hasattr(os, "setsid"), reason="POSIX process groups only")
+def test_run_cli_does_not_deadlock_on_a_chatty_stderr(tmp_path):
+    """Draining stdout to EOF *then* stderr deadlocks once the child fills the
+    64 KiB stderr pipe buffer — and `claude` reports account-level failures on
+    stderr, which is exactly what the classifier depends on.
+    """
+    script = tmp_path / "chatty.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        "i=0\n"
+        "while [ $i -lt 4000 ]; do\n"
+        '  echo "stderr line $i padding padding padding padding padding" >&2\n'
+        "  i=$((i+1))\n"
+        "done\n"
+        'echo \'{"type":"result","subtype":"success"}\'\n'
+    )
+    log = tmp_path / "log.jsonl"
+
+    exit_code, stderr_tail = run_cli(
+        ["/bin/sh", str(script)],
+        dict(os.environ),
+        log_path=str(log),
+        ceiling_seconds=30,
+    )
+
+    assert exit_code == 0, "a chatty stderr must not deadlock the adapter"
+    assert "stderr line" in stderr_tail
+    assert '"type":"result"' in log.read_text()
+
+
+@pytest.mark.skipif(not hasattr(os, "setsid"), reason="POSIX process groups only")
+def test_run_cli_ceiling_fires_on_a_silent_child(tmp_path):
+    """A deadline checked inside the stdout loop never runs for a child that
+    prints nothing, so the ceiling has to live on its own thread."""
+    script = tmp_path / "silent.sh"
+    script.write_text("#!/bin/sh\nsleep 60\n")
+    log = tmp_path / "log.jsonl"
+
+    started = time.monotonic()
+    exit_code, _ = run_cli(
+        ["/bin/sh", str(script)],
+        dict(os.environ),
+        log_path=str(log),
+        ceiling_seconds=2,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 30, "the ceiling must fire without any output from the child"
+    assert exit_code != 0
+
+
+def test_run_cli_reports_an_unstartable_cli_as_exit_2(tmp_path):
+    """SPEC §4.3: exit 2 means the CLI could not be started."""
+    exit_code, detail = run_cli(
+        ["/nonexistent/definitely-not-a-real-binary"],
+        dict(os.environ),
+        log_path=str(tmp_path / "log.jsonl"),
+        ceiling_seconds=5,
+    )
+    assert exit_code == EXIT_CLI_UNSTARTABLE
+    assert "could not start" in detail
