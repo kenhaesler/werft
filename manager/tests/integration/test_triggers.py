@@ -10,7 +10,7 @@ import uuid
 import asyncpg
 import pytest
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from werft.domain.events import NOTIFY_CHANNEL
 from werft.domain.runs import TRANSITIONS, RunStatus
@@ -102,16 +102,16 @@ async def test_created_event_on_insert(db_session) -> None:
 async def test_updated_at_stamped_on_transition(db_session) -> None:
     rid = await stage_run(db_session, RunStatus.QUEUED)
     before = (
-        await db_session.execute(
-            text("SELECT created_at, updated_at FROM runs WHERE id = :id"), {"id": rid}
-        )
-    ).one()
+        await db_session.execute(text("SELECT updated_at FROM runs WHERE id = :id"), {"id": rid})
+    ).scalar_one()
     await db_session.execute(text("UPDATE runs SET status = 'claimed' WHERE id = :id"), {"id": rid})
     await db_session.commit()
     after = (
         await db_session.execute(text("SELECT updated_at FROM runs WHERE id = :id"), {"id": rid})
     ).scalar_one()
-    assert after >= before.updated_at
+    # strict: the transition commits in a later transaction than stage_run's
+    # INSERT, so an unstamped updated_at would compare equal, not greater
+    assert after > before
 
 
 async def test_event_rolls_back_with_transition(db_session) -> None:
@@ -128,6 +128,66 @@ async def test_event_rolls_back_with_transition(db_session) -> None:
         )
     ).scalar_one()
     assert n == 0
+
+
+async def test_one_active_run_per_backlog_item_enforced(db_session) -> None:
+    """SPEC §3.3.6: at most one live run per backlog item (partial unique index)."""
+    rid = await stage_run(db_session, RunStatus.QUEUED)
+    row = (
+        await db_session.execute(
+            text("SELECT project_id, backlog_item_id FROM runs WHERE id = :id"), {"id": rid}
+        )
+    ).one()
+    with pytest.raises(IntegrityError, match="ux_runs_one_active_per_item"):
+        await db_session.execute(
+            text(
+                "INSERT INTO runs (project_id, backlog_item_id, status) VALUES (:p, :b, 'queued')"
+            ),
+            {"p": row.project_id, "b": row.backlog_item_id},
+        )
+    await db_session.rollback()
+    # a terminal run releases the slot
+    await db_session.execute(
+        text("UPDATE runs SET status = 'canceled' WHERE id = :id"), {"id": rid}
+    )
+    await db_session.commit()
+    await db_session.execute(
+        text("INSERT INTO runs (project_id, backlog_item_id, status) VALUES (:p, :b, 'queued')"),
+        {"p": row.project_id, "b": row.backlog_item_id},
+    )
+    await db_session.commit()
+
+
+async def test_pr_number_unique_per_project(db_session) -> None:
+    """ux_runs_pr: the GitHub-reconciliation idempotency anchor."""
+    rid1 = await stage_run(db_session, RunStatus.QUEUED)
+    pid = (
+        await db_session.execute(text("SELECT project_id FROM runs WHERE id = :id"), {"id": rid1})
+    ).scalar_one()
+    bid2 = (
+        await db_session.execute(
+            text(
+                "INSERT INTO backlog_items "
+                "(project_id, github_issue_number, title, github_updated_at) "
+                "VALUES (:p, 2, 't2', now()) RETURNING id"
+            ),
+            {"p": pid},
+        )
+    ).scalar_one()
+    rid2 = (
+        await db_session.execute(
+            text(
+                "INSERT INTO runs (project_id, backlog_item_id, status) "
+                "VALUES (:p, :b, 'queued') RETURNING id"
+            ),
+            {"p": pid, "b": bid2},
+        )
+    ).scalar_one()
+    await db_session.execute(text("UPDATE runs SET pr_number = 5 WHERE id = :id"), {"id": rid1})
+    await db_session.commit()
+    with pytest.raises(IntegrityError, match="ux_runs_pr"):
+        await db_session.execute(text("UPDATE runs SET pr_number = 5 WHERE id = :id"), {"id": rid2})
+    await db_session.rollback()
 
 
 async def test_pg_notify_fires_on_transition(db_session, migrated_db) -> None:

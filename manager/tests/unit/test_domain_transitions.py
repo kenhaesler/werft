@@ -1,5 +1,12 @@
-from hypothesis import given
-from hypothesis import strategies as st
+"""Properties of the transition table (SPEC §3.2).
+
+The state space is tiny (11 states, 121 ordered pairs), so every property
+is checked by exhaustive enumeration — deterministic on every run, unlike
+sampled property testing (adversarial-review finding: a 100-example random
+draw over 121 pairs let a violating edge survive ~1 in 6 cold runs).
+"""
+
+from itertools import product
 
 from werft.domain.attempts import BUDGET_EXEMPT_OUTCOMES, AttemptOutcome
 from werft.domain.runs import TERMINAL_STATUSES, TRANSITIONS, RunStatus
@@ -39,37 +46,43 @@ def test_spot_edges_from_spec() -> None:
         assert non_edge not in TRANSITIONS
 
 
-@given(st.sampled_from(ALL), st.sampled_from(ALL))
-def test_terminal_states_have_no_outgoing(frm: RunStatus, to: RunStatus) -> None:
-    if frm in TERMINAL_STATUSES:
-        assert (frm, to) not in TRANSITIONS
+def test_terminal_states_have_no_outgoing() -> None:
+    for frm, to in product(ALL, ALL):
+        if frm in TERMINAL_STATUSES:
+            assert (frm, to) not in TRANSITIONS, f"terminal {frm} has outgoing edge to {to}"
 
 
-@given(st.sampled_from(ALL))
-def test_no_self_loops(s: RunStatus) -> None:
-    assert (s, s) not in TRANSITIONS
+def test_no_self_loops() -> None:
+    for s in ALL:
+        assert (s, s) not in TRANSITIONS
 
 
-@given(st.sampled_from(ALL))
-def test_every_non_terminal_admits_cancel(s: RunStatus) -> None:
-    if s not in TERMINAL_STATUSES:
-        assert (s, RunStatus.CANCELED) in TRANSITIONS
+def test_every_non_terminal_admits_cancel() -> None:
+    for s in ALL:
+        if s not in TERMINAL_STATUSES:
+            assert (s, RunStatus.CANCELED) in TRANSITIONS, f"{s} cannot be canceled"
 
 
 def test_parked_is_never_terminal() -> None:
     assert (RunStatus.PARKED, RunStatus.QUEUED) in TRANSITIONS
 
 
-@given(st.sampled_from(ALL))
-def test_every_state_reaches_terminal(start: RunStatus) -> None:
-    seen, frontier = {start}, [start]
-    while frontier:
-        cur = frontier.pop()
-        for frm, to in TRANSITIONS:
-            if frm == cur and to not in seen:
-                seen.add(to)
-                frontier.append(to)
-    assert seen & TERMINAL_STATUSES
+def test_every_state_reaches_terminal() -> None:
+    for start in ALL:
+        seen, frontier = {start}, [start]
+        while frontier:
+            cur = frontier.pop()
+            for frm, to in TRANSITIONS:
+                if frm == cur and to not in seen:
+                    seen.add(to)
+                    frontier.append(to)
+        assert seen & TERMINAL_STATUSES, f"{start} cannot reach a terminal state"
+
+
+def test_all_edge_endpoints_are_valid_statuses() -> None:
+    for frm, to in TRANSITIONS:
+        assert isinstance(frm, RunStatus)
+        assert isinstance(to, RunStatus)
 
 
 def test_quota_exhausted_is_distinct_and_budget_exempt() -> None:
