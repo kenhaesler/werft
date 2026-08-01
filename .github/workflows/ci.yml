@@ -22,6 +22,22 @@ jobs:
     defaults:
       run:
         working-directory: manager
+    services:
+      postgres:
+        image: postgres@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a # postgres:18
+        env:
+          POSTGRES_USER: werft
+          POSTGRES_PASSWORD: werft
+          POSTGRES_DB: werft_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U werft"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      WERFT_TEST_DATABASE_URL: postgresql+asyncpg://werft:werft@localhost:5432/werft_test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
