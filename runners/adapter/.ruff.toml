@@ -1,0 +1,15 @@
+# The adapter runs on the RUNNER IMAGE's interpreter (python3.12), not on the
+# manager's 3.14 — it is PID 1 inside the container, installed into the venv at
+# /opt/werft/adapter.
+#
+# This file exists because the manager's `target-version = "py314"` made ruff
+# rewrite `except (OSError, AttributeError):` into the PEP 758 unparenthesized
+# form, which 3.12 rejects with a SyntaxError. Every local check passed and the
+# adapter would still have died at PID 1 on first run. Ruff must be told what
+# this package actually runs on.
+target-version = "py312"
+
+line-length = 100
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]

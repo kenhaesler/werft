@@ -20,7 +20,6 @@ from werft_adapter import (
     EXIT_CLI_UNSTARTABLE,
     EXIT_CONTRACT_FULFILLED,
     EXIT_RESULT_SERIALIZATION_FAILURE,
-    EXIT_WORKSPACE_GIT_FAILURE,
 )
 from werft_adapter.atomic import write_json_atomic
 from werft_adapter.process import reap_until_echild, start_in_own_process_group, tree_kill
@@ -32,8 +31,15 @@ WORKSPACE = "/work"
 GIT_TOKEN_PATH = "/run/secrets/git_token"
 
 
-def _read_secrets() -> list[str]:
-    """Values to strip from the transcript. Read by value, never matched by shape."""
+def _read_secrets(env: dict[str, str] | None = None) -> list[str]:
+    """Values to strip from the transcript. Read by value, never matched by shape.
+
+    Both mounted credentials are registered, not just the git token: the
+    provider OAuth token is handed to the CLI through the environment, and a
+    tool-call transcript that dumps env or an auth error body that echoes it
+    would otherwise land verbatim in a retained log (SPEC §8 keeps transcripts,
+    including in offsite backups).
+    """
     secrets: list[str] = []
     for path in (GIT_TOKEN_PATH,):
         try:
@@ -41,6 +47,10 @@ def _read_secrets() -> list[str]:
                 secrets.append(handle.read().strip())
         except OSError:
             continue
+    for name in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        value = (env or {}).get(name, "")
+        if value:
+            secrets.append(value.strip())
     return secrets
 
 
@@ -110,8 +120,12 @@ def main(argv: list[str] | None = None) -> int:
         with open(TASK_PATH, encoding="utf-8") as handle:
             task = json.load(handle)
     except (OSError, ValueError) as exc:
+        # Not exit 4: SPEC §4.3 defines that as a workspace/git failure, and
+        # sending the operator to look at git for an undeliverable task.json
+        # wastes the one thing the tier system exists to save. An unreadable
+        # task is an adapter-level input fault — "anything else = adapter crash".
         sys.stderr.write(f"unreadable {TASK_PATH}: {exc}\n")
-        return EXIT_WORKSPACE_GIT_FAILURE
+        return 1
 
     cli_argv = list(argv or task.get("argv") or [])
     if not cli_argv:
@@ -126,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
         env,
         log_path=os.path.join(OUTPUTS_DIR, "log.jsonl"),
         ceiling_seconds=float(task.get("timeout_seconds", 5400)),
-        secrets=_read_secrets(),
+        secrets=_read_secrets(env),
     )
 
     ended = datetime.now(UTC)
@@ -148,7 +162,15 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"could not serialise result.json: {exc}\n")
         return EXIT_RESULT_SERIALIZATION_FAILURE
 
-    return EXIT_CONTRACT_FULFILLED if exit_code == 0 else exit_code
+    # The adapter's exit code is a CONTRACT tier, not the CLI's exit status.
+    # Passing the CLI's code through would alias SPEC §4.3's reserved values: a
+    # CLI exiting 2 would read as "CLI unstartable", 5 as "result serialization
+    # failure", and a plain failed run (exit 1) as an adapter crash. The contract
+    # was in fact fulfilled — the CLI ran and a valid result.json was written —
+    # so a failed *task* still exits 0, and `result.json.status` carries the
+    # outcome. "The process finished" and "the task succeeded" are never one
+    # scalar.
+    return EXIT_CONTRACT_FULFILLED
 
 
 if __name__ == "__main__":

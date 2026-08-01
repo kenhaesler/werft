@@ -24,7 +24,11 @@ class Classification:
     no reset time, which is the common case and must not be faked.
     """
 
-    outcome: AttemptOutcome
+    #: `None` means "not yet determined" — the CLI finished cleanly but no CI
+    #: has run, so no attempt outcome exists yet. Doctrine #1: only executed
+    #: checks decide whether work is good. The orchestrator fills in
+    #: ci_green/ci_red once the oracle reports.
+    outcome: AttemptOutcome | None
     status: ResultStatus
     detail: str
     exhausted_until: datetime | None = None

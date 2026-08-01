@@ -1,10 +1,17 @@
 """Process supervision: own process group, tree-kill, reap to ECHILD.
 
-[BPÂ§P3.3]: "PID 1; `setsid` + tree-kill (`killpg` TERM -> 10 s -> KILL) +
-blocking `os.wait()` reap to `ECHILD`". No zombie outlives the container and no
-external reaper is needed, because none exists inside the box.
+[BP-P3.3]: PID 1, setsid, tree-kill (killpg TERM -> 10 s -> KILL), blocking
+reap to ECHILD. No zombie outlives the container and no external reaper is
+needed, because none exists inside the box.
 
-Hygiene, not containment â€” see the package docstring.
+Hygiene, not containment - see the package docstring.
+
+Portability note, and it is load-bearing: this package runs on the runner
+image's interpreter (python3.12), not on the manager's 3.14. Python 3.14
+accepts unparenthesized `except A, B:` via PEP 758 and 3.12 does not, so
+syntax that "works locally" can still be a SyntaxError at PID 1 inside the
+container. tests/unit/test_adapter_runtime.py compiles this package against
+the container's feature version to keep that from shipping again.
 """
 
 import contextlib
@@ -24,6 +31,10 @@ def start_in_own_process_group(argv: list[str], env: dict[str, str], cwd: str) -
     The group is what makes tree-kill possible: a CLI that spawns a build which
     spawns a test runner leaves a tree, and killing only the direct child would
     leave the rest running until the container is destroyed.
+
+    Pipes decode with errors="replace": a single invalid byte from the CLI or
+    anything it shells out to would otherwise raise UnicodeDecodeError out of
+    the read loop and kill the adapter mid-run.
     """
     kwargs: dict = {
         "stdout": subprocess.PIPE,
@@ -32,9 +43,11 @@ def start_in_own_process_group(argv: list[str], env: dict[str, str], cwd: str) -
         "env": env,
         "bufsize": 1,
         "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
     }
     if hasattr(os, "setsid"):
-        kwargs["preexec_fn"] = os.setsid  # noqa: PLW1509 â€” the point is a new session
+        kwargs["preexec_fn"] = os.setsid  # noqa: PLW1509 - a new session is the point
     return subprocess.Popen(argv, **kwargs)
 
 
@@ -44,7 +57,7 @@ def tree_kill(process: subprocess.Popen, *, grace_seconds: float = TERM_GRACE_SE
         return
     try:
         pgid = os.getpgid(process.pid)
-    except OSError, AttributeError:
+    except (OSError, AttributeError):
         process.terminate()
         return
 

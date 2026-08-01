@@ -31,8 +31,12 @@ from werft.contracts.task import TaskSpec
 from werft.domain.attempts import AttemptOutcome
 from werft.providers.base import Classification
 
-#: SIGTERM. The CLI exits 143 when the manager kills it at the ceiling.
-SIGTERM_EXIT_CODE = 143
+#: Signal-death exit codes. 128+SIGTERM(15)=143 and 128+SIGKILL(9)=137.
+#: Both matter: the adapter's own watchdog TERMs the tree, while the manager's
+#: ceiling enforcement kills with SIGKILL over the Docker API — so treating only
+#: 143 as a timeout left the manager-enforced path, the one that actually fires,
+#: falling through to agent_failure.
+SIGNAL_EXIT_CODES = frozenset({143, 137})
 
 #: Account-level failures that arrive as bare stderr, with no JSON envelope at all.
 #: Ordered: the first match wins, so the more specific patterns come first.
@@ -49,13 +53,31 @@ STDERR_PATTERNS: tuple[tuple[str, AttemptOutcome, ResultStatus], ...] = (
         AttemptOutcome.AUTH_FAILURE,
         ResultStatus.AUTH_FAILURE,
     ),
-    (r"usage limit|rate limit|quota", AttemptOutcome.QUOTA_EXHAUSTED, ResultStatus.QUOTA_EXHAUSTED),
+    (
+        # Deliberately not the bare word "quota": a successful run whose stderr
+        # mentions a disk quota, or an API quota it handled, or a project named
+        # quota-service, would otherwise be filed as provider exhaustion and
+        # would park the account.
+        r"usage limit|rate limit|quota (?:exceeded|exhausted|reached)|out of quota",
+        AttemptOutcome.QUOTA_EXHAUSTED,
+        ResultStatus.QUOTA_EXHAUSTED,
+    ),
 )
 
-#: A hard usage-limit stop delivered as envelope text, e.g.
-#: "You have hit your session limit, resets 3:45pm".
+#: A hard usage-limit stop delivered as envelope text. Both word orders occur in
+#: the wild — "You have hit your session limit, resets 3:45pm" and "Claude usage
+#: limit reached" — and matching only the verb-first form silently classified a
+#: quota stop as a successful run.
+#: Anchored at the start on purpose. When the CLI stops on a limit its message
+#: *replaces* the result, so it always leads; whereas the `result` field
+#: otherwise holds the agent's own summary, and a run that legitimately worked on
+#: rate-limit handling ("added a test for when the usage limit is reached") must
+#: not park the account. Anchoring is what separates the two.
 USAGE_LIMIT_TEXT = re.compile(
-    r"(hit|reached|exceeded).{0,40}(usage|session|weekly|rate)\s*limit", re.IGNORECASE
+    r"^(?:claude(?:\s+ai)?\s+|you\s+have\s+|you've\s+)?"
+    r"(?:(?:hit|reached|exceeded)\s+(?:your\s+)?(?:usage|session|weekly|rate)\s*limit"
+    r"|(?:usage|session|weekly|rate)\s*limit\s+(?:reached|exceeded|hit))",
+    re.IGNORECASE,
 )
 RESET_TEXT = re.compile(
     r"resets?\s+(?:at\s+)?(?P<when>[0-9]{1,2}:[0-9]{2}\s*(?:am|pm)?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[^\s\"]+)",
@@ -111,17 +133,23 @@ def parse_stream(lines: list[str]) -> ParsedStream:
 
 
 def _parse_reset(text: str) -> datetime | None:
-    """Best-effort. The CLI documents no reset-time field, so ambiguity means None."""
+    """Best-effort. The CLI documents no reset-time field, so ambiguity means None.
+
+    A naive datetime is treated as ambiguous and rejected: `exhausted_until` is a
+    TIMESTAMPTZ, and a value with no offset would be silently interpreted in some
+    other zone — the same "invent a number" failure §7 forbids, just quieter.
+    """
     match = RESET_TEXT.search(text or "")
     if not match:
         return None
-    when = match.group("when")
     try:
-        return datetime.fromisoformat(when)
+        parsed = datetime.fromisoformat(match.group("when"))
     except ValueError:
-        # A wall-clock string like "3:45pm" has no date and no timezone; inventing
-        # one would hand the quota ledger a wrong number, which §7 forbids.
+        # A wall-clock string like "3:45pm" has no date and no timezone.
         return None
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        return None
+    return parsed
 
 
 class ClaudeSpec:
@@ -140,8 +168,14 @@ class ClaudeSpec:
             task.model,  # SPEC §5: config value per project; no model IDs here
             "--append-system-prompt-file",
             system_prompt_file,
+            # The run is unattended: there is nobody to answer a permission
+            # prompt, and `acceptEdits` auto-accepts file edits ONLY — every
+            # Bash call (git, the project's own test runner, package installs)
+            # would block forever and burn the ceiling. The container is the
+            # wall here, not the permission dialog: capable box, no route out
+            # except the egress proxy, destroyed after the run (SPEC §4.2).
             "--permission-mode",
-            "acceptEdits",
+            "bypassPermissions",
             "@" + prompt_file,
         ]
 
@@ -164,7 +198,7 @@ class ClaudeSpec:
         stderr = stderr or ""
 
         # 1. The manager killed us at the ceiling.
-        if exit_code == SIGTERM_EXIT_CODE:
+        if exit_code in SIGNAL_EXIT_CODES:
             return Classification(
                 AttemptOutcome.TIMEOUT, ResultStatus.TIMEOUT, "terminated at the run ceiling"
             )
@@ -198,9 +232,10 @@ class ClaudeSpec:
                 AttemptOutcome.AGENT_FAILURE, ResultStatus.FAILURE, f"subtype={subtype}"
             )
 
-        # 6. A hard usage-limit stop arrives as text in `result`.
+        # 6. A hard usage-limit stop arrives as text in `result` (see the
+        #    USAGE_LIMIT_TEXT comment for why the match is anchored).
         text = str(envelope.get("result") or "")
-        if USAGE_LIMIT_TEXT.search(text):
+        if USAGE_LIMIT_TEXT.search(text.strip()):
             return Classification(
                 AttemptOutcome.QUOTA_EXHAUSTED,
                 ResultStatus.QUOTA_EXHAUSTED,
@@ -209,7 +244,11 @@ class ClaudeSpec:
             )
 
         if subtype == "success" and not envelope.get("is_error"):
-            return Classification(AttemptOutcome.CI_GREEN, ResultStatus.SUCCESS, "subtype=success")
+            # outcome is deliberately None. The CLI finishing cleanly is not a
+            # verdict on the work: doctrine #1 says only executed CI decides, and
+            # at this point no PR exists and no check has run. The orchestrator
+            # writes ci_green/ci_red once the oracle reports (SPEC §3.2).
+            return Classification(None, ResultStatus.SUCCESS, "subtype=success")
 
         return Classification(
             AttemptOutcome.AGENT_FAILURE,

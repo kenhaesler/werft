@@ -98,10 +98,65 @@ def test_credential_never_appears_in_argv(spec, task, tmp_path):
 # --- classification: one test per fixture ------------------------------------
 
 
-def test_success(spec):
+def test_success_does_not_assert_a_ci_verdict(spec):
+    """Doctrine #1: only executed CI decides whether work is good.
+
+    The CLI finishing cleanly happens before the PR exists and before any check
+    has run, so claiming CI_GREEN here would be an LLM-adjacent verdict standing
+    in for the oracle. The orchestrator fills the outcome in once CI reports.
+    """
     result = spec.classify(envelope=envelope_from("success.jsonl"), stderr="", exit_code=0)
-    assert result.outcome == AttemptOutcome.CI_GREEN
     assert result.status == ResultStatus.SUCCESS
+    assert result.outcome is None
+    assert result.outcome != AttemptOutcome.CI_GREEN
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "You have hit your session limit, resets 3:45pm",
+        "Claude usage limit reached for this account.",
+        "Claude AI usage limit reached|1754073000",
+        "Weekly limit reached",
+        "You have exceeded your rate limit",
+    ],
+)
+def test_both_word_orders_of_a_limit_stop_are_caught(spec, text):
+    """Matching only "hit ... limit" classified "usage limit reached" — the
+    phrasing the CLI actually uses — as a SUCCESSFUL run."""
+    envelope = {"type": "result", "subtype": "success", "is_error": False, "result": text}
+    result = spec.classify(envelope=envelope, stderr="", exit_code=0)
+    assert result.outcome == AttemptOutcome.QUOTA_EXHAUSTED, f"missed: {text!r}"
+    assert result.status == ResultStatus.QUOTA_EXHAUSTED
+
+
+def test_an_agents_own_summary_mentioning_limits_is_not_quota_exhaustion(spec):
+    """`result` normally holds the agent's summary. A run that genuinely
+    succeeded while working ON rate limiting must not park the account."""
+    envelope = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": (
+            "Implemented retry handling for the upstream API. Added a test that "
+            "asserts we back off when the usage limit is reached, and documented "
+            "the rate limit behaviour in the README."
+        ),
+    }
+    result = spec.classify(envelope=envelope, stderr="", exit_code=0)
+    assert result.status == ResultStatus.SUCCESS
+    assert result.outcome != AttemptOutcome.QUOTA_EXHAUSTED
+
+
+def test_a_benign_stderr_mentioning_quota_is_not_provider_exhaustion(spec):
+    """The bare word "quota" appears in disk-quota warnings and project names."""
+    result = spec.classify(
+        envelope={"type": "result", "subtype": "success", "is_error": False, "result": "done"},
+        stderr="npm warn: disk quota advisory for /home/runner\n",
+        exit_code=0,
+    )
+    assert result.status == ResultStatus.SUCCESS
+    assert result.outcome != AttemptOutcome.QUOTA_EXHAUSTED
 
 
 def test_refusal_is_policy_block(spec):
@@ -159,6 +214,50 @@ def test_reset_time_is_parsed_when_iso8601(spec):
     result = spec.classify(envelope=envelope, stderr="", exit_code=0)
     assert result.outcome == AttemptOutcome.QUOTA_EXHAUSTED
     assert isinstance(result.exhausted_until, datetime)
+    assert result.exhausted_until.tzinfo is not None
+
+
+def test_a_naive_iso_reset_time_is_rejected(spec):
+    """exhausted_until is a TIMESTAMPTZ. A value with no offset would be read in
+    whatever zone the reader assumes — the same invented number §7 forbids,
+    just quieter than a guess."""
+    envelope = {
+        "type": "result",
+        "subtype": "success",
+        "result": "You have hit your usage limit, resets 2026-08-01T21:00:00",
+    }
+    result = spec.classify(envelope=envelope, stderr="", exit_code=0)
+    assert result.outcome == AttemptOutcome.QUOTA_EXHAUSTED
+    assert result.exhausted_until is None
+
+
+@pytest.mark.parametrize("exit_code", [143, 137])
+def test_both_signal_deaths_are_timeouts(spec, exit_code):
+    """The manager's ceiling kills with SIGKILL (137), not SIGTERM (143), so
+    handling only 143 left the path that actually fires misclassified."""
+    result = spec.classify(envelope=None, stderr="", exit_code=exit_code)
+    assert result.outcome == AttemptOutcome.TIMEOUT
+    assert result.status == ResultStatus.TIMEOUT
+
+
+def test_argv_does_not_block_on_permission_prompts(spec, task):
+    """An unattended run has nobody to answer a prompt; acceptEdits allows file
+    edits only, so every Bash call (git, tests, installs) would hang until the
+    ceiling. The container is the wall, not the permission dialog."""
+    argv = spec.build_argv(task, prompt_file="/p", system_prompt_file="/s")
+    assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
+
+
+def test_stderr_pattern_order_is_load_bearing(spec):
+    """A suspension message that also says "limit" must classify as policy_block,
+    not quota_exhausted: re-auth and quota alerts send the operator different
+    places, and a suspended account never recovers by waiting for a reset."""
+    result = spec.classify(
+        envelope=None,
+        stderr="Your account has been suspended for exceeding the usage limit.",
+        exit_code=1,
+    )
+    assert result.outcome == AttemptOutcome.POLICY_BLOCK
 
 
 def test_stderr_only_auth_failure_is_never_a_parse_error(spec):
@@ -222,7 +321,8 @@ def test_transient_api_retry_is_not_a_run_outcome(spec):
     """A retried-and-recovered rate limit must not fail the run."""
     parsed = parse_stream(load("api_retry_rate_limit.jsonl"))
     result = spec.classify(envelope=parsed.result, stderr="", exit_code=0)
-    assert result.outcome == AttemptOutcome.CI_GREEN
+    assert result.status == ResultStatus.SUCCESS
+    assert result.outcome != AttemptOutcome.QUOTA_EXHAUSTED
 
 
 def test_parse_stream_survives_a_malformed_line(spec):
