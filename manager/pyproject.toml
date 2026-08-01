@@ -1,0 +1,65 @@
+[project]
+name = "werft-manager"
+version = "0.1.0"
+description = "Werft manager: scheduler + API + static dashboard, one process, one event loop (SPEC §1)"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    # SPEC §2 pins (2026-07-31), re-verified against PyPI 2026-08-01
+    "fastapi==0.140.*",            # SPEC 0.140.x (0.141.1 exists; SPEC governs)
+    "starlette>=1.3.1,<2",         # explicit floor: CVE-2026-54283 (SPEC §2)
+    "uvicorn==0.51.*",             # SPEC 0.51.x (0.52.0 exists; SPEC governs)
+    "pydantic>=2.13,<3",
+    "pydantic-settings>=2.14,<3",
+    "sqlalchemy[asyncio]>=2.0.51,<2.1",
+    "asyncpg==0.31.0",             # "pin exact at first uv lock" (SPEC §2)
+    "alembic==1.18.*",
+    "structlog==26.1.*",
+    "httpx==0.28.1",               # exact; httpx2 evaluated 2026-08-01 and NOT adopted
+                                   # (see docs/superpowers/plans/2026-08-01-thin-loop-t1-t2.md)
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.*",
+    "pytest-asyncio==1.4.*",
+    "hypothesis==6.164.*",
+    "testcontainers[postgres]==4.15.*",
+    "ruff==0.16.1",                # exact-pinned CI gate (SPEC §2)
+    "import-linter==2.13",         # exact-pinned CI gate (SPEC §2)
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["werft"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.importlinter]
+root_packages = ["werft"]
+
+[[tool.importlinter.contracts]]
+name = "Werft layered architecture (SPEC §1 one-engine guarantee; lineage A§3)"
+type = "layers"
+containers = ["werft"]
+exhaustive = true
+layers = [
+    "app",
+    "api",
+    "orchestrator",
+    "github | observe | quota | runner",
+    "providers",
+    "config | contracts | db",
+    "domain",
+]
