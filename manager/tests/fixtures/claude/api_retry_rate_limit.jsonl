@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","session_id":"ses_07","model":"claude-sonnet-5","cwd":"/work"}
+{"type":"system","subtype":"api_retry","error":"rate_limit","error_status":429,"attempt":1,"max_retries":5,"retry_delay_ms":8000}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Retrying after the rate limit cleared."}]}}
+{"type":"result","subtype":"success","is_error":false,"stop_reason":null,"num_turns":4,"duration_ms":72110,"session_id":"ses_07","total_cost_usd":0.019,"usage":{"input_tokens":5000,"output_tokens":600},"result":"Done."}
