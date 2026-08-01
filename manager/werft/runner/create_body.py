@@ -75,12 +75,19 @@ class ProjectRunnerConfig(BaseModel):
 
 @dataclass(frozen=True)
 class RunPlacement:
-    """Enumerated per-run facts, every one manager-computed."""
+    """Enumerated per-run facts, every one manager-computed.
+
+    `run_dir` is carried explicitly rather than derived from one of the other
+    paths: a containment check anchored to its own input can only prove the
+    inputs agree with each other, never that they are where the manager meant
+    them to be.
+    """
 
     run_id: str
     container_name: str
     network_name: str
     dns_ip: str
+    run_dir: str
     workspace_dir: str
     outputs_dir: str
     task_json_path: str
@@ -88,9 +95,18 @@ class RunPlacement:
 
 
 def _contained(path: str, run_root: str) -> str:
-    """Resolve a mount source and refuse anything outside this run's directory."""
+    """Resolve a mount source and refuse anything that is not *strictly under*
+    this run's directory.
+
+    Strictness matters twice over. Equality with the run root is refused because
+    binding the run directory itself would expose `secrets/` at `/outputs` under
+    the shared `:z` label, and SPEC §4.3 is explicit that "The shared label is
+    outputs-only". And the separator check prevents the classic prefix bug where
+    `/srv/werft/runs/r10` passes a containment check anchored at
+    `/srv/werft/runs/r1`.
+    """
     real = os.path.realpath(path)
-    if real != run_root and not real.startswith(run_root + os.sep):
+    if real == run_root or not real.startswith(run_root + os.sep):
         raise CreateBodyError(
             f"mount source {path!r} resolves outside the run directory {run_root!r}"
         )
@@ -106,7 +122,7 @@ def build_create_body(
             f"image {config.image_digest!r} must be digest-pinned (SPEC §4.1); tags are rejected"
         )
 
-    run_root = os.path.dirname(os.path.realpath(placement.task_json_path))
+    run_root = os.path.realpath(placement.run_dir)
     workspace = _contained(placement.workspace_dir, run_root)
     outputs = _contained(placement.outputs_dir, run_root)
     secrets = _contained(placement.secrets_dir, run_root)

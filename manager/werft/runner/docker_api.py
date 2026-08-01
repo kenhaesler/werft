@@ -105,12 +105,21 @@ class DockerClient:
 
     @staticmethod
     def _check(response: httpx.Response) -> None:
-        if response.status_code >= 400:
+        if response.status_code < 400:
+            return
+        # On a streamed response the body has not been read yet, and touching
+        # .text/.json() would raise httpx.ResponseNotRead — masking the real
+        # daemon error behind an httpx internal.
+        if not response.is_closed and not hasattr(response, "_content"):
             try:
-                message = response.json().get("message", response.text)
-            except ValueError:
-                message = response.text
-            raise DockerApiError(response.status_code, message)
+                response.read()
+            except Exception:
+                raise DockerApiError(response.status_code, "<unreadable body>") from None
+        try:
+            message = response.json().get("message", response.text)
+        except ValueError:
+            message = response.text
+        raise DockerApiError(response.status_code, message)
 
     # --- networks ---------------------------------------------------------
 
@@ -183,15 +192,41 @@ class DockerClient:
         self._check(response)
         return response.json()
 
+    async def container_disk_usage_bytes(self, container_id: str) -> int:
+        """Bytes written to the container's own writable layer.
+
+        SPEC §4.2: "disk bounded by manager-side polling with hard kill". The
+        poller lives in the orchestrator; this is the reading it polls. Bind
+        mounts are not counted here — those are on Werft-owned filesystems and
+        are bounded by the XFS project quota (SPEC §10).
+        """
+        response = await self._client.get(
+            self._path(f"/containers/{quote(container_id, safe='')}/json"), params={"size": "true"}
+        )
+        self._check(response)
+        return int(response.json().get("SizeRw") or 0)
+
     # --- events -----------------------------------------------------------
 
-    async def watch_die_events(self, run_id: str) -> AsyncIterator[DieEvent]:
-        """Stream `die` events for one run. Never a blocking wait, never log content."""
+    async def watch_die_events(
+        self, run_id: str, *, since: int | None = None
+    ) -> AsyncIterator[DieEvent]:
+        """Stream `die` events for one run. Never a blocking wait, never log content.
+
+        `since` is not optional in practice: a container that exits between
+        `start` and the stream being established emits its die event into the
+        gap, and without a replay window the manager waits out the entire run
+        ceiling for an event that already happened. Callers pass a timestamp
+        taken *before* the container was created.
+        """
         filters = json.dumps(
             {"label": [f"werft.run_id={run_id}"], "event": ["die"], "type": ["container"]}
         )
+        params: dict[str, Any] = {"filters": filters}
+        if since is not None:
+            params["since"] = str(since)
         async with self._client.stream(
-            "GET", self._path("/events"), params={"filters": filters}, timeout=None
+            "GET", self._path("/events"), params=params, timeout=None
         ) as response:
             self._check(response)
             async for line in response.aiter_lines():
@@ -199,6 +234,9 @@ class DockerClient:
                     continue
                 event = json.loads(line)
                 attributes = event.get("Actor", {}).get("Attributes", {})
+                # -1 when the daemon reports no exitCode: an unknown exit must
+                # never be mistaken for 0, which lifecycle reads as
+                # "contract fulfilled".
                 yield DieEvent(
                     container_id=event.get("Actor", {}).get("ID", event.get("id", "")),
                     exit_code=int(attributes.get("exitCode", -1)),

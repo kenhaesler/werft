@@ -112,6 +112,59 @@ def test_running_total_cap_stops_collection_and_names_what_was_dropped(trees):
     assert all(d.size_bytes == 400 for d in report.dropped)
 
 
+def test_over_cap_eviction_is_largest_first_not_walk_order(trees):
+    """SPEC §8: "over-cap drops largest-first".
+
+    Encounter-order eviction would hand the choice to the agent, which picks the
+    filenames and therefore the walk order. Names here are deliberately ordered
+    so that walk order and size order disagree.
+    """
+    src, dest = trees
+    (src / "a_huge.bin").write_bytes(b"x" * 900)  # first in walk order, largest
+    (src / "b_small.bin").write_bytes(b"x" * 100)
+    (src / "c_small.bin").write_bytes(b"x" * 100)
+
+    report = collect_outputs(str(src), str(dest), max_total_bytes=1000, max_file_bytes=10_000)
+
+    kept = {a.rel_path for a in report.artifacts}
+    assert kept == {"b_small.bin", "c_small.bin"}, "the two small files must survive"
+    assert [d.rel_path for d in report.dropped] == ["a_huge.bin"]
+    assert report.truncated is True
+
+
+def test_eviction_is_deterministic_regardless_of_name(trees):
+    """Equal-size files evict by a stable rule, not by whatever the agent named them."""
+    src, dest = trees
+    for name in ("zzz.bin", "aaa.bin", "mmm.bin"):
+        (src / name).write_bytes(b"x" * 400)
+
+    first = collect_outputs(str(src), str(dest), max_total_bytes=800, max_file_bytes=10_000)
+    second = collect_outputs(str(src), str(dest), max_total_bytes=800, max_file_bytes=10_000)
+
+    assert [a.rel_path for a in first.artifacts] == [a.rel_path for a in second.artifacts]
+
+
+def test_an_unreadable_entry_does_not_abort_the_whole_collection(trees, monkeypatch):
+    """A root agent can delete or swap an entry mid-walk. Losing one file must not
+    cost the run its entire evidence trail."""
+    src, dest = trees
+    (src / "good.txt").write_text("keep me")
+    (src / "vanishes.txt").write_text("gone by the time we stat it")
+
+    real_lstat = os.lstat
+
+    def flaky_lstat(path, *args, **kwargs):
+        if str(path).endswith("vanishes.txt"):
+            raise OSError(2, "No such file or directory")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", flaky_lstat)
+    report = collect_outputs(str(src), str(dest))
+
+    assert [a.rel_path for a in report.artifacts] == ["good.txt"]
+    assert any(d.rel_path == "vanishes.txt" and d.reason == "unreadable" for d in report.dropped)
+
+
 @pytest.mark.skipif(
     os.name != "posix", reason="POSIX modes are not real on Windows (only the read-only bit)"
 )

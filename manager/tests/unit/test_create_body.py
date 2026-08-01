@@ -1,4 +1,4 @@
-"""SPEC §4.2: the create-body is built from three components and the body test
+"""SPEC Â§4.2: the create-body is built from three components and the body test
 asserts byte-equality on BASE, key-enumeration on the per-run component, schema
 on the delta, and explicit negative assertions.
 """
@@ -37,6 +37,7 @@ def placement(run_dir, **over):
         "container_name": "werft-run-0198e1b2",
         "network_name": "werft-run-0198e1b2-net",
         "dns_ip": "10.90.7.53",
+        "run_dir": str(run_dir),
         "workspace_dir": str(run_dir / "workspace"),
         "outputs_dir": str(run_dir / "outputs"),
         "task_json_path": str(run_dir / "task.json"),
@@ -54,15 +55,49 @@ def body(run_dir, **over):
     return build_create_body(placement(run_dir, **over), config(), entrypoint=ENTRYPOINT)
 
 
-def test_base_host_config_is_byte_equal(run_dir):
+def test_base_host_config_is_byte_equal_to_this_literal():
+    """SPEC Â§4.2: "byte-equality on BASE".
+
+    This is an ALLOWLIST, and it has to be. Comparing the produced body against
+    BASE_HOST_CONFIG only proves composition does not mutate BASE â€” it pins
+    nothing, so a maintainer adding `Mounts` with the docker socket, or
+    `MaskedPaths: []`, or `PublishAllPorts: true`, or `GroupAdd: ["docker"]`
+    passes an entire suite of negative assertions, because those are a
+    hand-written denylist and the Docker API surface is far larger than it.
+
+    Changing BASE must therefore be a deliberate act that edits this literal.
+    """
+    assert BASE_HOST_CONFIG == {
+        "CapDrop": ["ALL"],
+        "CapAdd": [
+            "CHOWN",
+            "DAC_OVERRIDE",
+            "FOWNER",
+            "KILL",
+            "SETFCAP",
+            "SETGID",
+            "SETUID",
+        ],
+        "SecurityOpt": ["no-new-privileges:true"],
+        "ReadonlyRootfs": False,
+        "Privileged": False,
+        "PidsLimit": 4096,
+        "ShmSize": 1 << 30,
+        "Tmpfs": {"/tmp": "rw,nosuid,nodev,size=1g"},
+        "PortBindings": {},
+        "AutoRemove": False,
+    }
+
+
+def test_composition_does_not_mutate_base(run_dir):
     host = body(run_dir)["HostConfig"]
     for key, value in BASE_HOST_CONFIG.items():
         assert host[key] == value, f"BASE key {key} was mutated"
 
 
 def test_cap_floor_is_the_empirically_locked_set(run_dir):
-    # SPEC §4.2 defers the exact floor to an empirical test "and then locked by
-    # the create-body test". Settled 2026-08-01 — see scripts/capfloor.sh.
+    # SPEC Â§4.2 defers the exact floor to an empirical test "and then locked by
+    # the create-body test". Settled 2026-08-01 â€” see scripts/capfloor.sh.
     assert CAP_ADD_FLOOR == (
         "CHOWN",
         "DAC_OVERRIDE",
@@ -76,7 +111,7 @@ def test_cap_floor_is_the_empirically_locked_set(run_dir):
 
 
 def test_per_run_component_keys_are_exactly_enumerated():
-    """SPEC §4.2: no other key may ever appear in the per-run component."""
+    """SPEC Â§4.2: no other key may ever appear in the per-run component."""
     assert frozenset({"NetworkMode", "Dns", "Binds", "Labels"}) == PER_RUN_KEYS
 
 
@@ -113,12 +148,11 @@ def test_negative_assertions_on_the_final_body(run_dir):
         "IpcMode",
         "CgroupnsMode",
         "UsernsMode",
-        "NetworkMode_host",
     ):
         assert absent not in host, f"{absent} must be ABSENT, not falsy"
     assert host["PortBindings"] == {}
-    assert "User" not in b, "SPEC §4.2: root inside — User absent"
-    assert host["ReadonlyRootfs"] is False, "SPEC §4.2: capable box"
+    assert "User" not in b, "SPEC Â§4.2: root inside â€” User absent"
+    assert host["ReadonlyRootfs"] is False, "SPEC Â§4.2: capable box"
     assert host["NetworkMode"] != "host"
     assert all("docker.sock" not in bind for bind in host["Binds"])
 
@@ -131,18 +165,18 @@ def test_spec_resource_shape(run_dir):
 
 
 def test_mount_shape_matches_spec_verbatim(run_dir):
-    """SPEC §4.2: workspace rw :Z; outputs dir rw :z; task.json ro; secrets/ ro; nothing else."""
+    """SPEC Â§4.2: workspace rw :Z; outputs dir rw :z; task.json ro; secrets/ ro; nothing else."""
     host = body(run_dir)["HostConfig"]
     assert len(host["Binds"]) == 4
     workspace, outputs, task, secrets = host["Binds"]
     assert workspace.endswith(":/work:rw,Z")  # private label
-    assert outputs.endswith(":/outputs:rw,z")  # shared label — manager reads after exit (§4.3)
+    assert outputs.endswith(":/outputs:rw,z")  # shared label â€” manager reads after exit (Â§4.3)
     assert task.endswith(":/task.json:ro")
-    assert secrets.endswith(":/run/secrets:ro")  # DIRECTORY — re-mint by rename is seen
+    assert secrets.endswith(":/run/secrets:ro")  # DIRECTORY â€” re-mint by rename is seen
 
 
 def test_top_level_body_keys_are_exactly_enumerated(run_dir):
-    """Nothing may appear at the top level beyond the enumerated set — a new key
+    """Nothing may appear at the top level beyond the enumerated set â€” a new key
     there (User, NetworkingConfig, HostConfig-bypassing fields) must fail loudly."""
     assert set(body(run_dir)) == {
         "Image",
@@ -204,7 +238,7 @@ def test_mount_source_traversal_is_refused(run_dir):
 
 
 def test_symlinked_mount_source_is_refused(run_dir, tmp_path):
-    """realpath, not the literal path — a symlink out of the run dir must not pass."""
+    """realpath, not the literal path â€” a symlink out of the run dir must not pass."""
     secret = tmp_path / "host-secrets"
     secret.mkdir()
     link = run_dir / "workspace-link"

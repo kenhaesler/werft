@@ -2,7 +2,7 @@
 
 Skipped where no daemon socket exists (Windows dev box); runs in CI on
 ubuntu-24.04. SELinux-label behaviour (:Z / :z) and `ps -eZ` showing
-`container_t` are NOT falsifiable here — they need the Rocky Linux 10 host with
+`container_t` are NOT falsifiable here â€” they need the Rocky Linux 10 host with
 SELinux enforcing, and are asserted by install.sh at T9.
 """
 
@@ -32,8 +32,8 @@ TEST_IMAGE_REF = "busybox:1.37"
 @pytest.fixture
 async def client():
     async with DockerClient() as docker:
-        # Step down to whatever this daemon serves — CI's runner is older than
-        # the SPEC §2 floor the manager targets in production.
+        # Step down to whatever this daemon serves â€” CI's runner is older than
+        # the SPEC Â§2 floor the manager targets in production.
         await docker.negotiate()
         yield docker
 
@@ -51,7 +51,7 @@ def run_dir(tmp_path):
 
 
 async def pinned_image(client: DockerClient) -> str:
-    """Resolve the test image to a digest — create bodies are digest-only."""
+    """Resolve the test image to a digest â€” create bodies are digest-only."""
     proc = await asyncio.create_subprocess_exec(
         "docker",
         "image",
@@ -78,6 +78,7 @@ def placement_for(run_dir, tag: str) -> RunPlacement:
         container_name=f"werft-itest-{tag}",
         network_name=f"werft-itest-{tag}-net",
         dns_ip="127.0.0.11",
+        run_dir=str(run_dir),
         workspace_dir=str(run_dir / "workspace"),
         outputs_dir=str(run_dir / "outputs"),
         task_json_path=str(run_dir / "task.json"),
@@ -146,25 +147,48 @@ async def test_two_concurrent_runs_cannot_reach_each_other(client, tmp_path):
         for placement in placements:
             await lifecycle.prepare(placement)
             ids.append(
-                await lifecycle.launch(placement, config, entrypoint=["/bin/sh", "-c", "sleep 30"])
+                await lifecycle.launch(
+                    placement,
+                    config,
+                    # A listener each, so reachability is directly observable.
+                    entrypoint=["/bin/sh", "-c", "while true; do nc -l -p 9000 -e /bin/true; done"],
+                )
             )
 
-        b_info = await client.inspect_container(ids[1])
-        b_networks = b_info["NetworkSettings"]["Networks"]
-        b_ip = next(iter(b_networks.values()))["IPAddress"]
-        assert b_ip, "run B must have an address on its own network"
+        async def address_of(container_id: str) -> str:
+            info = await client.inspect_container(container_id)
+            networks = info["NetworkSettings"]["Networks"]
+            return next(iter(networks.values()))["IPAddress"]
 
-        probe = await asyncio.create_subprocess_exec(
-            "docker",
-            "exec",
-            ids[0],
-            "/bin/sh",
-            "-c",
-            f"nc -w 2 -z {b_ip} 22 || ping -c1 -W2 {b_ip}",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+        async def can_reach(from_id: str, ip: str) -> bool:
+            probe = await asyncio.create_subprocess_exec(
+                "docker",
+                "exec",
+                from_id,
+                "/bin/sh",
+                "-c",
+                f"nc -w 3 {ip} 9000 </dev/null",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            return await probe.wait() == 0
+
+        a_ip, b_ip = await address_of(ids[0]), await address_of(ids[1])
+        assert a_ip and b_ip, "both runs must have an address on their own network"
+        await asyncio.sleep(1.0)  # let both listeners bind
+
+        # POSITIVE CONTROL. Without this the test is vacuous: if the probe tool
+        # were missing or the listener never started, an unreachable-looking
+        # result would "prove" isolation that does not exist.
+        assert await can_reach(ids[0], a_ip), (
+            "probe is broken: run A cannot reach its own listener, so a negative "
+            "result below would prove nothing"
         )
-        assert await probe.wait() != 0, "run A must not reach run B's address"
+        assert await can_reach(ids[1], b_ip), "probe is broken on run B"
+
+        # THE ACTUAL ASSERTION.
+        assert not await can_reach(ids[0], b_ip), "run A must not reach run B"
+        assert not await can_reach(ids[1], a_ip), "run B must not reach run A"
     finally:
         for placement, container_id in zip(placements, ids, strict=False):
             await lifecycle.teardown(placement, container_id)
