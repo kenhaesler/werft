@@ -38,6 +38,9 @@ packages = ["werft"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "docker: needs a real Docker daemon (skipped when the daemon socket is absent)",
+]
 
 [tool.ruff]
 line-length = 100
@@ -63,3 +66,12 @@ layers = [
     "config | contracts | db",
     "domain",
 ]
+
+[[tool.importlinter.contracts]]
+# SPEC §3.3.1: "Runners are DB-blind — file in (task.json), files out
+# (result.json, log.jsonl), exit code." The runner plane composes container
+# bodies and reads output trees; it must never grow a database path.
+name = "The runner plane is DB-blind (SPEC §3.3.1)"
+type = "forbidden"
+source_modules = ["werft.runner", "werft.providers"]
+forbidden_modules = ["werft.db"]
