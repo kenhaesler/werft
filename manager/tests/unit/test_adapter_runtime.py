@@ -185,6 +185,7 @@ def test_run_cli_does_not_deadlock_on_a_chatty_stderr(tmp_path):
         dict(os.environ),
         log_path=str(log),
         ceiling_seconds=30,
+        cwd=str(tmp_path),
     )
 
     assert exit_code == 0, "a chatty stderr must not deadlock the adapter"
@@ -206,6 +207,7 @@ def test_run_cli_ceiling_fires_on_a_silent_child(tmp_path):
         dict(os.environ),
         log_path=str(log),
         ceiling_seconds=2,
+        cwd=str(tmp_path),
     )
     elapsed = time.monotonic() - started
 
@@ -220,6 +222,7 @@ def test_run_cli_reports_an_unstartable_cli_as_exit_2(tmp_path):
         dict(os.environ),
         log_path=str(tmp_path / "log.jsonl"),
         ceiling_seconds=5,
+        cwd=str(tmp_path),
     )
     assert exit_code == EXIT_CLI_UNSTARTABLE
     assert "could not start" in detail

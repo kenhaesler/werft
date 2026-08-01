@@ -51,6 +51,7 @@ def run_cli(
     log_path: str,
     ceiling_seconds: float,
     secrets: list[str] | None = None,
+    cwd: str = WORKSPACE,
 ) -> tuple[int, str]:
     """Run the CLI, tee a redacted transcript, return (exit code, stderr tail).
 
@@ -67,9 +68,9 @@ def run_cli(
     stderr_tail: deque[str] = deque(maxlen=50)
 
     try:
-        process = start_in_own_process_group(argv, env, WORKSPACE)
+        process = start_in_own_process_group(argv, env, cwd)
     except OSError as exc:
-        return EXIT_CLI_UNSTARTABLE, f"could not start {argv[0]!r}: {exc}"
+        return EXIT_CLI_UNSTARTABLE, f"could not start {argv[0]!r} in {cwd!r}: {exc}"
 
     def drain_stderr() -> None:
         for line in process.stderr or ():
