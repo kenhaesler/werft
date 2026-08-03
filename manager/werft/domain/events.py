@@ -2,5 +2,7 @@
 
 NOTIFY_CHANNEL = "werft_events"
 
-RUN_EVENT_TYPES = frozenset({"created", "status_changed", "dispatch", "ci_observed", "alert"})
+RUN_EVENT_TYPES = frozenset(
+    {"created", "status_changed", "dispatch", "ci_observed", "alert", "cleanup"}
+)
 PROJECT_EVENT_TYPES = frozenset({"onboarded", "lifecycle_flipped", "protection_applied"})
