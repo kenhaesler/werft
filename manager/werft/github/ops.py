@@ -1,4 +1,4 @@
-"""RepoOps: the closed set of repo operations (SPEC §8 GitHub integration;
+"""RepoOps: the closed set of repo operations (SPEC §6 GitHub integration;
 plan Task 3/A3).
 
 Every repo-scoped GitHub call the orchestrator or dispatcher needs — refs,
@@ -14,11 +14,11 @@ Two idempotency seams matter enough to be load-bearing, not incidental:
 - **Adopt-on-422** (`open_pr`, `ensure_branch`): a crash between "create"
   and "record the result" is a normal failure mode for a poller-driven
   system with no distributed transaction across GitHub and Werft's own DB
-  (SPEC §8.3). Re-driving the same create call hits GitHub's own
-  duplicate-resource 422; rather than treat that as fatal, both methods
-  fall back to *reading* the resource GitHub says already exists and
-  returning it, so a re-driven caller converges on the same state a
-  first-try success would have left.
+  (SPEC §6.2: PR-open is idempotent, adopt-on-422). Re-driving the same
+  create call hits GitHub's own duplicate-resource 422; rather than treat
+  that as fatal, both methods fall back to *reading* the resource GitHub
+  says already exists and returning it, so a re-driven caller converges on
+  the same state a first-try success would have left.
 - **Doctrine #1, mechanically** (`oracle_check`): "no LLM opinion exists
   anywhere in this path" (lineage ARCHITECTURE-v1.4 §6.4/§8.2) means a
   check-run conclusion of `neutral` or `skipped` must never read as green —
@@ -107,7 +107,7 @@ def _error_message(response: httpx.Response) -> str:
     return response.text
 
 
-#: `apply_partial_protection`'s exact body (SPEC §8.1: the protection
+#: `apply_partial_protection`'s exact body (SPEC §6.3: the protection
 #: `unattended` gets at repo creation, before any run PR — and thus any
 #: `werft-oracle` check — exists): enforce-admins and no
 #: force-push/deletions from day one, but no required check yet, since
@@ -125,7 +125,7 @@ _PARTIAL_PROTECTION_BODY: dict[str, Any] = {
 #: doctrine-#1 flip on the first green `werft-oracle` check): same base,
 #: `required_status_checks` now requires the branch be up to date
 #: (`strict`) against exactly the `werft-oracle` context — the
-#: merged-result guarantee (SPEC §8.2 `strict_serialized`) depends on
+#: merged-result guarantee (SPEC §6.2 `strict_serialized`) depends on
 #: `strict: True` specifically.
 _STRICT_PROTECTION_BODY: dict[str, Any] = {
     **_PARTIAL_PROTECTION_BODY,
@@ -183,7 +183,7 @@ class RepoOps:
         return existing
 
     async def force_reset_ref(self, branch: str, sha: str) -> None:
-        """Force `refs/heads/<branch>` to point at `sha` (SPEC §8.1: every
+        """Force `refs/heads/<branch>` to point at `sha` (SPEC §6.1/§3.2: every
         dispatch attempt force-resets the run branch to `unattended` HEAD)."""
         await self._client.request(
             "PATCH",
@@ -194,7 +194,7 @@ class RepoOps:
 
     async def delete_ref(self, branch: str) -> None:
         """Delete `refs/heads/<branch>`; already-gone (404) is a no-op —
-        terminal-path cleanup (SPEC §8.1) may race a repo's own
+        terminal-path cleanup (SPEC §6.1/§3.2) may race a repo's own
         auto-delete-on-merge."""
         await self._client.request(
             "DELETE", self._repo_path(f"/git/refs/heads/{branch}"), expect=(204, 404)
@@ -247,7 +247,7 @@ class RepoOps:
         )
 
     async def update_branch(self, number: int, expected_head_sha: str) -> None:
-        """Update PR `number`'s branch from its base (SPEC §8.2
+        """Update PR `number`'s branch from its base (SPEC §6.2
         `strict_serialized`: the pre-merge refresh that makes
         green-on-updated-head mean green-on-merged-result).
         `expected_head_sha` guards the update against a head that moved
@@ -320,7 +320,7 @@ class RepoOps:
     # -- backlog issues -------------------------------------------------------
 
     async def list_ready_issues(self) -> ConditionalResult:
-        """Open issues labeled `werft:ready`, ETag-conditional (SPEC §8.3:
+        """Open issues labeled `werft:ready`, ETag-conditional (SPEC §6.2:
         free 304s on the 60 s backlog poll). Items that are actually pull
         requests (GitHub's issues API returns both; a `pull_request` key is
         the tell) are filtered out of `data` before returning — belt-and-
@@ -337,7 +337,7 @@ class RepoOps:
 
     async def ensure_label(self, name: str, color: str) -> None:
         """Create label `name` if absent; a 422 (already exists) is a
-        no-op — onboarding (SPEC §8.6) re-runs idempotently."""
+        no-op — onboarding (lineage ARCHITECTURE-v1.4 §8.6) re-runs idempotently."""
         await self._client.request(
             "POST",
             self._repo_path("/labels"),
@@ -360,7 +360,7 @@ class RepoOps:
         """The protection the doctrine-#1 flip (SPEC §3.1) applies on the
         first green `werft-oracle` check: same base as partial, plus a
         `strict` (must-be-up-to-date) required check on exactly
-        `werft-oracle` — the merged-result guarantee (SPEC §8.2) depends
+        `werft-oracle` — the merged-result guarantee (SPEC §6.2) depends
         on."""
         await self._client.request(
             "PUT",
