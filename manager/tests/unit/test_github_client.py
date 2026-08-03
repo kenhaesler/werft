@@ -188,6 +188,51 @@ async def test_get_conditional_key_includes_params_so_different_params_get_own_e
     assert len(calls) == 2
 
 
+async def test_invalidate_conditional_forgets_every_etag_so_the_next_get_refetches():
+    """The ETag store advances the instant GitHub answers 200, but the rows
+    derived from that body only become durable when the *caller's*
+    transaction commits. A caller whose unit rolled back has to be able to
+    say "forget what I just learned", or the next poll gets a free 304 for a
+    body it never actually persisted — silently, forever."""
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        assert "if-none-match" not in request.headers
+        return httpx.Response(200, headers={"etag": '"abc123"'}, json=[{"id": 1}])
+
+    client = client_with(handler)
+
+    await client.get_conditional("/repos/acme/widgets/issues", params={"state": "open"})
+    client.invalidate_conditional()
+    result = await client.get_conditional("/repos/acme/widgets/issues", params={"state": "open"})
+
+    assert len(calls) == 2
+    assert result.modified is True  # a real body, not a 304 over lost writes
+
+
+async def test_invalidate_conditional_with_a_prefix_leaves_other_paths_cached():
+    """One project's rolled-back poll must not throw away another project's
+    (or another endpoint's) hard-won ETag — the client is shared per
+    project, but the store is keyed by path."""
+    seen: list[tuple[str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, request.headers.get("if-none-match")))
+        return httpx.Response(200, headers={"etag": '"e1"'}, json=[])
+
+    client = client_with(handler)
+
+    await client.get_conditional("/repos/acme/widgets/issues")
+    await client.get_conditional("/repos/other/repo/issues")
+    client.invalidate_conditional("/repos/acme/widgets")
+    await client.get_conditional("/repos/acme/widgets/issues")
+    await client.get_conditional("/repos/other/repo/issues")
+
+    assert seen[2] == ("/repos/acme/widgets/issues", None)  # invalidated
+    assert seen[3] == ("/repos/other/repo/issues", '"e1"')  # untouched
+
+
 async def test_get_conditional_key_ignores_param_order():
     calls: list[httpx.Request] = []
 

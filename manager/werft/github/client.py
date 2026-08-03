@@ -150,6 +150,28 @@ class GitHubClient:
             self._etags[key] = new_etag
         return ConditionalResult(modified=True, data=response.json())
 
+    def invalidate_conditional(self, path_prefix: str | None = None) -> None:
+        """Forget stored ETags — all of them, or just those whose path
+        starts with `path_prefix`.
+
+        The ETag store and the caller's database transaction are two
+        different commit domains: `get_conditional` advances the store the
+        instant GitHub answers 200, but the rows a caller derives from that
+        body only become durable when *its* transaction commits. A caller
+        whose unit rolled back must be able to retract the advance, or the
+        next poll takes a free 304 over writes that were never persisted —
+        and, since nothing else re-fetches, stays wrong until GitHub's own
+        representation changes for an unrelated reason.
+
+        `path_prefix` keeps one caller's retraction from costing every other
+        caller sharing this client its own hard-won ETags.
+        """
+        if path_prefix is None:
+            self._etags.clear()
+            return
+        for key in [key for key in self._etags if key[0].startswith(path_prefix)]:
+            del self._etags[key]
+
     async def _send(
         self,
         method: str,

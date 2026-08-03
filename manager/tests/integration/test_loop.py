@@ -18,15 +18,17 @@ import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from werft.config.settings import Settings
 from werft.db.models import BacklogItem, Project, Run, RunEvent
-from werft.github.client import ConditionalResult, GitHubUnavailable
-from werft.github.ops import CheckState, PullRequest
+from werft.github.client import ConditionalResult, GitHubClient, GitHubUnavailable
+from werft.github.ops import CheckState, PullRequest, RepoOps
 from werft.observe.alerts import NullAlertSink
+from werft.orchestrator import loop as loop_module
 from werft.orchestrator.finalize import NullQuota
 from werft.orchestrator.loop import Orchestrator
 
@@ -778,6 +780,94 @@ async def test_poll_issues_once_skips_paused_projects(
     await orchestrator.poll_issues_once()
 
     assert ops.list_ready_issues_calls == 0
+
+
+# -- poll_issues_once: ETag-vs-transaction coupling ------------------------------
+
+
+def real_issue_poll_ops(requests: list[httpx.Request], issues: list[dict]) -> RepoOps:
+    """A *real* `RepoOps`/`GitHubClient` pair over `httpx.MockTransport` —
+    the only way to assert on the `If-None-Match` header itself, which no
+    duck-typed fake models. Answers 304 to any conditional request and a
+    fresh 200 + ETag otherwise, exactly like GitHub."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.headers.get("if-none-match"):
+            return httpx.Response(304)
+        return httpx.Response(200, headers={"etag": '"issues-e1"'}, json=issues)
+
+    async def token_provider() -> str:
+        return "ghs_test"
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = GitHubClient(http, api_url="https://api.github.test", token_provider=token_provider)
+    return RepoOps(client, "o", "r")
+
+
+def ready_issue(number: int) -> dict:
+    return {
+        "number": number,
+        "title": "a ready issue",
+        "body": "",
+        "labels": [{"name": "werft:ready"}],
+        "updated_at": "2026-08-01T12:00:00Z",
+    }
+
+
+async def test_a_rolled_back_issue_poll_invalidates_the_etag_so_the_next_poll_refetches(
+    db_session, orchestrator_session_factory, monkeypatch
+) -> None:
+    """`get_conditional` advances the in-memory ETag the moment GitHub
+    answers 200, but the rows derived from that body only become durable if
+    *this unit's* transaction commits. `_run_unit` rolls back and swallows
+    on any failure — including a failing COMMIT — while the ETag advance
+    survives in the memoized-per-project client. Without invalidation the
+    next poll gets a free 304, `sync_backlog` returns before writing
+    anything, and the labeled issues are never queued again until GitHub's
+    ready set changes for some unrelated reason. Silent, and permanent."""
+    project = await seed_project(db_session)
+    requests: list[httpx.Request] = []
+    ops = real_issue_poll_ops(requests, [ready_issue(1)])
+
+    attempts = {"n": 0}
+    real_intake = loop_module.intake
+
+    async def flaky_intake(session, project):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("transient DB error, after the 200 and after the upsert")
+        return await real_intake(session, project)
+
+    monkeypatch.setattr(loop_module, "intake", flaky_intake)
+
+    orchestrator = make_orchestrator(orchestrator_session_factory, ops_for=lambda p: ops)
+    await orchestrator.poll_issues_once()  # 200 -> upsert -> intake raises -> rollback
+    await orchestrator.poll_issues_once()  # must re-fetch, not 304
+
+    assert len(requests) == 2
+    assert "if-none-match" not in requests[1].headers
+    runs = await runs_for(db_session, project.id)
+    assert len(runs) == 1  # the second poll really did see the issue and queue it
+
+
+async def test_a_committed_issue_poll_keeps_its_etag_for_a_free_304(
+    db_session, orchestrator_session_factory
+) -> None:
+    """The other half of the contract: a unit that commits must *not* throw
+    its ETag away — the whole point of the memoized client (SPEC §6.2) is
+    that the steady-state 60 s poll costs a free 304."""
+    project = await seed_project(db_session)
+    requests: list[httpx.Request] = []
+    ops = real_issue_poll_ops(requests, [ready_issue(1)])
+
+    orchestrator = make_orchestrator(orchestrator_session_factory, ops_for=lambda p: ops)
+    await orchestrator.poll_issues_once()
+    await orchestrator.poll_issues_once()
+
+    assert len(requests) == 2
+    assert requests[1].headers["if-none-match"] == '"issues-e1"'
+    assert len(await runs_for(db_session, project.id)) == 1
 
 
 # -- loop resilience: one project's outage never starves the rest ---------------

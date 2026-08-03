@@ -20,7 +20,11 @@ Three independent loops, one process, one `asyncio.TaskGroup` (`run`):
   tick's own 15 s.
 - `poll_issues_once` (default 60 s, SPEC §6.2) is `sync_backlog` + `intake`
   for every project that isn't paused — a paused project accepts no new
-  work, so there is nothing for a backlog sync to feed.
+  work, so there is nothing for a backlog sync to feed. It is also the one
+  sweep that reads its unit's outcome: the fetch is ETag-conditional and the
+  client advances that ETag outside the unit's transaction, so a unit that
+  doesn't commit has to retract the advance (`RepoOps.invalidate_conditional`)
+  or the next poll takes a free 304 over writes that were rolled back.
 - `poll_checks_once` (default 30 s, SPEC §6.2) is `advance_awaiting_ci` for
   every `awaiting_ci` run, `check_flip` for every `awaiting_review` run
   whose *project* is still `bootstrap` (plan decision 4's observation-site
@@ -127,16 +131,26 @@ class Orchestrator:
 
     async def _run_unit(
         self, kind: str, key: Any, work: Callable[[AsyncSession], Awaitable[None]]
-    ) -> None:
+    ) -> bool:
         """Open one session, run `work` inside one transaction, commit on a
         clean return. Any exception rolls back this unit's own transaction
         (never anyone else's — it never had one) and is logged rather than
-        raised, so the calling sweep always reaches its next candidate."""
+        raised, so the calling sweep always reaches its next candidate.
+
+        Returns whether the unit committed. Most sweeps ignore that — a
+        failed unit just gets retried on the next tick — but a sweep whose
+        unit has *non-transactional* side effects (`poll_issues_once`'s ETag
+        advance) needs to know, since the rollback cannot undo those for it.
+        The `except` deliberately wraps the `async with` as a whole, so a
+        failing COMMIT counts as a failed unit exactly like a failing body.
+        """
         try:
             async with self._session_factory() as session, session.begin():
                 await work(session)
         except Exception as exc:  # noqa: BLE001 - isolate every unit, by design
             logger.error("orchestrator.unit_failed", kind=kind, key=str(key), error=str(exc))
+            return False
+        return True
 
     # -- per-row work, one method per handler --------------------------------
 
@@ -190,11 +204,18 @@ class Orchestrator:
             return
         await advance_merging(session, self._ops_for(project), run, project, alerts=self._alerts)
 
-    async def _poll_issues_one(self, session: AsyncSession, project_id: Any) -> None:
+    async def _poll_issues_one(
+        self, session: AsyncSession, project_id: Any, used_ops: list[RepoOps]
+    ) -> None:
+        """One project's backlog sync + intake. Appends the `RepoOps` it
+        used to `used_ops` *before* making any call with it, so the sweep
+        can retract that client's ETag advance if this unit doesn't commit
+        (see `poll_issues_once`)."""
         project = await session.get(Project, project_id)
         if project is None:
             return
         ops = self._ops_for(project)
+        used_ops.append(ops)
         await sync_backlog(session, ops, project)
         await intake(session, project)
 
@@ -321,6 +342,20 @@ class Orchestrator:
     # -- poll_issues_once: 60 s backlog sync + intake ------------------------
 
     async def poll_issues_once(self, stop: asyncio.Event | None = None) -> None:
+        """Sync + intake for every unpaused project, one unit each.
+
+        This is the one sweep that has to look at its unit's outcome. The
+        fetch it drives is ETag-conditional, and `GitHubClient` advances
+        that ETag the moment GitHub answers 200 — in memory, in a
+        process-lived client, outside the unit's transaction entirely. When
+        the unit then rolls back (or its COMMIT fails), the writes derived
+        from that body are gone while the ETag advance survives, so the next
+        poll would get a free 304, `sync_backlog` would return before
+        writing anything, and the labeled issues would never be queued
+        again until GitHub's ready set changed for some unrelated reason.
+        Retracting the advance on any failed unit is what keeps the two
+        commit domains consistent.
+        """
         async with self._session_factory() as session:
             project_ids = (
                 (await session.execute(select(Project.id).where(Project.is_paused.is_(False))))
@@ -331,11 +366,15 @@ class Orchestrator:
         for project_id in project_ids:
             if stop is not None and stop.is_set():
                 break
-            await self._run_unit(
+            used_ops: list[RepoOps] = []
+            committed = await self._run_unit(
                 "poll_issues",
                 project_id,
-                lambda session, p=project_id: self._poll_issues_one(session, p),
+                lambda session, p=project_id, o=used_ops: self._poll_issues_one(session, p, o),
             )
+            if not committed:
+                for ops in used_ops:
+                    ops.invalidate_conditional()
 
     # -- poll_checks_once: 30 s CI/review/merge polling ----------------------
 

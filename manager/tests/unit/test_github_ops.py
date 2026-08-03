@@ -42,9 +42,13 @@ class MockTransport:
         self.requests: list[httpx.Request] = []
         self._queue: list[httpx.Response] = []
 
-    def enqueue(self, status_code: int, body: Any = None) -> None:
+    def enqueue(
+        self, status_code: int, body: Any = None, *, headers: dict[str, str] | None = None
+    ) -> None:
         response = (
-            httpx.Response(status_code) if body is None else httpx.Response(status_code, json=body)
+            httpx.Response(status_code, headers=headers)
+            if body is None
+            else httpx.Response(status_code, headers=headers, json=body)
         )
         self._queue.append(response)
 
@@ -294,6 +298,28 @@ async def test_list_ready_issues_passes_through_not_modified(ops, transport):
     transport.enqueue(304)
     result = await ops.list_ready_issues()
     assert result == ConditionalResult(modified=False, data=None)
+
+
+async def test_invalidate_conditional_scopes_the_drop_to_this_repos_paths(ops, transport):
+    """`RepoOps.invalidate_conditional` is what an orchestrator unit calls
+    when its transaction rolled back after a 200: the ETag advanced in
+    memory but the rows it described did not survive, so the next poll must
+    re-fetch rather than take a free 304 over lost writes. It scopes the
+    drop to its own repo — a shared client must not lose another repo's
+    ETags to one project's failed unit."""
+    transport.enqueue(200, [{"number": 1, "title": "issue one"}], headers={"etag": '"e1"'})
+    await ops.list_ready_issues()
+
+    ops.invalidate_conditional()
+
+    transport.enqueue(200, [{"number": 1, "title": "issue one"}], headers={"etag": '"e2"'})
+    await ops.list_ready_issues()
+    assert "if-none-match" not in transport.requests[1].headers
+
+    # and the ETag is live again straight afterwards
+    transport.enqueue(304)
+    await ops.list_ready_issues()
+    assert transport.requests[2].headers["if-none-match"] == '"e2"'
 
 
 # -- labels ---------------------------------------------------------------

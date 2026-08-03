@@ -152,6 +152,17 @@ class RepoOps:
     def _repo_path(self, suffix: str) -> str:
         return f"/repos/{self._owner}/{self._repo}{suffix}"
 
+    def invalidate_conditional(self) -> None:
+        """Retract every ETag this repo's conditional GETs have stored.
+
+        Called by an orchestrator unit whose transaction rolled back *after*
+        a 200: the ETag advanced in memory but the rows it described did
+        not survive, so the next poll must re-fetch rather than take a free
+        304 over lost writes. Scoped to this repo's own paths — one
+        project's failed unit must not cost another project its ETags on a
+        shared client."""
+        self._client.invalidate_conditional(self._repo_path(""))
+
     # -- refs -------------------------------------------------------------
 
     async def get_ref_sha(self, branch: str) -> str | None:
