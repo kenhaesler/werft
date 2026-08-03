@@ -49,15 +49,43 @@ async def orchestrator_session_factory(migrated_db: str):
         await engine.dispose()
 
 
-def make_orchestrator(session_factory, *, ops_for, admin_ops_for=None) -> Orchestrator:
+def make_orchestrator(session_factory, *, ops_for, admin_ops_for=None, alerts=None) -> Orchestrator:
     return Orchestrator(
         session_factory,
         ops_for,
         admin_ops_for or (lambda project: FakeRepoOps()),
-        alerts=NullAlertSink(),
+        alerts=alerts or NullAlertSink(),
         quota=NullQuota(),
         settings=Settings(tick_seconds=15, issue_poll_seconds=60, check_poll_seconds=30),
     )
+
+
+class SpyAlertSink:
+    def __init__(self) -> None:
+        self.review_waiting_calls: list[tuple[str, uuid.UUID, str]] = []
+        self.run_parked_calls: list[tuple[str, uuid.UUID, str]] = []
+        self.project_flipped_calls: list[str] = []
+        self.auth_failure_calls: list[str] = []
+        self.quota_exhausted_until_calls: list[tuple[str, datetime]] = []
+        self.disk_threshold_calls: list[float] = []
+
+    async def review_waiting(self, project_slug, run_id, pr_url) -> None:
+        self.review_waiting_calls.append((project_slug, run_id, pr_url))
+
+    async def run_parked(self, project_slug, run_id, reason) -> None:
+        self.run_parked_calls.append((project_slug, run_id, reason))
+
+    async def project_flipped(self, project_slug) -> None:
+        self.project_flipped_calls.append(project_slug)
+
+    async def auth_failure(self, provider) -> None:
+        self.auth_failure_calls.append(provider)
+
+    async def quota_exhausted_until(self, provider, until) -> None:
+        self.quota_exhausted_until_calls.append((provider, until))
+
+    async def disk_threshold(self, percent) -> None:
+        self.disk_threshold_calls.append(percent)
 
 
 # -- fakes / spies ------------------------------------------------------------
@@ -435,6 +463,75 @@ async def test_tick_parks_a_failed_run_whose_attempt_budget_is_spent(
     updated = await fresh_run(db_session, run.id)
     assert updated.status == "parked"
     assert updated.parked_reason == "agent_failure"
+
+
+async def test_tick_park_from_the_failed_wake_fires_run_parked_exactly_once(
+    db_session, orchestrator_session_factory
+) -> None:
+    """`advance_failed` is deliberately alert-free — every caller re-reads
+    the post-advance row and fires `alerts.run_parked` itself
+    (`finalize_attempt` does; every other park site does). The `failed`-wake
+    sweep is a caller too, and it is the *only* onward path for runs CASed
+    to `failed` by the infra-edge writers in `ci_watch`/`merge_flow`. Its
+    parks were landing silently: the run sat in the review queue needing a
+    human requeue and the operator's only push channel never said so.
+
+    The second tick asserts there is no duplicate alert either: the sweep
+    selects `status = 'failed'`, and a parked run has left that set.
+    """
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(
+        db_session,
+        project,
+        item,
+        status="failed",
+        next_attempt_at=datetime.now(UTC) - timedelta(minutes=5),
+        attempt_count=3,
+        max_attempts=3,
+    )
+    await seed_closed_attempt(db_session, run.id, outcome="agent_failure")
+
+    alerts = SpyAlertSink()
+    orchestrator = make_orchestrator(
+        orchestrator_session_factory, ops_for=lambda p: FakeRepoOps(), alerts=alerts
+    )
+    await orchestrator.tick_once()
+
+    updated = await fresh_run(db_session, run.id)
+    assert updated.status == "parked"
+    assert alerts.run_parked_calls == [(project.slug, run.id, "agent_failure")]
+
+    await orchestrator.tick_once()
+    assert alerts.run_parked_calls == [(project.slug, run.id, "agent_failure")]  # still one
+
+
+async def test_tick_failed_wake_that_requeues_never_alerts(
+    db_session, orchestrator_session_factory
+) -> None:
+    """Budget left means `queued`, not `parked` — and a requeue is not an
+    operator event."""
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(
+        db_session,
+        project,
+        item,
+        status="failed",
+        next_attempt_at=datetime.now(UTC) - timedelta(minutes=5),
+        attempt_count=0,
+        max_attempts=3,
+    )
+    await seed_closed_attempt(db_session, run.id, outcome="agent_failure")
+
+    alerts = SpyAlertSink()
+    orchestrator = make_orchestrator(
+        orchestrator_session_factory, ops_for=lambda p: FakeRepoOps(), alerts=alerts
+    )
+    await orchestrator.tick_once()
+
+    assert (await fresh_run(db_session, run.id)).status == "queued"
+    assert alerts.run_parked_calls == []
 
 
 async def test_tick_wakes_a_failed_run_whose_latest_attempt_has_no_outcome_yet(
