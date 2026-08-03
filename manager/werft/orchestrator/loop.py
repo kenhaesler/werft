@@ -173,9 +173,10 @@ class Orchestrator:
         attempt was still `NULL` ("pending oracle") at the moment its run
         was CASed to `failed` out-of-band.
 
-        `advance_failed` is deliberately alert-free (`finalize.py`): every
-        caller is responsible for reading the post-advance row and firing
-        `alerts.run_parked` when it landed `parked`. This sweep is a caller,
+        `advance_failed` never fires `run_parked` itself (`finalize.py`: it
+        has no reason to load the project the alert's slug comes from):
+        every caller reads the post-advance row and fires it. This sweep is
+        a caller,
         and the only onward path for the two infra-edge `-> failed` writers,
         so a park reached this way would otherwise be the one park in the
         system with no operator notification at all."""
@@ -191,7 +192,14 @@ class Orchestrator:
             )
         ).scalar_one_or_none()
         outcome = AttemptOutcome(outcome_value) if outcome_value is not None else None
-        await advance_failed(session, run, outcome=outcome, exhausted_until=None, quota=self._quota)
+        await advance_failed(
+            session,
+            run,
+            outcome=outcome,
+            exhausted_until=None,
+            quota=self._quota,
+            alerts=self._alerts,
+        )
 
         advanced = await session.get(Run, run_id, populate_existing=True)
         if advanced.status == RunStatus.PARKED.value:

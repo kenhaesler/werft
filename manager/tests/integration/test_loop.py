@@ -468,9 +468,9 @@ async def test_tick_parks_a_failed_run_whose_attempt_budget_is_spent(
 async def test_tick_park_from_the_failed_wake_fires_run_parked_exactly_once(
     db_session, orchestrator_session_factory
 ) -> None:
-    """`advance_failed` is deliberately alert-free — every caller re-reads
-    the post-advance row and fires `alerts.run_parked` itself
-    (`finalize_attempt` does; every other park site does). The `failed`-wake
+    """`advance_failed` never fires `run_parked` itself — every caller
+    re-reads the post-advance row and fires it (`finalize_attempt` does;
+    every other park site does). The `failed`-wake
     sweep is a caller too, and it is the *only* onward path for runs CASed
     to `failed` by the infra-edge writers in `ci_watch`/`merge_flow`. Its
     parks were landing silently: the run sat in the review queue needing a

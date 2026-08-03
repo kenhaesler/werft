@@ -12,6 +12,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import text
 
 from werft.contracts.result import ResultStatus
@@ -490,6 +491,10 @@ async def test_quota_exhausted_moves_to_blocked_quota_with_provider_reported_wak
     assert updated.next_attempt_at == exhausted_until
     assert updated.attempt_count == 1  # unchanged: budget-exempt outcome
     assert len(quota.calls) == 1
+    # SPEC §9 lists quota exhaustion among the six operator notifications;
+    # before this it was the one sink method with no call site anywhere, so
+    # a provider going dark until 20:00 was entirely silent.
+    assert alerts.quota_exhausted_until_calls == [("claude", exhausted_until)]
 
     updated_attempt = await fresh_attempt(db_session, attempt.id)
     assert updated_attempt.outcome == "quota_exhausted"  # brief-mandated retry-ledger outcome
@@ -508,6 +513,7 @@ async def test_quota_exhausted_without_reported_until_falls_back_to_now_plus_15_
         detail="provider window exhausted",
         exhausted_until=None,
     )
+    alerts = SpyAlertSink()
 
     before = datetime.now(UTC)
     await finalize_attempt(
@@ -518,12 +524,61 @@ async def test_quota_exhausted_without_reported_until_falls_back_to_now_plus_15_
         classification=classification,
         pushed=False,
         quota=SpyQuota(),
-        alerts=SpyAlertSink(),
+        alerts=alerts,
     )
 
     updated = await fresh_run(db_session, run.id)
     assert updated.status == "blocked_quota"
     assert before + timedelta(minutes=14) < updated.next_attempt_at < before + timedelta(minutes=16)
+    # No provider-reported window means nothing to tell an operator: the
+    # 15 min guess is this system's own retry heuristic, not a fact about
+    # the provider, and alerting it would be inventing information.
+    assert alerts.quota_exhausted_until_calls == []
+
+
+async def test_a_lost_cas_on_the_blocked_quota_edge_alerts_nobody(db_session) -> None:
+    """The alert reports a transition; a transition that didn't happen must
+    not be reported. Seeds a `failed` run, moves the real row out from under
+    a stale view, and drives `advance_failed` with that stale view: the CAS
+    loses, the (genuine, single-writer-violating) error propagates, and the
+    sink stays untouched."""
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_running_run(db_session, project, item)
+    await db_session.execute(
+        text("UPDATE runs SET status = 'failed' WHERE id = :id"), {"id": run.id}
+    )
+    await db_session.commit()
+    failed_run = await fresh_run(db_session, run.id)
+    stale_view = SimpleNamespace(
+        id=failed_run.id,
+        version=failed_run.version,
+        provider=failed_run.provider,
+        attempt_count=failed_run.attempt_count,
+        max_attempts=failed_run.max_attempts,
+    )
+
+    moved = await transition_run(
+        db_session,
+        run_id=run.id,
+        expected_version=failed_run.version,
+        new_status=RunStatus.QUEUED,
+    )
+    assert moved
+    await db_session.commit()
+
+    alerts = SpyAlertSink()
+    with pytest.raises(RuntimeError):
+        await advance_failed(
+            db_session,
+            stale_view,
+            outcome=AttemptOutcome.QUOTA_EXHAUSTED,
+            exhausted_until=datetime(2026, 8, 3, 20, 0, 0, tzinfo=UTC),
+            quota=SpyQuota(),
+            alerts=alerts,
+        )
+
+    assert alerts.quota_exhausted_until_calls == []
 
 
 # -- advance_failed / finalize_attempt: genuine failures ---------------------
@@ -589,6 +644,7 @@ async def test_advance_failed_called_directly_moves_an_infra_failure_to_queued_w
         outcome=classification.outcome,
         exhausted_until=classification.exhausted_until,
         quota=SpyQuota(),
+        alerts=SpyAlertSink(),
     )
 
     updated = await fresh_run(db_session, run.id)

@@ -128,9 +128,11 @@ async def finalize_attempt(
     since SPEC §3.2 has no direct edge out of `running` for those. An
     `auth_failure` outcome additionally fires `alerts.auth_failure`, and a
     run that lands `parked` fires `alerts.run_parked` — both read off the
-    post-`advance_failed` row rather than being threaded through it, so
-    `advance_failed` itself stays alert-free (SPEC layering: it needs no
-    `AlertSink` to do its job).
+    post-`advance_failed` row here rather than being fired inside it, since
+    `run_parked` needs the project slug `advance_failed` has no reason to
+    load. (`advance_failed` fires exactly one alert of its own,
+    `quota_exhausted_until`, which needs only the provider and the
+    provider-reported reset time it was handed.)
 
     A lost `running -> failed` CAS is not always a bug: `running ->
     canceled` is itself a legal edge, so an operator cancel racing this
@@ -187,6 +189,7 @@ async def finalize_attempt(
         outcome=classification.outcome,
         exhausted_until=classification.exhausted_until,
         quota=quota,
+        alerts=alerts,
     )
 
     if classification.outcome == AttemptOutcome.AUTH_FAILURE:
@@ -251,6 +254,16 @@ async def open_pr_and_wait(
         await alerts.review_waiting(project.slug, run.id, pr.html_url)
 
 
+async def _attempt_provider(session: AsyncSession, run_id: UUID) -> str | None:
+    result = await session.execute(
+        select(RunAttempt.provider)
+        .where(RunAttempt.run_id == run_id)
+        .order_by(RunAttempt.attempt_no.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 async def advance_failed(
     session: AsyncSession,
     run: Run,
@@ -258,6 +271,7 @@ async def advance_failed(
     outcome: AttemptOutcome | None,
     exhausted_until: datetime | None,
     quota: QuotaPort,
+    alerts: AlertSink,
 ) -> None:
     """Behavioral decision 8, verbatim (thin plan): route a `failed` run on.
 
@@ -289,6 +303,14 @@ async def advance_failed(
     dedicated slot yet and do fall through to the generic
     `agent_failure` — post-milestone fallthrough, and only the alert
     distinguishes them today.
+
+    `alerts` is used for exactly one thing here: `quota_exhausted_until`, on
+    the `failed -> blocked_quota` edge, and only when the provider actually
+    reported a reset time (the 15 min fallback is this system's own retry
+    heuristic, not a fact about the provider — alerting it would be
+    inventing information) and only after the CAS has won. The run's park
+    alerts stay the caller's job, as they always were: those need the
+    project slug this function has no reason to load.
     """
     if outcome in BUDGET_EXEMPT_OUTCOMES:
         next_attempt_at = exhausted_until or (datetime.now(UTC) + timedelta(minutes=15))
@@ -303,6 +325,9 @@ async def advance_failed(
             raise RuntimeError(
                 f"advance_failed: lost CAS race on run {run.id} (failed->blocked_quota)"
             )
+        if exhausted_until is not None:
+            provider = run.provider or await _attempt_provider(session, run.id)
+            await alerts.quota_exhausted_until(provider or "unknown", exhausted_until)
         return
 
     attempt_count = run.attempt_count + 1
