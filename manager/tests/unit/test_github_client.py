@@ -15,13 +15,28 @@ from werft.github.client import ConditionalResult, GitHubApiError, GitHubClient,
 API_URL = "https://api.github.test"
 
 
-def client_with(handler, *, token: str = "ghs_test") -> GitHubClient:
+class FakeClock:
+    """A monotonic clock that only moves when a test says so."""
+
+    def __init__(self, now: float = 1_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def client_with(handler, *, token: str = "ghs_test", clock=None) -> GitHubClient:
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
     async def token_provider() -> str:
         return token
 
-    return GitHubClient(http, api_url=API_URL, token_provider=token_provider)
+    if clock is None:
+        return GitHubClient(http, api_url=API_URL, token_provider=token_provider)
+    return GitHubClient(http, api_url=API_URL, token_provider=token_provider, clock=clock)
 
 
 async def test_request_injects_the_three_standard_headers():
@@ -185,6 +200,91 @@ async def test_get_conditional_key_includes_params_so_different_params_get_own_e
     await client.get_conditional("/repos/acme/widgets/issues", params={"state": "open"})
     await client.get_conditional("/repos/acme/widgets/issues", params={"state": "closed"})
 
+    assert len(calls) == 2
+
+
+# -- secondary-rate-limit cooldown ------------------------------------------
+
+
+async def test_a_retry_after_response_starts_a_cooldown_that_short_circuits_every_call():
+    """GitHub's documented requirement is to *wait out* `retry-after` before
+    retrying; continuing to request while secondary-rate-limited is grounds
+    for extending the block or suspending the integration. Nothing outside
+    this client is in a position to honour it — every handler swallows
+    `GitHubUnavailable` and returns, and the tick/poll loops then re-issue
+    the same calls on their fixed 15/30/60 s cadences, deepening the outage
+    they are reporting. So the client itself refuses to send.
+    """
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            403, headers={"retry-after": "60"}, json={"message": "secondary rate limit"}
+        )
+
+    clock = FakeClock()
+    client = client_with(handler, clock=clock)
+
+    with pytest.raises(GitHubUnavailable):
+        await client.request("GET", "/repos/acme/widgets", expect=(200,))
+    assert len(calls) == 1
+
+    with pytest.raises(GitHubUnavailable) as exc_info:
+        await client.request("PUT", "/repos/acme/widgets/pulls/1/merge", expect=(200,))
+    assert len(calls) == 1  # never reached the transport at all
+    assert exc_info.value.status == 0
+    assert exc_info.value.message.startswith("cooling down")
+    assert exc_info.value.retry_after == 60
+
+    with pytest.raises(GitHubUnavailable):  # conditional GETs are gated too
+        await client.get_conditional("/repos/acme/widgets/issues")
+    assert len(calls) == 1
+
+
+async def test_requests_flow_again_once_the_cooldown_has_elapsed():
+    responses = [
+        httpx.Response(403, headers={"retry-after": "30"}, json={"message": "slow down"}),
+        httpx.Response(200, json={"ok": True}),
+    ]
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return responses[min(len(calls) - 1, len(responses) - 1)]
+
+    clock = FakeClock()
+    client = client_with(handler, clock=clock)
+
+    with pytest.raises(GitHubUnavailable):
+        await client.request("GET", "/repos/acme/widgets", expect=(200,))
+
+    clock.advance(29.0)
+    with pytest.raises(GitHubUnavailable) as exc_info:
+        await client.request("GET", "/repos/acme/widgets", expect=(200,))
+    assert exc_info.value.retry_after == 1.0  # what is left of the window
+    assert len(calls) == 1
+
+    clock.advance(1.5)
+    response = await client.request("GET", "/repos/acme/widgets", expect=(200,))
+    assert response.status_code == 200
+    assert len(calls) == 2
+
+
+async def test_a_plain_error_without_retry_after_starts_no_cooldown():
+    """Only the rate-limited family carries the signal; a 422 or a bare 403
+    must not silence the client for a minute."""
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(422, json={"message": "Validation Failed"})
+
+    client = client_with(handler, clock=FakeClock())
+
+    for _ in range(2):
+        with pytest.raises(GitHubApiError):
+            await client.request("POST", "/repos/acme/widgets/pulls", expect=(201,))
     assert len(calls) == 2
 
 

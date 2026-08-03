@@ -14,6 +14,7 @@ has no opinion on how tokens are minted or attenuated — composition happens
 where the client is constructed (Task 8).
 """
 
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -104,9 +105,15 @@ def _map_error(response: httpx.Response) -> GitHubApiError:
 class GitHubClient:
     """Owns the process's `httpx.AsyncClient` calls to one GitHub API host.
 
-    Stateless except for the in-memory ETag store (`get_conditional`), which
-    is per-instance and never persisted: a manager restart just means the
-    next poll costs one real rate-limit unit instead of a free 304.
+    Two pieces of per-instance state, both in-memory and never persisted:
+
+    - the ETag store (`get_conditional`) — a manager restart just means the
+      next poll costs one real rate-limit unit instead of a free 304;
+    - the `retry-after` cooldown (`_assert_not_cooling_down`) — while a
+      rate-limit window GitHub named is still open, this client refuses to
+      send at all rather than deepening the block. Because a
+      `GitHubClient` is built per project (`app._ops_factory`), one
+      project's secondary-rate-limit trip does not silence the others.
     """
 
     def __init__(
@@ -115,11 +122,18 @@ class GitHubClient:
         *,
         api_url: str,
         token_provider: Callable[[], Awaitable[str]],
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._http = http
         self._api_url = api_url.rstrip("/")
         self._token_provider = token_provider
         self._etags: dict[_EtagKey, str] = {}
+        #: Monotonic deadline before which this client refuses to send
+        #: (`_send`). Set from a rate-limited response's `retry-after`;
+        #: monotonic specifically, so a wall-clock/NTP step can neither
+        #: extend nor cancel the wait.
+        self._cooldown_until: float | None = None
+        self._clock = clock
 
     async def request(
         self,
@@ -190,6 +204,7 @@ class GitHubClient:
         expect: tuple[int, ...],
         extra_headers: Mapping[str, str],
     ) -> httpx.Response:
+        self._assert_not_cooling_down()
         token = await self._token_provider()
         headers = {
             "Authorization": f"Bearer {token}",
@@ -206,4 +221,34 @@ class GitHubClient:
 
         if response.status_code in expect:
             return response
-        raise _map_error(response)
+
+        error = _map_error(response)
+        if isinstance(error, GitHubUnavailable) and error.retry_after is not None:
+            # GitHub told us how long to wait; honouring it is not optional.
+            # Continuing to request while secondary-rate-limited is grounds
+            # for extending the block or suspending the integration, and no
+            # caller is in a position to do this instead: every handler
+            # swallows `GitHubUnavailable` and returns, and the tick/poll
+            # loops re-issue the same calls on their fixed cadences.
+            self._cooldown_until = max(
+                self._cooldown_until or 0.0, self._clock() + error.retry_after
+            )
+        raise error
+
+    def _assert_not_cooling_down(self) -> None:
+        """Refuse to send — with no HTTP call and no token minted — while a
+        `retry-after` window is still open, raising the same transient
+        `GitHubUnavailable` the callers already know how to leave state
+        alone for. `retry_after` carries what is *left* of the window, so a
+        caller that ever wants to schedule around it can."""
+        if self._cooldown_until is None:
+            return
+        remaining = self._cooldown_until - self._clock()
+        if remaining <= 0:
+            self._cooldown_until = None
+            return
+        raise GitHubUnavailable(
+            _TRANSPORT_ERROR_STATUS,
+            "cooling down after a GitHub rate-limit response",
+            retry_after=remaining,
+        )
