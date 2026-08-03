@@ -567,6 +567,17 @@ async def test_deliberately_red_budget_spent_parks_and_stays_parked(db_session) 
 
     assert alerts.run_parked_calls == [(project.slug, run.id, "ci_red")]  # never re-fires
 
+    # `ci_observed` is the one T5 event type this run's own module docstring
+    # says is written unconditionally on every decisive oracle read, *before*
+    # the CAS is attempted — "a true fact independent of the run's raced
+    # fate" (test_ci_watch.py's own phrase for this, exercised there for a
+    # single lost CAS). Every one of the 3 re-drives above re-reads the same
+    # FAILURE verdict off the same head sha and re-records it even though the
+    # CAS underneath it always loses: 1 from the initial (winning) park +
+    # 1 per re-drive = 4, never deduplicated by design.
+    ci_observed = await run_events_of_type(db_session, run.id, "ci_observed")
+    assert len(ci_observed) == 4
+
 
 # -- scenario 4: the flip -------------------------------------------------------
 
