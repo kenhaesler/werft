@@ -596,6 +596,42 @@ async def test_advance_failed_called_directly_moves_an_infra_failure_to_queued_w
     assert updated.attempt_count == 2
 
 
+async def test_infra_failure_at_budget_parks_with_the_infra_failure_reason_not_agent_failure(
+    db_session,
+) -> None:
+    """`ParkedReason.INFRA_FAILURE` exists in the enum *and* in the DB's
+    `parked_reason` CHECK constraint, so recording a disk-full or
+    container-start failure as `agent_failure` was a plain miswiring, not
+    the "no slot yet" limitation the docstring claimed. It is
+    operator-facing: T6's review queue reads `parked_reason` directly, and
+    "the agent failed three times" points a human at the prompt when the
+    truth is that the infrastructure never let the agent run."""
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_running_run(db_session, project, item, attempt_count=2, max_attempts=3)
+    await seed_open_attempt(db_session, run)
+    classification = Classification(
+        outcome=AttemptOutcome.INFRA_FAILURE, status=ResultStatus.FAILURE, detail="disk full"
+    )
+    alerts = SpyAlertSink()
+
+    await finalize_attempt(
+        db_session,
+        FakeRepoOps(),
+        run,
+        project,
+        classification=classification,
+        pushed=False,
+        quota=SpyQuota(),
+        alerts=alerts,
+    )
+
+    updated = await fresh_run(db_session, run.id)
+    assert updated.status == "parked"
+    assert updated.parked_reason == "infra_failure"
+    assert alerts.run_parked_calls == [(project.slug, run.id, "infra_failure")]
+
+
 async def test_agent_failure_at_attempt_budget_parks_and_alerts_run_parked(db_session) -> None:
     project = await seed_project(db_session)
     item = await seed_backlog_item(db_session, project, 1)

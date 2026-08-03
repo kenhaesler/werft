@@ -54,6 +54,15 @@ from werft.github.ops import RepoOps
 from werft.observe.alerts import AlertSink
 from werft.providers.base import Classification
 
+#: Attempt outcomes that have a dedicated `parked_reason` CHECK slot of
+#: their own. Everything absent here parks as the generic `agent_failure`
+#: (`auth_failure`/`policy_block`/`timeout`/`canceled` — no slot yet; only
+#: the alert distinguishes them). Operator-facing: T6's review queue reads
+#: `parked_reason` directly.
+_PARKED_REASON_BY_OUTCOME: dict[AttemptOutcome, ParkedReason] = {
+    AttemptOutcome.INFRA_FAILURE: ParkedReason.INFRA_FAILURE,
+}
+
 
 class QuotaPort(Protocol):
     """The quota-release seam `finalize_attempt` calls inside its own
@@ -271,10 +280,15 @@ async def advance_failed(
 
     Every non-exempt outcome — `agent_failure`, `infra_failure`,
     `auth_failure`, `policy_block`, `timeout`, `canceled` — shares the same
-    ladder and, if it parks, the one generic `parked_reason='agent_failure'`:
-    provider-specific parked reasons are post-milestone fallthrough (the
-    `parked_reason` CHECK constraint has no dedicated slot for the others
-    yet).
+    retry/park ladder. The *parked reason* it lands with is whatever the
+    `parked_reason` CHECK constraint actually has a slot for:
+    `infra_failure` has one (`ParkedReason.INFRA_FAILURE`), and recording a
+    disk-full or container-start failure as `agent_failure` would point an
+    operator at the prompt when the infrastructure never let the agent run.
+    `auth_failure`/`policy_block`/`timeout`/`canceled` genuinely have no
+    dedicated slot yet and do fall through to the generic
+    `agent_failure` — post-milestone fallthrough, and only the alert
+    distinguishes them today.
     """
     if outcome in BUDGET_EXEMPT_OUTCOMES:
         next_attempt_at = exhausted_until or (datetime.now(UTC) + timedelta(minutes=15))
@@ -296,7 +310,9 @@ async def advance_failed(
         target = RunStatus.PARKED
         extra = {
             "attempt_count": attempt_count,
-            "parked_reason": ParkedReason.AGENT_FAILURE.value,
+            "parked_reason": _PARKED_REASON_BY_OUTCOME.get(
+                outcome, ParkedReason.AGENT_FAILURE
+            ).value,
         }
     else:
         backoff_seconds = min(2**attempt_count * 30, 1800)
