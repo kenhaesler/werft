@@ -14,7 +14,14 @@ import pytest
 
 from werft.domain.errors import PermanentError
 from werft.github.client import ConditionalResult, GitHubClient
-from werft.github.ops import READY_LABEL, CheckState, MergeBlocked, MergeShaMismatch, RepoOps
+from werft.github.ops import (
+    MAX_READY_ISSUE_PAGES,
+    READY_LABEL,
+    CheckState,
+    MergeBlocked,
+    MergeShaMismatch,
+    RepoOps,
+)
 
 API_URL = "https://api.github.test"
 OWNER = "ken"
@@ -278,6 +285,10 @@ async def test_oracle_check_maps_status_and_conclusion(
 # -- backlog issues -----------------------------------------------------
 
 
+def _next_link(page: int) -> dict[str, str]:
+    return {"link": f'<{API_URL}/repositories/1/issues?page={page}>; rel="next"'}
+
+
 async def test_list_ready_issues_filters_pull_request_items(ops, transport):
     transport.enqueue(
         200,
@@ -292,12 +303,56 @@ async def test_list_ready_issues_filters_pull_request_items(ops, transport):
     request = transport.requests[0]
     assert request.url.params["labels"] == "werft:ready"
     assert request.url.params["state"] == "open"
+    assert request.url.params["per_page"] == "100"  # never GitHub's default 30
+    assert "page" not in request.url.params
 
 
-async def test_list_ready_issues_passes_through_not_modified(ops, transport):
+async def test_list_ready_issues_follows_link_rel_next_and_accumulates_every_page(ops, transport):
+    """Unpaginated, this returned at most GitHub's default 30 issues — and
+    `sync_backlog` reads "absent from the fetch" as "no longer labeled", so
+    a project with more than one page's worth of ready issues had the
+    remainder actively flipped `is_eligible=False` and silently dropped out
+    of intake. Every page has to be here before that sweep runs."""
+    transport.enqueue(200, [{"number": 1, "title": "one"}], headers=_next_link(2))
+    transport.enqueue(
+        200,
+        [
+            {"number": 31, "title": "thirty-one"},
+            {"number": 32, "title": "a pr, on page two", "pull_request": {"url": "..."}},
+        ],
+    )
+
+    result = await ops.list_ready_issues()
+
+    assert result.modified is True
+    assert [item["number"] for item in result.data] == [1, 31]  # PR filter spans pages
+    first, second = transport.requests
+    assert "page" not in first.url.params
+    assert second.url.params["page"] == "2"
+    assert second.url.params["per_page"] == "100"
+    assert second.url.params["labels"] == "werft:ready"
+    # Page 2 is an unconditional GET: the ETag belongs to page 1's URL alone,
+    # and sending it here would 304 away a page we have not read.
+    assert "if-none-match" not in second.headers
+
+
+async def test_list_ready_issues_304_on_page_one_short_circuits_without_paging(ops, transport):
     transport.enqueue(304)
     result = await ops.list_ready_issues()
     assert result == ConditionalResult(modified=False, data=None)
+    assert len(transport.requests) == 1
+
+
+async def test_list_ready_issues_stops_at_the_page_ceiling(ops, transport):
+    """A malformed or looping `Link` header must not spin forever against
+    GitHub's rate limit; the walk is bounded."""
+    for page in range(MAX_READY_ISSUE_PAGES + 2):
+        transport.enqueue(200, [{"number": page, "title": "t"}], headers=_next_link(page + 2))
+
+    result = await ops.list_ready_issues()
+
+    assert len(transport.requests) == MAX_READY_ISSUE_PAGES
+    assert len(result.data) == MAX_READY_ISSUE_PAGES
 
 
 async def test_invalidate_conditional_scopes_the_drop_to_this_repos_paths(ops, transport):

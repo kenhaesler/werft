@@ -52,10 +52,17 @@ class GitHubUnavailable(GitHubApiError):
 @dataclass(frozen=True)
 class ConditionalResult:
     """The outcome of `get_conditional`. `data` is `None` iff `modified` is
-    `False` — a 304 means GitHub sent nothing new to parse."""
+    `False` — a 304 means GitHub sent nothing new to parse.
+
+    `links` carries the response's parsed `Link` header (httpx's
+    `Response.links`, keyed by `rel`) or `None` when there wasn't one: a
+    caller that has to walk a paginated collection needs the `rel="next"`
+    signal, and it is only visible on the response this method consumed.
+    """
 
     modified: bool
     data: list | dict | None
+    links: Mapping[str, Mapping[str, str]] | None = None
 
 
 def _etag_key(path: str, params: Mapping[str, Any] | None) -> _EtagKey:
@@ -136,7 +143,8 @@ class GitHubClient:
         """`GET path` with `If-None-Match` from the in-memory ETag store,
         keyed by `path` plus sorted `params`. A 304 is free (SPEC §6.2) and
         maps to `ConditionalResult(modified=False, data=None)`; a 200 stores
-        the fresh ETag and returns the parsed body."""
+        the fresh ETag and returns the parsed body plus any `Link` header a
+        paginating caller needs to keep walking."""
         key = _etag_key(path, params)
         etag = self._etags.get(key)
         extra_headers = {"If-None-Match": etag} if etag else {}
@@ -148,7 +156,7 @@ class GitHubClient:
         new_etag = response.headers.get("etag")
         if new_etag:
             self._etags[key] = new_etag
-        return ConditionalResult(modified=True, data=response.json())
+        return ConditionalResult(modified=True, data=response.json(), links=response.links or None)
 
     def invalidate_conditional(self, path_prefix: str | None = None) -> None:
         """Forget stored ETags — all of them, or just those whose path

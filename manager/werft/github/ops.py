@@ -103,6 +103,16 @@ def _parse_pr(data: dict[str, Any]) -> PullRequest:
 #: — one definition, because all three have to name the same string.
 READY_LABEL = "werft:ready"
 
+#: GitHub's maximum `per_page` for the issues API. Anything smaller means
+#: `list_ready_issues` pages more often; GitHub's *default* (30) is what made
+#: it silently truncate before it paged at all.
+_READY_ISSUE_PAGE_SIZE = 100
+
+#: Hard ceiling on `list_ready_issues`' page walk (10 000 ready issues). A
+#: malformed or self-referential `Link: rel="next"` header must cost a
+#: bounded number of rate-limit units, not an unbounded loop inside one poll.
+MAX_READY_ISSUE_PAGES = 100
+
 
 def _error_message(response: httpx.Response) -> str:
     try:
@@ -338,17 +348,55 @@ class RepoOps:
     # -- backlog issues -------------------------------------------------------
 
     async def list_ready_issues(self) -> ConditionalResult:
-        """Open issues labeled `werft:ready`, ETag-conditional (SPEC §6.2:
-        free 304s on the 60 s backlog poll). Items that are actually pull
-        requests (GitHub's issues API returns both; a `pull_request` key is
-        the tell) are filtered out of `data` before returning — belt-and-
-        braces with A4's DB-level assertion of the same filter."""
-        result = await self._client.get_conditional(
-            self._repo_path("/issues"), params={"labels": READY_LABEL, "state": "open"}
-        )
+        """*Every* open issue labeled `werft:ready`, ETag-conditional on the
+        first page (SPEC §6.2: free 304s on the 60 s backlog poll).
+
+        Pagination is not an optimization here, it is correctness:
+        `sync_backlog` reads "absent from this fetch" as "no longer
+        labeled" and flips those rows `is_eligible=False`. At GitHub's
+        default page size of 30, a project with 35 ready issues had its 5
+        oldest actively de-eligibilized on every poll and silently dropped
+        out of intake, recovering only if enough newer issues closed. So
+        the walk asks for the maximum page size and follows `Link:
+        rel="next"` to exhaustion (bounded by `MAX_READY_ISSUE_PAGES`
+        against a malformed or looping header).
+
+        Subsequent pages go through plain `request` GETs, re-derived from
+        this repo's own path with an explicit `page` param rather than
+        following the absolute URL GitHub hands back: the installation
+        token must only ever be sent to a URL this client constructed. They
+        carry no `If-None-Match` either — the stored ETag belongs to page
+        one's URL alone, and sending it here would 304 away a page that has
+        not been read. A 304 on page one still short-circuits the whole
+        walk, which is exactly what it asserts: nothing about this
+        collection changed.
+
+        Items that are actually pull requests (GitHub's issues API returns
+        both; a `pull_request` key is the tell) are filtered out of every
+        page — belt-and-braces with A4's DB-level assertion of the same
+        filter.
+        """
+        params: dict[str, Any] = {
+            "labels": READY_LABEL,
+            "state": "open",
+            "per_page": _READY_ISSUE_PAGE_SIZE,
+        }
+        result = await self._client.get_conditional(self._repo_path("/issues"), params=params)
         if result.data is None:
             return result
-        filtered = [item for item in result.data if "pull_request" not in item]
+
+        issues = list(result.data)
+        links = result.links or {}
+        page = 1
+        while "next" in links and page < MAX_READY_ISSUE_PAGES:
+            page += 1
+            response = await self._client.request(
+                "GET", self._repo_path("/issues"), params={**params, "page": page}, expect=(200,)
+            )
+            issues.extend(response.json())
+            links = response.links
+
+        filtered = [item for item in issues if "pull_request" not in item]
         return ConditionalResult(modified=result.modified, data=filtered)
 
     # -- labels + protection --------------------------------------------------
