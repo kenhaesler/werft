@@ -81,7 +81,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from werft.db.models import Project, Run, RunEvent
 from werft.db.transitions import transition_run
 from werft.domain.projects import ProjectLifecycle
-from werft.domain.runs import ParkedReason, RunStatus
+from werft.domain.runs import ParkedReason, RunStatus, run_branch_name
 from werft.github.client import GitHubUnavailable
 from werft.github.ops import MergeBlocked, MergeShaMismatch, PullRequest, RepoOps
 from werft.observe.alerts import AlertSink
@@ -95,8 +95,9 @@ _CLEANUP_STATUSES = frozenset({RunStatus.CANCELED.value, RunStatus.MERGED.value}
 
 def _branch_name(run: Run) -> str:
     """`run.branch_name` when a dispatcher (T7) recorded one; otherwise the
-    deterministic name every run's branch gets (SPEC §6.1: `werft/run-<id>`)."""
-    return run.branch_name or f"werft/run-{run.id}"
+    deterministic name every run's branch gets (SPEC §6.1: `werft/run-<id>`),
+    derived from `domain.runs.run_branch_name` — never re-spelled here."""
+    return run.branch_name or run_branch_name(run.id)
 
 
 def _commit_title(project: Project, run: Run) -> str:

@@ -49,7 +49,7 @@ from werft.db.models import BacklogItem, Project, Run, RunAttempt
 from werft.db.transitions import transition_run
 from werft.domain.attempts import BUDGET_EXEMPT_OUTCOMES, AttemptOutcome
 from werft.domain.projects import ProjectLifecycle
-from werft.domain.runs import ParkedReason, RunStatus
+from werft.domain.runs import ParkedReason, RunStatus, run_branch_name
 from werft.github.ops import RepoOps
 from werft.observe.alerts import AlertSink
 from werft.providers.base import Classification
@@ -208,7 +208,7 @@ async def open_pr_and_wait(
     duplicate, not an error.
     """
     item = await session.get(BacklogItem, run.backlog_item_id)
-    head = f"werft/run-{run.id}"
+    head = run_branch_name(run.id)
     title = f"werft: {item.title} (#{item.github_issue_number})"
     body = f"Closes #{item.github_issue_number}\n\nWerft run: {run.id}"
     pr = await ops.open_pr(head, project.unattended_branch, title, body)
