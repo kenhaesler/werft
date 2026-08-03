@@ -30,11 +30,16 @@ same `PullRequest` snapshot (one `get_pr` per call — never more):
   reason, so which one appears is itself diagnostic); otherwise the
   squash-merge is attempted directly, and a `409` (external base move,
   rare — merges are serialized per project) simply stays `merging` for the
-  next tick to retry. **No call to `oracle_check` ever happens on this
-  path** — asserting that absence is exactly as load-bearing as asserting
-  any transition, since a stray oracle read here would silently convert an
-  operator's accept into a CI wait that bootstrap has no mechanism to
-  satisfy.
+  next tick to retry. A `405` (`MergeBlocked`) *on that attempt* — GitHub's
+  `mergeable` is computed async, so a clean-at-read snapshot can still be
+  followed by a conflicting base push before the merge call lands, and a
+  squash-disabled repo 405s every time regardless of `mergeable` — parks as
+  `merge_blocked` the same as a pre-flight `dirty` read: SPEC §6.2 gives
+  bootstrap a binary outcome, merge or park, never an indefinite retry.
+  **No call to `oracle_check` ever happens on this path** — asserting that
+  absence is exactly as load-bearing as asserting any transition, since a
+  stray oracle read here would silently convert an operator's accept into
+  a CI wait that bootstrap has no mechanism to satisfy.
 
 A `PullRequest.merged` seen `True` (merged out-of-band, e.g. an operator
 merged it by hand on GitHub) short-circuits both tables: it's a merge
@@ -189,7 +194,10 @@ async def _advance_bootstrap_merging(
 ) -> None:
     """Plan Behavioral decision 5, verbatim. No branch here ever calls
     `oracle_check` — bootstrap has no check to wait for; the operator's
-    accept already *is* the merge decision."""
+    accept already *is* the merge decision. Bootstrap's outcome here is
+    binary (SPEC §6.2): merge, or park as `merge_blocked` — never an
+    indefinite retry, so a `405` on the merge attempt itself (not just a
+    pre-flight `dirty` read) also parks."""
     if pr.mergeable is None:
         return  # still computing; next tick re-reads
 
@@ -215,6 +223,14 @@ async def _advance_bootstrap_merging(
         return
     except MergeShaMismatch:
         return  # 409: external base move (rare, serialized per project) — next tick retries
+    except MergeBlocked:
+        # A 405 on the attempt itself, not just a pre-flight `dirty` read:
+        # `mergeable` is computed async (clean-at-read, conflicting by the
+        # time of the call) or squash merging is disabled on the repo
+        # entirely. Bootstrap's outcome is binary (SPEC §6.2) — park rather
+        # than retry forever.
+        await _park(session, run, project, ParkedReason.MERGE_BLOCKED, alerts=alerts)
+        return
 
     await _land_merged(session, ops, run, merge_commit_sha=merge_sha)
 

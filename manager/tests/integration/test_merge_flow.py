@@ -341,13 +341,14 @@ async def test_oracle_gated_mergeable_none_leaves_state_untouched_with_zero_writ
     run = await seed_run(db_session, project, item, pr_number=101)
     ops = FakeRepoOps(prs=[make_pr(101, mergeable=None, mergeable_state="unknown")])
     alerts = SpyAlertSink()
+    before = run.version
 
     await advance_merging(db_session, ops, run, project, alerts=alerts)
     await db_session.commit()
 
     updated = await fresh_run(db_session, run.id)
     assert updated.status == "merging"
-    assert updated.version == run.version  # zero writes
+    assert updated.version == before  # zero writes
     assert ops.squash_merge_calls == []
 
 
@@ -417,13 +418,14 @@ async def test_bootstrap_mergeable_none_leaves_state_untouched_with_zero_writes(
     run = await seed_run(db_session, project, item, pr_number=202)
     ops = FakeRepoOps(prs=[make_pr(202, mergeable=None, mergeable_state="unknown")])
     alerts = SpyAlertSink()
+    before = run.version
 
     await advance_merging(db_session, ops, run, project, alerts=alerts)
     await db_session.commit()
 
     updated = await fresh_run(db_session, run.id)
     assert updated.status == "merging"
-    assert updated.version == run.version
+    assert updated.version == before
     assert ops.squash_merge_calls == []
     assert ops.update_branch_calls == []
     assert ops.oracle_check_calls == []
@@ -438,14 +440,43 @@ async def test_bootstrap_409_on_merge_stays_merging_for_next_tick_retry(db_sessi
         squash_merge_error=MergeShaMismatch(409, "base moved"),
     )
     alerts = SpyAlertSink()
+    before = run.version
 
     await advance_merging(db_session, ops, run, project, alerts=alerts)
     await db_session.commit()
 
     updated = await fresh_run(db_session, run.id)
     assert updated.status == "merging"
-    assert updated.version == run.version
+    assert updated.version == before
     assert alerts.run_parked_calls == []
+
+
+async def test_bootstrap_405_on_squash_merge_parks_merge_blocked_and_alerts(db_session) -> None:
+    """The pre-flight read can be clean (`mergeable=True`) and the squash-merge
+    call itself can still 405 — GitHub's `mergeable` is computed async, so a
+    conflicting base push can land between the read and the merge attempt,
+    and a squash-disabled repo 405s unconditionally. SPEC §6.2 gives
+    bootstrap a binary outcome (merge or park), so this must park as
+    `merge_blocked` and alert — never re-raise and leave the run stuck in
+    `merging` forever."""
+    project = await seed_project(db_session, lifecycle="bootstrap")
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item, pr_number=202)
+    ops = FakeRepoOps(
+        prs=[make_pr(202, mergeable=True, mergeable_state="clean")],
+        squash_merge_error=MergeBlocked(405, "not mergeable"),
+    )
+    alerts = SpyAlertSink()
+
+    await advance_merging(db_session, ops, run, project, alerts=alerts)
+    await db_session.commit()
+
+    updated = await fresh_run(db_session, run.id)
+    assert updated.status == "parked"
+    assert updated.parked_reason == "merge_blocked"
+    assert alerts.run_parked_calls == [(project.slug, run.id, "merge_blocked")]
+    assert ops.update_branch_calls == []
+    assert ops.oracle_check_calls == []
 
 
 # -- advance_merging: PR gone / merged out-of-band -----------------------------
@@ -511,13 +542,14 @@ async def test_get_pr_unavailable_leaves_state_untouched_and_does_not_raise(db_s
 
     ops = RaisingOps()
     alerts = SpyAlertSink()
+    before = run.version
 
     await advance_merging(db_session, ops, run, project, alerts=alerts)  # must not raise
     await db_session.commit()
 
     updated = await fresh_run(db_session, run.id)
     assert updated.status == "merging"
-    assert updated.version == run.version
+    assert updated.version == before
 
 
 async def test_squash_merge_unavailable_leaves_state_untouched_and_does_not_raise(
@@ -531,13 +563,14 @@ async def test_squash_merge_unavailable_leaves_state_untouched_and_does_not_rais
         squash_merge_error=GitHubUnavailable(500, "boom"),
     )
     alerts = SpyAlertSink()
+    before = run.version
 
     await advance_merging(db_session, ops, run, project, alerts=alerts)  # must not raise
     await db_session.commit()
 
     updated = await fresh_run(db_session, run.id)
     assert updated.status == "merging"
-    assert updated.version == run.version
+    assert updated.version == before
 
 
 async def test_delete_ref_unavailable_after_merge_does_not_undo_the_merge_transition(
