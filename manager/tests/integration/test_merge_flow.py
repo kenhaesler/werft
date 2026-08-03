@@ -731,6 +731,38 @@ async def test_delete_ref_unavailable_after_merge_does_not_undo_the_merge_transi
     assert updated.merge_commit_sha == "feedbeef"
 
 
+async def test_a_permanent_delete_ref_error_after_merge_does_not_undo_the_merge_either(
+    db_session,
+) -> None:
+    """The transient family was already contained; a *permanent* one was
+    not. An org ruleset or a revoked `contents:write` grant makes
+    `DELETE /git/refs/heads/werft/run-<id>` return 403 — a plain
+    `GitHubApiError`, since it carries neither `retry-after` nor a zeroed
+    rate-limit header — which used to propagate out of `advance_merging`
+    into `_run_unit` and roll back the whole unit, *including the
+    already-won merge CAS*. The PR was merged on GitHub while the run row
+    reverted to `merging`; the next pass saw `pr.merged`, re-entered
+    `_land_merged` with `merge_commit_sha=None`, 403'd, and rolled back
+    again — forever, with the real merge sha permanently lost and
+    `cleanup_terminal` never reached because the run never became
+    terminal."""
+    project = await seed_project(db_session, lifecycle="oracle_gated")
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item, pr_number=101)
+    ops = FakeRepoOps(
+        prs=[make_pr(101, mergeable=True, mergeable_state="clean")],
+        squash_merge_result="feedbeef",
+        delete_ref_error=GitHubApiError(403, "Resource not accessible by integration"),
+    )
+
+    await advance_merging(db_session, ops, run, project, alerts=SpyAlertSink())  # must not raise
+    await db_session.commit()
+
+    updated = await fresh_run(db_session, run.id)
+    assert updated.status == "merged"
+    assert updated.merge_commit_sha == "feedbeef"  # never lost to a rollback
+
+
 # -- advance_merging: lost CAS races a concurrent operator cancel --------------
 
 

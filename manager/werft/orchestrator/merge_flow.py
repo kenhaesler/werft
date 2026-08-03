@@ -181,14 +181,22 @@ async def _land_merged(
     transaction with the CAS, so it is exactly as durable as the merge
     itself and is the actual guarantee.
 
-    The label removal is the operator-visible echo of that flag, and is
-    strictly best-effort: **every** `GitHubApiError` (the whole family, not
-    just the transient one) is caught, because nothing GitHub says about a
-    label may unwind a merge that has already landed. `sync_backlog`'s
-    absent-from-ready-set sweep converges the rest on its own. The branch
-    delete is best-effort for the same reason (the merge is real; only
-    Werft's bookkeeping of the branch is stale) — `cleanup_terminal`'s sweep
-    is its retry.
+    Both GitHub calls below are best-effort, and both catch the **whole**
+    `GitHubApiError` family rather than only the transient `GitHubUnavailable`
+    one. The narrow catch was the bug: nothing that runs after the CAS shares
+    a commit domain with GitHub, so an escaping error rolls back
+    `_run_unit`'s transaction and un-records a merge that has *already
+    landed* — the PR is merged on GitHub while the run reverts to `merging`,
+    loses `merge_commit_sha`, and re-enters this function via the
+    merged-out-of-band short circuit on every subsequent pass, forever. A
+    permissions/ruleset 403 (no `retry-after`, no zeroed rate-limit header,
+    so a plain `GitHubApiError`) is exactly that shape. Convergence lives
+    elsewhere instead: `sync_backlog`'s absent-from-ready-set sweep for the
+    label, `cleanup_terminal`'s sweep for the branch.
+
+    (`cleanup_terminal` deliberately keeps the narrow `GitHubUnavailable`
+    catch: nothing is won before its GitHub calls, so an escaping error
+    there costs a re-driven sweep, not the rollback of a landed merge.)
     """
     ok = await transition_run(
         session,
@@ -219,9 +227,9 @@ async def _land_merged(
     branch = _branch_name(run)
     try:
         await ops.delete_ref(branch)
-    except GitHubUnavailable as exc:
+    except GitHubApiError as exc:
         logger.warning(
-            "merge_flow.delete_ref_unavailable", run_id=str(run.id), branch=branch, error=str(exc)
+            "merge_flow.delete_ref_failed", run_id=str(run.id), branch=branch, error=str(exc)
         )
 
 
@@ -398,6 +406,12 @@ async def cleanup_terminal(session: AsyncSession, ops: RepoOps, run: Run) -> Non
     the next dispatch force-resets this same branch). Safe to re-run: a
     prior `cleanup` `run_events` row for this run is the whole idempotence
     story, checked before any GitHub call is made.
+
+    The `GitHubUnavailable` catch stays deliberately narrow here, unlike
+    `_land_merged`'s: this function wins nothing before its GitHub calls, so
+    letting a permanent error escape into `_run_unit` costs a re-driven
+    sweep and a logged line — never the rollback of a transition that has
+    already happened.
     """
     if run.status not in _CLEANUP_STATUSES:
         return
