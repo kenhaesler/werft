@@ -1,20 +1,31 @@
 """Composition root (SPEC §1 layering: the only module allowed to import
 from every layer below it).
 
-Lifespan wiring: the GitHub-backed orchestrator only starts when a GitHub
-App client id is configured (`Settings.github_app_client_id`) — tests and
-local dev boot clean, healthz-only, with no engine, no httpx client, and no
-GitHub call ever made. When creds are present, the lifespan reads the
-App's private key file, builds one engine, one `httpx.AsyncClient`, one
-`AppAuth`, a manager-permission `RepoOps` factory (`MANAGER_PERMISSIONS`)
-for day-to-day polling, and an admin-permission `TransientAdminOps` factory
-for the one branch-protection call onboarding/the doctrine-#1 flip need
-(SPEC §6.3) — then starts `Orchestrator.run` as a background task. Shutdown
-sets the stop event and awaits that task before disposing the engine/http
-client — both run unconditionally even if awaiting the task itself raises
-(an `ExceptionGroup` from a crashed loop must still leave a clean
-teardown) — so a clean SIGTERM/lifespan-exit drains every in-flight unit
-of work first.
+Lifespan wiring: the lifespan always builds one DB engine and one
+`async_sessionmaker`, stashed on `app.state.session_factory` — the API
+layer's `get_session` dependency (SPEC §9 operator surface) needs it
+regardless of GitHub configuration, and `create_async_engine` is lazy (no
+connection is opened until a route actually issues a query), so this costs
+nothing when nothing queries it. The GitHub-backed orchestrator, on the
+other hand, only starts when a GitHub App client id is configured
+(`Settings.github_app_client_id`) — tests and local dev boot clean,
+healthz-and-API-only, with no httpx client and no GitHub call ever made.
+When creds are present, the lifespan reads the App's private key file,
+builds one `httpx.AsyncClient`, one `AppAuth`, a manager-permission
+`RepoOps` factory (`MANAGER_PERMISSIONS`) for day-to-day polling, and an
+admin-permission `TransientAdminOps` factory for the one branch-protection
+call onboarding/the doctrine-#1 flip need (SPEC §6.3) — then starts
+`Orchestrator.run` as a background task. Shutdown sets the stop event and
+awaits that task before disposing the engine/http client — both run
+unconditionally even if awaiting the task itself raises (an
+`ExceptionGroup` from a crashed loop must still leave a clean teardown) —
+so a clean SIGTERM/lifespan-exit drains every in-flight unit of work
+first.
+
+The static bearer token guarding `/api/v1` (SPEC §9) is read once here,
+synchronously, from its file mount (SPEC §10: secrets are file mounts,
+never env) — before the app is even constructed, not inside the lifespan —
+because `include_router`'s `dependencies=` is fixed at router-mount time.
 """
 
 import asyncio
@@ -25,10 +36,11 @@ from typing import Any
 from uuid import UUID
 
 import httpx
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from werft.api.routes import router
+from werft.api.auth import make_require_token
+from werft.api.routes import api_router, healthz_router
 from werft.config.settings import Settings
 from werft.db.engine import create_engine_from_url
 from werft.db.models import Project
@@ -169,20 +181,42 @@ def _admin_ops_factory(
     return build
 
 
+def _read_api_token(path: str) -> str | None:
+    """Read the static bearer token once, at startup, from its file mount
+    (SPEC §10: secrets are file mounts, never env). An empty path or a
+    path that doesn't resolve to a file both mean "not configured" —
+    `make_require_token` fails closed on `None` rather than treating a
+    missing mount as "auth disabled"."""
+    if not path:
+        return None
+    token_path = Path(path)
+    if not token_path.is_file():
+        return None
+    return token_path.read_text().strip()
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings or Settings()
+    require_token = make_require_token(_read_api_token(resolved.api_token_file))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        engine = create_engine_from_url(resolved.database_url)
+        app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
         if not resolved.github_app_client_id:
-            # No GitHub App configured: tests/dev boot clean, healthz-only —
-            # no engine, no httpx client, no orchestrator, no GitHub call.
-            yield
+            # No GitHub App configured: the orchestrator never starts — no
+            # httpx client, no GitHub call — but the API layer still needs
+            # a session factory to serve /api/v1/runs. The engine above is
+            # a lazy connection pool, so building it here opens no
+            # connection until a route actually issues a query.
+            try:
+                yield
+            finally:
+                await engine.dispose()
             return
 
         private_key_pem = Path(resolved.github_app_private_key_file).read_text()
-        engine = create_engine_from_url(resolved.database_url)
-        session_factory = async_sessionmaker(engine, expire_on_commit=False)
         http = httpx.AsyncClient()
         auth = AppAuth(
             http,
@@ -191,7 +225,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             api_url=resolved.github_api_url,
         )
         orchestrator = Orchestrator(
-            session_factory,
+            app.state.session_factory,
             _ops_factory(auth, http, resolved.github_api_url, MANAGER_PERMISSIONS),
             _admin_ops_factory(auth, http, resolved.github_api_url),
             alerts=NullAlertSink(),
@@ -216,5 +250,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await engine.dispose()
 
     app = FastAPI(title="werft-manager", lifespan=lifespan)
-    app.include_router(router)
+    app.include_router(healthz_router)
+    app.include_router(api_router, prefix="/api/v1", dependencies=[Depends(require_token)])
     return app

@@ -21,3 +21,10 @@ class Settings(BaseSettings):
     tick_seconds: int = 15
     issue_poll_seconds: int = 60
     check_poll_seconds: int = 30
+
+    # Operator API auth (SPEC §9: "Static bearer token, Tailscale-only, TLS
+    # via `tailscale cert`"). The ro-mounted file holding the static bearer
+    # token (SPEC §10: secrets are file mounts, never env). Empty default
+    # means "not configured" — `werft/api/auth.py` fails closed (403) rather
+    # than treating an unmounted secret as "auth disabled".
+    api_token_file: str = ""
