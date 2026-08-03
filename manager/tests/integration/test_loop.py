@@ -141,6 +141,34 @@ class FakeRepoOps:
         self.partial_calls.append(branch)
 
 
+class DelayedSquashMergeOps:
+    """Scripted `RepoOps` whose `squash_merge` blocks on an `asyncio.Event`
+    before returning — proves `_advance_all_merging`'s lock (fix 3) forces
+    two concurrent callers (`tick_once`'s and `poll_checks_once`'s merging
+    sweeps coinciding) to serialize rather than both reach `squash_merge`
+    for the same row: the GitHub mutation happens before any CAS, so an
+    unguarded second caller could double-merge or leave a merged PR
+    recorded as `awaiting_ci`."""
+
+    def __init__(self, pr: PullRequest, release: asyncio.Event) -> None:
+        self._pr = pr
+        self._release = release
+        self.get_pr_calls: list[int] = []
+        self.squash_merge_calls: list[int] = []
+
+    async def get_pr(self, number: int) -> PullRequest | None:
+        self.get_pr_calls.append(number)
+        return self._pr
+
+    async def squash_merge(self, number: int, head_sha: str, commit_title: str) -> str:
+        self.squash_merge_calls.append(number)
+        await self._release.wait()
+        return "deadc0de"
+
+    async def delete_ref(self, branch: str) -> None:
+        return None
+
+
 class FailingForProjectOpsFactory:
     """An `ops_for` factory that raises `GitHubUnavailable` for one named
     project id and returns a working `FakeRepoOps` for every other project
@@ -255,13 +283,16 @@ async def seed_run(
     status: str,
     pr_number: int | None = None,
     next_attempt_at: datetime | None = None,
+    attempt_count: int | None = None,
+    max_attempts: int | None = None,
 ) -> Run:
     rid = (
         await session.execute(
             text(
                 "INSERT INTO runs (project_id, backlog_item_id, status, provider, pr_number, "
-                "next_attempt_at) "
-                "VALUES (:p, :b, :status, 'claude', :pr, COALESCE(:nat, now())) RETURNING id"
+                "next_attempt_at, attempt_count, max_attempts) "
+                "VALUES (:p, :b, :status, 'claude', :pr, COALESCE(:nat, now()), "
+                "COALESCE(:ac, 0), COALESCE(:ma, 3)) RETURNING id"
             ),
             {
                 "p": project.id,
@@ -269,6 +300,8 @@ async def seed_run(
                 "status": status,
                 "pr": pr_number,
                 "nat": next_attempt_at,
+                "ac": attempt_count,
+                "ma": max_attempts,
             },
         )
     ).scalar_one()
@@ -287,6 +320,25 @@ async def seed_open_attempt(session, run_id: uuid.UUID, *, attempt_no: int = 1) 
             "VALUES (:r, :n, 'claude', now() - interval '30 seconds', now())"
         ),
         {"r": run_id, "n": attempt_no},
+    )
+    await session.commit()
+
+
+async def seed_closed_attempt(
+    session, run_id: uuid.UUID, *, attempt_no: int = 1, outcome: str | None
+) -> None:
+    """A fully closed `run_attempts` row — `ended_at` set *and* `outcome`
+    filled — what a `finalize_attempt`/`ci_watch`/`merge_flow` writer
+    leaves behind on a run it CASes to `failed`. `_wake_failed_one` reads
+    this row's `outcome` back out (via `AttemptOutcome(...)`, or `None`
+    when this is left `None`) to hand to `advance_failed`."""
+    await session.execute(
+        text(
+            "INSERT INTO run_attempts "
+            "(run_id, attempt_no, provider, started_at, ended_at, outcome) "
+            "VALUES (:r, :n, 'claude', now() - interval '30 seconds', now(), :outcome)"
+        ),
+        {"r": run_id, "n": attempt_no, "outcome": outcome},
     )
     await session.commit()
 
@@ -313,6 +365,116 @@ async def runs_for(session, project_id) -> list[Run]:
         select(Run).where(Run.project_id == project_id).execution_options(populate_existing=True)
     )
     return list(result.scalars().all())
+
+
+# -- tick_once: failed-row wake (the stranded-row sweep) -------------------------
+
+
+async def test_tick_wakes_a_failed_run_with_budget_left_back_to_queued(
+    db_session, orchestrator_session_factory
+) -> None:
+    """The dispatch instructions for this task originally said to skip the
+    `failed`-row sweep; the plan's brief mandates it, and it closes a real
+    gap: `ci_watch.advance_awaiting_ci`'s gone-PR edge and
+    `merge_flow._fail_gone` both CAS a run straight to `failed` without
+    ever calling `advance_failed` themselves, leaving it stranded there
+    forever with `next_attempt_at` already in the past. `tick_once`'s
+    failed-wake sweep re-reads the latest closed attempt's outcome and
+    drives `advance_failed` directly; with budget left, that means
+    `queued`."""
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(
+        db_session,
+        project,
+        item,
+        status="failed",
+        next_attempt_at=datetime.now(UTC) - timedelta(minutes=5),
+        attempt_count=0,
+        max_attempts=3,
+    )
+    await seed_closed_attempt(db_session, run.id, outcome="agent_failure")
+
+    orchestrator = make_orchestrator(orchestrator_session_factory, ops_for=lambda p: FakeRepoOps())
+    await orchestrator.tick_once()
+
+    updated = await fresh_run(db_session, run.id)
+    assert updated.status == "queued"
+    assert updated.attempt_count == 1
+
+
+async def test_tick_parks_a_failed_run_whose_attempt_budget_is_spent(
+    db_session, orchestrator_session_factory
+) -> None:
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(
+        db_session,
+        project,
+        item,
+        status="failed",
+        next_attempt_at=datetime.now(UTC) - timedelta(minutes=5),
+        attempt_count=3,
+        max_attempts=3,
+    )
+    await seed_closed_attempt(db_session, run.id, outcome="agent_failure")
+
+    orchestrator = make_orchestrator(orchestrator_session_factory, ops_for=lambda p: FakeRepoOps())
+    await orchestrator.tick_once()
+
+    updated = await fresh_run(db_session, run.id)
+    assert updated.status == "parked"
+    assert updated.parked_reason == "agent_failure"
+
+
+async def test_tick_wakes_a_failed_run_whose_latest_attempt_has_no_outcome_yet(
+    db_session, orchestrator_session_factory
+) -> None:
+    """The latest `run_attempts` row's `outcome` may be `NULL` (no attempt
+    row at all, or one whose outcome was never filled before its run was
+    CASed to `failed` out-of-band) — the sweep must still convert that to
+    a plain `None` and drive `advance_failed`, not raise."""
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(
+        db_session,
+        project,
+        item,
+        status="failed",
+        next_attempt_at=datetime.now(UTC) - timedelta(minutes=5),
+        attempt_count=0,
+        max_attempts=3,
+    )
+    # Deliberately no run_attempts row seeded at all.
+
+    orchestrator = make_orchestrator(orchestrator_session_factory, ops_for=lambda p: FakeRepoOps())
+    await orchestrator.tick_once()
+
+    updated = await fresh_run(db_session, run.id)
+    assert updated.status == "queued"
+    assert updated.attempt_count == 1
+
+
+async def test_tick_leaves_a_failed_run_whose_next_attempt_at_is_in_the_future(
+    db_session, orchestrator_session_factory
+) -> None:
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(
+        db_session,
+        project,
+        item,
+        status="failed",
+        next_attempt_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    await seed_closed_attempt(db_session, run.id, outcome="agent_failure")
+
+    orchestrator = make_orchestrator(orchestrator_session_factory, ops_for=lambda p: FakeRepoOps())
+    await orchestrator.tick_once()
+
+    updated = await fresh_run(db_session, run.id)
+    assert updated.status == "failed"
+    assert updated.version == run.version  # zero writes
 
 
 # -- tick_once: blocked_quota wake ----------------------------------------------
@@ -394,6 +556,40 @@ async def test_tick_terminal_cleanup_is_a_no_op_once_the_cleanup_event_exists(
     assert len(await cleanup_events(db_session, run.id)) == 1
 
 
+async def test_sweep_terminal_cleanup_stops_starting_new_units_once_stop_is_set(
+    db_session, orchestrator_session_factory
+) -> None:
+    """Fix 5b: every sweep checks `stop.is_set()` between units — never
+    mid-unit — before starting the next one. Two canceled runs are seeded;
+    the shared ops object's `close_pr` sets `stop` as a side effect of
+    processing whichever row comes first, proving the sweep never starts a
+    second unit afterward (regardless of the discovery query's — unordered
+    by design — row order)."""
+    project = await seed_project(db_session)
+    item_a = await seed_backlog_item(db_session, project, 1)
+    run_a = await seed_run(db_session, project, item_a, status="canceled", pr_number=101)
+    item_b = await seed_backlog_item(db_session, project, 2)
+    run_b = await seed_run(db_session, project, item_b, status="canceled", pr_number=102)
+
+    stop = asyncio.Event()
+
+    class StoppingOnFirstCloseOps(FakeRepoOps):
+        async def close_pr(self, number: int) -> None:
+            await super().close_pr(number)
+            stop.set()
+
+    ops = StoppingOnFirstCloseOps()
+    orchestrator = make_orchestrator(orchestrator_session_factory, ops_for=lambda p: ops)
+
+    await orchestrator._sweep_terminal_cleanup(stop)
+
+    assert len(ops.close_pr_calls) == 1  # the second unit was never started
+
+    cleaned_a = await cleanup_events(db_session, run_a.id)
+    cleaned_b = await cleanup_events(db_session, run_b.id)
+    assert len(cleaned_a) + len(cleaned_b) == 1
+
+
 # -- tick_once: merging advance --------------------------------------------------
 
 
@@ -409,6 +605,43 @@ async def test_tick_advances_a_due_merging_run(db_session, orchestrator_session_
     updated = await fresh_run(db_session, run.id)
     assert updated.status == "merged"
     assert ops.squash_merge_calls == [101]
+
+
+async def test_advance_all_merging_serializes_concurrent_callers_via_the_lock(
+    db_session, orchestrator_session_factory
+) -> None:
+    """`tick_once` and `poll_checks_once` both call `_advance_all_merging`
+    on independent 15 s/30 s cadences that periodically coincide. Without
+    the lock, two concurrent calls could both discover the same `merging`
+    row and both reach `squash_merge` before either's CAS has landed. Here,
+    the first call's `squash_merge` is held open on an `asyncio.Event`
+    while a second call is started concurrently; the second must block on
+    the *same* lock rather than run its own discovery query and also reach
+    `squash_merge` — proven by `squash_merge` being called exactly once in
+    total, and by the second call, once it does get the lock, finding
+    nothing left `merging` to advance."""
+    project = await seed_project(db_session, lifecycle="oracle_gated")
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item, status="merging", pr_number=101)
+
+    release = asyncio.Event()
+    ops = DelayedSquashMergeOps(make_pr(101, mergeable=True), release)
+    orchestrator = make_orchestrator(orchestrator_session_factory, ops_for=lambda p: ops)
+
+    first = asyncio.create_task(orchestrator._advance_all_merging("tick_merging_advance"))
+    await asyncio.sleep(0.05)  # let `first` acquire the lock and reach squash_merge
+    second = asyncio.create_task(orchestrator._advance_all_merging("poll_merging_advance"))
+    await asyncio.sleep(0.05)  # `second` must now be blocked waiting on the same lock
+
+    assert not first.done()
+    assert not second.done()
+
+    release.set()
+    await asyncio.wait_for(asyncio.gather(first, second), timeout=5)
+
+    assert ops.squash_merge_calls == [101]  # exactly once, never twice
+    updated = await fresh_run(db_session, run.id)
+    assert updated.status == "merged"
 
 
 # -- poll_checks_once: awaiting_ci / awaiting_review(bootstrap) / merging --------
@@ -576,7 +809,18 @@ async def test_poll_issues_once_isolates_one_projects_github_outage_from_the_res
 async def test_run_executes_loops_and_stops_promptly_after_the_stop_event(
     orchestrator_session_factory,
 ) -> None:
-    settings = Settings(tick_seconds=1, issue_poll_seconds=1, check_poll_seconds=1)
+    """Deliberately uses the real 15/60/30 s poll cadences (`Settings()`'s
+    own defaults), not a 1 s override: `_loop`'s stop-responsiveness comes
+    from racing `stop.wait()` against `interval_seconds` inside
+    `wait_for`, not from the interval being short. A bare
+    `asyncio.sleep(interval_seconds)` implementation would still finish a
+    1 s-cadence test inside 5 s, silently hiding the very bug this test
+    exists to catch; only the real, much longer defaults make that bug
+    actually blow the 5 s bound. `asyncio.wait_for(task, timeout=5)` is
+    itself the entire load-bearing assertion — it raises on its own if
+    `task` isn't done in time.
+    """
+    settings = Settings(tick_seconds=15, issue_poll_seconds=60, check_poll_seconds=30)
     orchestrator = Orchestrator(
         orchestrator_session_factory,
         lambda project: FakeRepoOps(),

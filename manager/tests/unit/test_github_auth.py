@@ -154,6 +154,53 @@ async def test_token_for_remints_when_expiring_within_five_minutes():
     assert first.token != second.token
 
 
+async def test_token_for_transient_mints_fresh_each_time_and_never_touches_the_cache():
+    """`transient=True` (`TransientAdminOps`'s doctrine, `app.py`) must
+    bypass both the cache read and the cache write: two transient calls for
+    the exact same `(owner, repo, permissions)` key each mint their own
+    token, and the shared cache dict stays empty throughout — a later
+    non-transient call for the same key must not find anything left behind
+    by a transient one."""
+    mint_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal mint_calls
+        if request.url.path.endswith("/installation"):
+            return httpx.Response(200, json={"id": 1})
+        mint_calls += 1
+        return _mint_response(f"ghs_{mint_calls}")
+
+    auth = auth_with(handler)
+    first = await auth.token_for(OWNER, REPO, ADMIN_PERMISSIONS, transient=True)
+    second = await auth.token_for(OWNER, REPO, ADMIN_PERMISSIONS, transient=True)
+
+    assert mint_calls == 2  # never served from cache
+    assert first.token != second.token
+    assert auth._cache == {}  # never written to cache either
+
+
+async def test_token_for_transient_does_not_shadow_the_non_transient_cache():
+    """A transient mint for a key must not pollute — or be satisfied
+    by — the cache a non-transient caller for that same key relies on."""
+    mint_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal mint_calls
+        if request.url.path.endswith("/installation"):
+            return httpx.Response(200, json={"id": 1})
+        mint_calls += 1
+        return _mint_response(f"ghs_{mint_calls}")
+
+    auth = auth_with(handler)
+    transient = await auth.token_for(OWNER, REPO, ADMIN_PERMISSIONS, transient=True)
+    cached_first = await auth.token_for(OWNER, REPO, ADMIN_PERMISSIONS)
+    cached_second = await auth.token_for(OWNER, REPO, ADMIN_PERMISSIONS)
+
+    assert mint_calls == 2  # one for the transient call, one for the first cached call
+    assert transient.token != cached_first.token
+    assert cached_first.token == cached_second.token  # the non-transient pair now caches normally
+
+
 async def test_distinct_permission_sets_get_distinct_tokens():
     mint_calls = 0
 

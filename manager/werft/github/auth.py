@@ -6,13 +6,19 @@ every installation token `administration:write` — the permission `PUT
 §3.1), but one that must never ride along on a run's attenuated token or a
 day-to-day ops call. `MANAGER_PERMISSIONS` is what the manager mints for
 itself; `ADMIN_PERMISSIONS` is minted transiently, used for one protection
-call, and revoked immediately (`AppAuth.revoke`); `RUNNER_PERMISSIONS` is
-T7's per-run dispatch grant.
+call, and revoked immediately (`AppAuth.revoke`; `app.py`'s
+`TransientAdminOps` is the caller that actually does this); `RUNNER_PERMISSIONS`
+is T7's per-run dispatch grant.
 
 Installation tokens are cached per `(owner, repo, permission set)` — minting is
 a JWT-authed round trip plus a write against GitHub's secondary rate limit, and
 distinct permission sets are, by GitHub's own attenuation model, distinct
-tokens that cannot be merged into one cache entry.
+tokens that cannot be merged into one cache entry. `token_for`'s
+`transient=True` kwarg bypasses that cache entirely (no read, no write) —
+`TransientAdminOps`'s doctrine that an admin-scoped token is minted for one
+call and revoked immediately means it must never be read back out of the
+shared cache by some other caller, nor left occupying that cache's slot
+after this caller has already asked to revoke it.
 """
 
 import time
@@ -107,17 +113,26 @@ class AppAuth:
         return response.json()["id"]
 
     async def token_for(
-        self, owner: str, repo: str, permissions: dict[str, str]
+        self, owner: str, repo: str, permissions: dict[str, str], *, transient: bool = False
     ) -> InstallationToken:
         """An installation token attenuated to `permissions`, scoped to `repo`.
 
         Cached per `(owner, repo, permission set)`; re-minted once fewer than
         five minutes of validity remain.
+
+        `transient=True` bypasses the cache entirely — no read, no write.
+        This is `TransientAdminOps` (`app.py`)'s doctrine: an admin-scoped
+        token is minted for exactly one protection call and revoked
+        immediately after, so it must never be handed back to some other,
+        unrelated caller out of the shared cache, and must never itself
+        occupy that cache slot for the next legitimate admin mint to find
+        (already-revoked) stale.
         """
         key = _cache_key(owner, repo, permissions)
-        cached = self._cache.get(key)
-        if cached is not None and cached.expires_at - datetime.now(UTC) > _RENEW_MARGIN:
-            return cached
+        if not transient:
+            cached = self._cache.get(key)
+            if cached is not None and cached.expires_at - datetime.now(UTC) > _RENEW_MARGIN:
+                return cached
 
         installation_id = await self.installation_id(owner, repo)
         response = await self._http.post(
@@ -130,7 +145,8 @@ class AppAuth:
         token = InstallationToken(
             token=data["token"], expires_at=datetime.fromisoformat(data["expires_at"])
         )
-        self._cache[key] = token
+        if not transient:
+            self._cache[key] = token
         return token
 
     async def revoke(self, token: str) -> bool:
