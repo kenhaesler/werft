@@ -55,21 +55,37 @@ def _ops_factory(
     to the next. A fresh `RepoOps`/`GitHubClient` per call — this
     function's pre-fix behavior — meant `If-None-Match` was never sent and
     every 60 s issue poll burned a real rate-limit unit instead of a free
-    304."""
+    304.
+
+    Because the cached object outlives the session that loaded the `Project`
+    it was built from, **nothing cached here may hold an ORM reference.**
+    `owner`/`repo`/`project_id` are read once, here, as plain values, and
+    the token-provider closure captures those instead of the instance. The
+    lazy read this replaces made the *first* unit that built the ops object
+    decide that project's fate: `Orchestrator._run_unit` rolls back on any
+    exception, SQLAlchemy expires every identity-mapped state on that
+    rollback, the session closes — and every later request through the
+    cached ops object then raised `DetachedInstanceError` from inside the
+    token provider, before reaching HTTP. That project went dark for the
+    life of the process while `/healthz` stayed green."""
     cache: dict[UUID, RepoOps] = {}
 
     def build(project: Project) -> RepoOps:
-        cached = cache.get(project.id)
+        project_id: UUID = project.id
+        cached = cache.get(project_id)
         if cached is not None:
             return cached
 
+        owner: str = project.github_owner
+        repo: str = project.github_repo
+
         async def token_provider() -> str:
-            token = await auth.token_for(project.github_owner, project.github_repo, permissions)
+            token = await auth.token_for(owner, repo, permissions)
             return token.token
 
         client = GitHubClient(http, api_url=api_url, token_provider=token_provider)
-        ops = RepoOps(client, project.github_owner, project.github_repo)
-        cache[project.id] = ops
+        ops = RepoOps(client, owner, repo)
+        cache[project_id] = ops
         return ops
 
     return build
@@ -138,10 +154,17 @@ def _admin_ops_factory(
     `_ops_factory`'s manager-permission clients, there is nothing here
     worth memoizing — `TransientAdminOps` holds no persistent client or
     ETag cache of its own; every one of its calls mints and revokes its own
-    token regardless of which wrapper instance made it."""
+    token regardless of which wrapper instance made it.
+
+    Same ORM-reference rule as `_ops_factory` all the same: `owner`/`repo`
+    are read eagerly, here, into plain strings the wrapper then owns. It
+    never holds the `Project` instance, so it cannot be poisoned by the
+    session that loaded it rolling back."""
 
     def build(project: Project) -> TransientAdminOps:
-        return TransientAdminOps(auth, http, api_url, project.github_owner, project.github_repo)
+        owner: str = project.github_owner
+        repo: str = project.github_repo
+        return TransientAdminOps(auth, http, api_url, owner, repo)
 
     return build
 

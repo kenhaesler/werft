@@ -7,6 +7,9 @@ import httpx
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from sqlalchemy.orm import make_transient_to_detached
+from sqlalchemy.orm.attributes import instance_state
+from sqlalchemy.orm.exc import DetachedInstanceError
 
 from werft.app import TransientAdminOps, _ops_factory, create_app
 from werft.config.settings import Settings
@@ -117,6 +120,71 @@ async def test_ops_factory_memoizes_repo_ops_per_project_id() -> None:
     second = build(project)
 
     assert first is second
+
+
+class _RecordingAuth:
+    """Duck-typed `AppAuth` that only records which `(owner, repo)` the
+    token provider asked for — the whole point of the test below is that
+    those two values are still readable at request time."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    async def token_for(
+        self, owner: str, repo: str, permissions: dict[str, str], *, transient: bool = False
+    ) -> InstallationToken:
+        self.calls.append((owner, repo))
+        return InstallationToken(
+            token="ghs_live", expires_at=datetime.now(UTC) + timedelta(hours=1)
+        )
+
+
+def _poison_like_a_rolled_back_unit(project: Project) -> None:
+    """Reproduce, without a database, exactly what `Orchestrator._run_unit`
+    leaves behind when a unit raises: SQLAlchemy's non-nested
+    `SessionTransaction.rollback()` calls `_restore_snapshot(dirty_only=False)`,
+    which expires *every* state in the identity map, and the session then
+    closes, leaving the instance detached as well. Any later attribute read
+    on it raises `DetachedInstanceError` — there is no session left to
+    refresh from. (`_expire` is private, but it is the one hook that
+    reproduces the rollback's effect on a single instance in-process.)"""
+    make_transient_to_detached(project)
+    instance_state(project)._expire(project.__dict__, set())
+
+
+async def test_memoized_ops_still_work_after_the_project_instance_is_expired_and_detached() -> None:
+    """The memoized `RepoOps` outlives the session that loaded the `Project`
+    it was built from, so its `token_provider` closure must capture
+    `github_owner`/`github_repo` as plain strings at memoization time and
+    hold no ORM reference at all.
+
+    Reading them lazily inside the coroutine — the pre-fix shape — meant the
+    *first* unit that built the ops object for a project also decided that
+    project's fate: if that unit rolled back (a GitHub 503 during the first
+    poll, a transient DB error), the captured instance was left expired and
+    detached, and every subsequent request through the cached ops object
+    raised `DetachedInstanceError` before it ever reached HTTP. The project
+    went dark for the life of the process while `/healthz` stayed green.
+    """
+    auth = _RecordingAuth()
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"object": {"sha": "sha-1"}})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    build = _ops_factory(auth, http, "https://api.github.test", MANAGER_PERMISSIONS)
+    project = Project(id=uuid.uuid4(), slug="s", github_owner="acme", github_repo="widgets")
+    ops = build(project)
+
+    _poison_like_a_rolled_back_unit(project)
+    with pytest.raises(DetachedInstanceError):  # sanity: the poisoning is real
+        _ = project.github_owner
+
+    assert await ops.get_ref_sha("unattended") == "sha-1"
+    assert auth.calls == [("acme", "widgets")]
+    assert seen[0].headers["authorization"] == "Bearer ghs_live"
 
 
 # -- TransientAdminOps: mint -> protection call -> revoke (fix 4) ------------
