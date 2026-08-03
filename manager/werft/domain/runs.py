@@ -1,6 +1,7 @@
-"""Run state machine as a pure table (SPEC §3.2). Imports nothing."""
+"""Run state machine as a pure table (SPEC §3.2). Imports nothing but stdlib."""
 
 from enum import StrEnum
+from uuid import UUID
 
 
 class RunStatus(StrEnum):
@@ -52,6 +53,21 @@ TRANSITIONS: frozenset[tuple[RunStatus, RunStatus]] = frozenset(
     }
     | {(s, _S.CANCELED) for s in RunStatus if s not in TERMINAL_STATUSES}
 )
+
+
+def run_branch_name(run_id: UUID) -> str:
+    """The one definition of a run's branch name (SPEC §6.1: `werft/run-<id>`
+    — ephemeral, force-reset per attempt, deleted on merge/terminal).
+
+    Lives here, in the pure domain layer, because three planes that never
+    share a call stack have to agree on it byte-for-byte:
+    `finalize.open_pr_and_wait` names the head branch when it opens the PR,
+    `merge_flow` names it again to delete it, and T7's dispatcher creates and
+    force-resets it before the container starts. Two of those used to spell
+    the same f-string inline — one edit away from silently orphaning every
+    run branch.
+    """
+    return f"werft/run-{run_id}"
 
 
 class ParkedReason(StrEnum):

@@ -16,6 +16,7 @@ dependencies = [
     "structlog==26.1.*",
     "httpx==0.28.1",               # exact; httpx2 evaluated 2026-08-01 and NOT adopted
                                    # (see docs/superpowers/plans/2026-08-01-thin-loop-t1-t2.md)
+    "pyjwt[crypto]>=2.10,<3",       # App JWT, RS256
 ]
 
 [dependency-groups]
