@@ -396,6 +396,7 @@ async def test_agent_failure_with_budget_left_requeues_with_exponential_backoff(
     classification = Classification(
         outcome=AttemptOutcome.AGENT_FAILURE, status=ResultStatus.FAILURE, detail="agent crashed"
     )
+    alerts = SpyAlertSink()
 
     before = datetime.now(UTC)
     await finalize_attempt(
@@ -406,7 +407,7 @@ async def test_agent_failure_with_budget_left_requeues_with_exponential_backoff(
         classification=classification,
         pushed=False,
         quota=SpyQuota(),
-        alerts=SpyAlertSink(),
+        alerts=alerts,
     )
 
     updated = await fresh_run(db_session, run.id)
@@ -415,6 +416,7 @@ async def test_agent_failure_with_budget_left_requeues_with_exponential_backoff(
     assert updated.error_message == "agent crashed"
     # backoff = min(2**1 * 30, 1800) = 60s
     assert before + timedelta(seconds=55) < updated.next_attempt_at < before + timedelta(seconds=65)
+    assert alerts.run_parked_calls == []  # budget left: never parks, never alerts
 
 
 async def test_advance_failed_called_directly_moves_an_infra_failure_to_queued_with_backoff(
@@ -506,6 +508,7 @@ async def test_auth_failure_with_budget_left_requeues_and_fires_auth_failure_ale
     # same queued/parked ladder as every other genuine failure.
     assert updated.status == "queued"
     assert alerts.auth_failure_calls == ["claude"]
+    assert alerts.run_parked_calls == []  # budget left: never parks
 
 
 async def test_auth_failure_at_budget_parks_with_generic_agent_failure_reason_not_auth_failure(
