@@ -89,7 +89,7 @@ class AppAuth:
         now = int(time.time())
         payload = {
             "iat": now - _JWT_IAT_SKEW_SECONDS,
-            "exp": now - _JWT_IAT_SKEW_SECONDS + _JWT_TTL_SECONDS,
+            "exp": now + _JWT_TTL_SECONDS,
             "iss": self._client_id,
         }
         return jwt.encode(payload, self._private_key_pem, algorithm="RS256")
@@ -136,7 +136,15 @@ class AppAuth:
     async def revoke(self, token: str) -> bool:
         """Revoke an installation token at teardown. Never raises: a failed
         revoke must not block or fail the caller's own teardown path — the
-        token still expires on its own within the hour."""
+        token still expires on its own within the hour.
+
+        Evicts the token from `_cache` regardless of whether the DELETE call
+        itself succeeds, so a subsequent `token_for` for the same key never
+        hands back a token this caller has already asked to revoke.
+        """
+        for key, cached in list(self._cache.items()):
+            if cached.token == token:
+                del self._cache[key]
         try:
             response = await self._http.delete(
                 f"{self._api_url}/installation/token",

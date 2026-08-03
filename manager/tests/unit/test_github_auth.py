@@ -65,7 +65,9 @@ def test_app_jwt_is_valid_rs256_with_correct_claims():
 
     claims = _decode(token)
     assert claims["iss"] == CLIENT_ID
-    assert claims["exp"] - claims["iat"] <= 600
+    # exp is pinned to now+540s independent of the backdated iat, so the
+    # full window is exactly 600s (60s skew + 540s ttl), not merely "under".
+    assert claims["exp"] - claims["iat"] == 600
 
     now = datetime.now(UTC)
     iat = datetime.fromtimestamp(claims["iat"], tz=UTC)
@@ -201,3 +203,26 @@ async def test_revoke_returns_false_without_raising_on_transport_error():
 
     auth = auth_with(handler)
     assert await auth.revoke("ghs_x") is False
+
+
+async def test_revoke_evicts_the_cached_token_so_token_for_remints():
+    mint_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal mint_calls
+        if request.url.path.endswith("/installation"):
+            return httpx.Response(200, json={"id": 1})
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        mint_calls += 1
+        return _mint_response(f"ghs_{mint_calls}")
+
+    auth = auth_with(handler)
+    first = await auth.token_for(OWNER, REPO, ADMIN_PERMISSIONS)
+
+    assert await auth.revoke(first.token) is True
+
+    second = await auth.token_for(OWNER, REPO, ADMIN_PERMISSIONS)
+
+    assert mint_calls == 2
+    assert first.token != second.token
