@@ -11,10 +11,13 @@ same `PullRequest` snapshot (one `get_pr` per call — never more):
   module never calls `oracle_check` itself. It tries the squash-merge
   directly: `200` lands `merged`; a `405` (`MergeBlocked`) means GitHub
   wouldn't merge it at all, and `mergeable_state` disambiguates *why* —
-  `dirty` is a real conflict (`parked/merge_conflict` + alert), anything
-  else (`behind`/`blocked`/other) means the base moved, so an update-branch
-  is due and the *updated* head must re-earn green (`merging -> awaiting_ci`,
-  SPEC §6.2); a `409` (`MergeShaMismatch`) means the head itself moved
+  `dirty` is a real conflict (`parked/merge_conflict` + alert); `behind`
+  means the base moved, so an update-branch is due and the *updated* head
+  must re-earn green (`merging -> awaiting_ci`, SPEC §6.2); and anything
+  else (`clean`/`blocked`/`unstable`/unknown) is a *permanent* block —
+  squash merges disabled, an org ruleset — which parks as `merge_blocked`
+  with an alert rather than ping-ponging `merging -> awaiting_ci ->
+  merging` forever on an unchanging head; a `409` (`MergeShaMismatch`) means the head itself moved
   since the last read — same destination, no update-branch needed (the
   next `awaiting_ci` pass reads the fresh head on its own). `mergeable is
   None` (GitHub still computing it) is a pure no-op: stay `merging`, next
@@ -309,7 +312,21 @@ async def _advance_oracle_gated_merging(
         if pr.mergeable_state == "dirty":
             await _park(session, run, project, ParkedReason.MERGE_CONFLICT, alerts=alerts)
             return
-        # behind/blocked/other: the base moved — update, then the updated
+        if pr.mergeable_state != "behind":
+            # A 405 that is neither a conflict (`dirty`) nor a moved base
+            # (`behind`) is permanent from Werft's side: squash merges are
+            # disabled on the repo, or an org ruleset requires something the
+            # doctrine-#1 protection PUT cannot satisfy. Reading it as "the
+            # base moved" livelocks — update-branch leaves the head sha
+            # unchanged, `advance_awaiting_ci` reads the same green oracle
+            # and CASes straight back to `merging`, and each re-entry resets
+            # the `ci_timeout` epoch, so not even the timeout backstop can
+            # break the cycle. Park with an operator signal instead, the
+            # same binary outcome `_advance_bootstrap_merging`'s own 405
+            # guard takes.
+            await _park(session, run, project, ParkedReason.MERGE_BLOCKED, alerts=alerts)
+            return
+        # behind: the genuine base-moved path — update, then the updated
         # head must re-earn green (SPEC §6.2).
         try:
             await ops.update_branch(run.pr_number, pr.head_sha)

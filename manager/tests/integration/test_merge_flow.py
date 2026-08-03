@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import select, text
 
 from werft.db.models import BacklogItem, Project, Run, RunEvent
@@ -280,6 +281,9 @@ async def test_oracle_gated_405_dirty_parks_merge_conflict_and_alerts(db_session
 
 
 async def test_oracle_gated_405_behind_updates_branch_then_reenters_awaiting_ci(db_session) -> None:
+    """`behind` is the one genuinely transient 405: the base moved, so an
+    update-branch is due and the *updated* head must re-earn green (SPEC
+    §6.2). This is the only non-`dirty` 405 that may re-enter `awaiting_ci`."""
     project = await seed_project(db_session, lifecycle="oracle_gated")
     item = await seed_backlog_item(db_session, project, 1)
     run = await seed_run(db_session, project, item, pr_number=101)
@@ -298,18 +302,28 @@ async def test_oracle_gated_405_behind_updates_branch_then_reenters_awaiting_ci(
     assert alerts.run_parked_calls == []
 
 
-async def test_oracle_gated_405_blocked_state_also_updates_branch_and_reenters_awaiting_ci(
-    db_session,
+@pytest.mark.parametrize("mergeable_state", ["clean", "blocked", "unstable", "unknown"])
+async def test_oracle_gated_405_that_is_not_dirty_or_behind_parks_merge_blocked(
+    db_session, mergeable_state
 ) -> None:
-    """`mergeable_state` can legitimately be anything other than `dirty` on
-    a 405 (behind/blocked/unstable/unknown) — decision 6 treats all of them
-    the same way: only `dirty` is a real conflict."""
+    """A 405 whose `mergeable_state` is neither `dirty` (a real conflict)
+    nor `behind` (the base moved) is *permanent* from Werft's side: squash
+    merges are disabled on the repo, or an org ruleset requires something
+    the doctrine-#1 protection PUT cannot satisfy. Treating it as "the base
+    moved" — update-branch, `merging -> awaiting_ci` — livelocks: the head
+    sha never changes, so `advance_awaiting_ci` reads the same green oracle
+    and CASes straight back to `merging`, forever. Nothing parks, nothing
+    alerts, no retry budget is consumed, and each re-entry resets the
+    `ci_timeout` epoch, so even the timeout backstop can never fire.
+
+    Park with the operator signal instead — the same binary outcome the
+    sibling bootstrap 405 guard already takes."""
     project = await seed_project(db_session, lifecycle="oracle_gated")
     item = await seed_backlog_item(db_session, project, 1)
     run = await seed_run(db_session, project, item, pr_number=101)
     ops = FakeRepoOps(
-        prs=[make_pr(101, head_sha="bbb222", mergeable=True, mergeable_state="blocked")],
-        squash_merge_error=MergeBlocked(405, "not mergeable"),
+        prs=[make_pr(101, head_sha="bbb222", mergeable=True, mergeable_state=mergeable_state)],
+        squash_merge_error=MergeBlocked(405, "Squash merges are not allowed on this repository"),
     )
     alerts = SpyAlertSink()
 
@@ -317,8 +331,10 @@ async def test_oracle_gated_405_blocked_state_also_updates_branch_and_reenters_a
     await db_session.commit()
 
     updated = await fresh_run(db_session, run.id)
-    assert updated.status == "awaiting_ci"
-    assert ops.update_branch_calls == [(101, "bbb222")]
+    assert updated.status == "parked"
+    assert updated.parked_reason == "merge_blocked"
+    assert alerts.run_parked_calls == [(project.slug, run.id, "merge_blocked")]
+    assert ops.update_branch_calls == []  # never the ping-pong update
 
 
 async def test_oracle_gated_409_reenters_awaiting_ci_without_park_or_update_branch(
