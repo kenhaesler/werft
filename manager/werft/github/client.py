@@ -27,7 +27,7 @@ _API_VERSION = "2022-11-28"
 
 #: `GitHubUnavailable.status` for a transport-level failure (connect/timeout)
 #: that never produced an HTTP response to read a real status code from.
-TRANSPORT_ERROR_STATUS = 0
+_TRANSPORT_ERROR_STATUS = 0
 
 #: Etag store key: the request path plus its params, order-independent.
 _EtagKey = tuple[str, tuple[tuple[str, Any], ...]]
@@ -172,7 +172,7 @@ class GitHubClient:
                 method, f"{self._api_url}{path}", json=json, params=params, headers=headers
             )
         except httpx.HTTPError as exc:
-            raise GitHubUnavailable(TRANSPORT_ERROR_STATUS, str(exc)) from exc
+            raise GitHubUnavailable(_TRANSPORT_ERROR_STATUS, str(exc)) from exc
 
         if response.status_code in expect:
             return response
