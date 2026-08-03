@@ -16,7 +16,9 @@ from sqlalchemy import text
 
 from werft.contracts.result import ResultStatus
 from werft.db.models import BacklogItem, Project, Run, RunAttempt
+from werft.db.transitions import transition_run
 from werft.domain.attempts import AttemptOutcome
+from werft.domain.runs import RunStatus
 from werft.github.ops import PullRequest
 from werft.orchestrator.finalize import advance_failed, finalize_attempt, open_pr_and_wait
 from werft.providers.base import Classification
@@ -269,6 +271,79 @@ async def test_success_pushed_bootstrap_advances_to_awaiting_review_and_alerts_r
     ]
 
 
+# -- finalize_attempt: success without push ----------------------------------
+
+
+async def test_success_without_push_records_agent_failure_outcome_and_requeues_with_backoff(
+    db_session,
+) -> None:
+    """An agent that exits 0 but pushes nothing never reaches an oracle —
+    doctrine #1's `outcome=NULL` ("pending oracle") encoding only makes sense
+    for a run with a PR actually in flight for CI/review to judge. Leaving
+    `outcome` NULL here would write a lying ledger row: a run that will
+    never reach an oracle, forever encoded as "waiting on one". This must be
+    recharacterized as a concrete `agent_failure` outcome and ride the same
+    requeue/park ladder as any other genuine failure."""
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_running_run(db_session, project, item, attempt_count=0, max_attempts=3)
+    attempt = await seed_open_attempt(db_session, run)
+    alerts = SpyAlertSink()
+    quota = SpyQuota()
+
+    await finalize_attempt(
+        db_session,
+        FakeRepoOps(),
+        run,
+        project,
+        classification=success_classification(),  # outcome=None, status=SUCCESS
+        pushed=False,
+        quota=quota,
+        alerts=alerts,
+    )
+
+    updated_attempt = await fresh_attempt(db_session, attempt.id)
+    assert updated_attempt.outcome == "agent_failure"  # not NULL: no lying "pending oracle" row
+    assert updated_attempt.ended_at is not None
+
+    updated = await fresh_run(db_session, run.id)
+    assert updated.status == "queued"  # budget left: requeues like any other genuine failure
+    assert updated.attempt_count == 1
+    assert updated.error_message == "success without push"
+    assert alerts.run_parked_calls == []
+    assert len(quota.calls) == 1
+
+
+async def test_success_without_push_at_attempt_budget_parks_with_agent_failure_outcome(
+    db_session,
+) -> None:
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_running_run(db_session, project, item, attempt_count=2, max_attempts=3)
+    attempt = await seed_open_attempt(db_session, run)
+    alerts = SpyAlertSink()
+
+    await finalize_attempt(
+        db_session,
+        FakeRepoOps(),
+        run,
+        project,
+        classification=success_classification(),
+        pushed=False,
+        quota=SpyQuota(),
+        alerts=alerts,
+    )
+
+    updated_attempt = await fresh_attempt(db_session, attempt.id)
+    assert updated_attempt.outcome == "agent_failure"
+
+    updated = await fresh_run(db_session, run.id)
+    assert updated.status == "parked"
+    assert updated.attempt_count == 3
+    assert updated.parked_reason == "agent_failure"
+    assert alerts.run_parked_calls == [(project.slug, run.id, "agent_failure")]
+
+
 # -- open_pr_and_wait: crash-window re-drive ---------------------------------
 
 
@@ -316,6 +391,69 @@ async def test_open_pr_and_wait_redriven_after_a_simulated_crash_advances_exactl
     assert updated.version == stale_view.version + 1  # advanced exactly once, not twice
 
 
+# -- finalize_attempt: running -> canceled race ------------------------------
+
+
+async def test_finalize_attempt_loses_cas_to_an_out_of_band_cancel_and_returns_cleanly(
+    db_session,
+) -> None:
+    """`running -> canceled` is itself a legal, routine edge (an operator can
+    cancel a run while its container is still finishing) — it is not the
+    only-genuinely-impossible case `finalize_attempt`'s `running -> failed`
+    CAS loss must raise for. This seeds a running run with one open attempt,
+    captures a stale view of the run's version, then transitions the *real*
+    row to `canceled` out from under it (as a concurrent operator-cancel
+    would) before calling `finalize_attempt` with the stale view. The
+    `running -> failed` CAS must lose (stale version), but the attempt row
+    is already closed and quota already released earlier in the same call —
+    `finalize_attempt` must return cleanly, not raise and unwind that
+    release, leaking the just-freed quota back out as unreserved headroom.
+    """
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_running_run(db_session, project, item, attempt_count=0, max_attempts=3)
+    attempt = await seed_open_attempt(db_session, run)
+    # captured before the out-of-band transition below, same technique as
+    # the open_pr_and_wait redrive test: a bare SimpleNamespace never
+    # session-tracked, so it can't be silently synchronized to the new
+    # version the way the identity-mapped `run` object would be.
+    stale_view = SimpleNamespace(id=run.id, version=run.version)
+
+    canceled = await transition_run(
+        db_session, run_id=run.id, expected_version=run.version, new_status=RunStatus.CANCELED
+    )
+    assert canceled  # sanity: running -> canceled really is a legal edge
+    await db_session.commit()
+
+    classification = Classification(
+        outcome=AttemptOutcome.AGENT_FAILURE, status=ResultStatus.FAILURE, detail="agent crashed"
+    )
+    quota = SpyQuota()
+    alerts = SpyAlertSink()
+
+    await finalize_attempt(
+        db_session,
+        FakeRepoOps(),
+        stale_view,
+        project,
+        classification=classification,
+        pushed=False,
+        quota=quota,
+        alerts=alerts,
+    )  # must not raise
+
+    updated = await fresh_run(db_session, run.id)
+    assert updated.status == "canceled"  # the race's outcome stands, untouched
+
+    updated_attempt = await fresh_attempt(db_session, attempt.id)
+    assert updated_attempt.ended_at is not None  # attempt row still closed
+    assert updated_attempt.outcome == "agent_failure"
+
+    assert len(quota.calls) == 1  # quota still released despite the lost CAS
+    assert alerts.run_parked_calls == []
+    assert alerts.auth_failure_calls == []
+
+
 # -- advance_failed / finalize_attempt: quota_exhausted ----------------------
 
 
@@ -325,7 +463,7 @@ async def test_quota_exhausted_moves_to_blocked_quota_with_provider_reported_wak
     project = await seed_project(db_session)
     item = await seed_backlog_item(db_session, project, 1)
     run = await seed_running_run(db_session, project, item, attempt_count=1, max_attempts=3)
-    await seed_open_attempt(db_session, run)
+    attempt = await seed_open_attempt(db_session, run)
     exhausted_until = datetime(2026, 8, 3, 20, 0, 0, tzinfo=UTC)
     classification = Classification(
         outcome=AttemptOutcome.QUOTA_EXHAUSTED,
@@ -352,6 +490,9 @@ async def test_quota_exhausted_moves_to_blocked_quota_with_provider_reported_wak
     assert updated.next_attempt_at == exhausted_until
     assert updated.attempt_count == 1  # unchanged: budget-exempt outcome
     assert len(quota.calls) == 1
+
+    updated_attempt = await fresh_attempt(db_session, attempt.id)
+    assert updated_attempt.outcome == "quota_exhausted"  # brief-mandated retry-ledger outcome
 
 
 async def test_quota_exhausted_without_reported_until_falls_back_to_now_plus_15_minutes(
@@ -392,7 +533,7 @@ async def test_agent_failure_with_budget_left_requeues_with_exponential_backoff(
     project = await seed_project(db_session)
     item = await seed_backlog_item(db_session, project, 1)
     run = await seed_running_run(db_session, project, item, attempt_count=0, max_attempts=3)
-    await seed_open_attempt(db_session, run)
+    attempt = await seed_open_attempt(db_session, run)
     classification = Classification(
         outcome=AttemptOutcome.AGENT_FAILURE, status=ResultStatus.FAILURE, detail="agent crashed"
     )
@@ -418,6 +559,9 @@ async def test_agent_failure_with_budget_left_requeues_with_exponential_backoff(
     assert before + timedelta(seconds=55) < updated.next_attempt_at < before + timedelta(seconds=65)
     assert alerts.run_parked_calls == []  # budget left: never parks, never alerts
 
+    updated_attempt = await fresh_attempt(db_session, attempt.id)
+    assert updated_attempt.outcome == "agent_failure"  # brief-mandated retry-ledger outcome
+
 
 async def test_advance_failed_called_directly_moves_an_infra_failure_to_queued_with_backoff(
     db_session,
@@ -439,7 +583,13 @@ async def test_advance_failed_called_directly_moves_an_infra_failure_to_queued_w
         outcome=AttemptOutcome.INFRA_FAILURE, status=ResultStatus.FAILURE, detail="disk full"
     )
 
-    await advance_failed(db_session, failed_run, classification=classification, quota=SpyQuota())
+    await advance_failed(
+        db_session,
+        failed_run,
+        outcome=classification.outcome,
+        exhausted_until=classification.exhausted_until,
+        quota=SpyQuota(),
+    )
 
     updated = await fresh_run(db_session, run.id)
     assert updated.status == "queued"

@@ -20,12 +20,23 @@ incidental:
   moves it on from there. Both CAS calls run inside the same
   session/transaction the caller commits — no partially-advanced state is
   ever visible past a commit.
+- **`running -> canceled` races `running -> failed` (`finalize_attempt`)**:
+  `running -> canceled` is a legal, routine edge (SPEC §3.2: any
+  non-terminal status can cancel) — an operator can cancel a run while its
+  container is still finishing. When that race loses the `running ->
+  failed` CAS, the attempt row is already closed and quota already released
+  (both run unconditionally, above the branch); finalizing must return
+  cleanly rather than raise, or the caller's transaction unwinds *both* of
+  those and leaks the just-released quota back out as headroom nobody
+  reserved. Only a version mismatch where the run is still (impossibly)
+  `running` is a genuine bug worth raising for.
 
 `finalize_attempt` also calls `quota.release` in that same transaction,
 *before* branching on success/failure: releasing an attempt's reserved
 quota is a property of the attempt being over, not of how it ended.
 """
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 from uuid import UUID
@@ -90,10 +101,15 @@ async def finalize_attempt(
     """Close out `run`'s open attempt row and move it off `running`.
 
     Fills `outcome`/`ended_at`/`duration_seconds` on the latest open
-    `run_attempts` row. On `SUCCESS`, `outcome` stays `None` — doctrine #1:
-    only an executed check (the oracle) decides whether work is good, so a
-    clean-exit attempt with nothing yet observed is not a verdict yet; a
-    later CI-watch task fills `ci_green`/`ci_red` once the oracle reports.
+    `run_attempts` row. On a *pushed* `SUCCESS`, `outcome` stays `None` —
+    doctrine #1: only an executed check (the oracle) decides whether work is
+    good, so a clean-exit attempt with a PR in flight is not a verdict yet; a
+    later CI-watch task fills `ci_green`/`ci_red` once the oracle reports. A
+    `SUCCESS` that pushed nothing never reaches an oracle at all — doctrine
+    #1's NULL encoding does not apply, so it is recharacterized as a concrete
+    `agent_failure` outcome (detail `"success without push"`) before this
+    function does anything else, and rides the same ladder as any other
+    genuine failure.
 
     `quota.release` runs in this same transaction, before the branch below:
     releasing reserved quota is a property of the attempt ending, not of how
@@ -106,7 +122,24 @@ async def finalize_attempt(
     post-`advance_failed` row rather than being threaded through it, so
     `advance_failed` itself stays alert-free (SPEC layering: it needs no
     `AlertSink` to do its job).
+
+    A lost `running -> failed` CAS is not always a bug: `running ->
+    canceled` is itself a legal edge, so an operator cancel racing this
+    finalize is routine, not exceptional. On CAS loss this re-reads the run;
+    if it has left `running` (canceled or otherwise already advanced by
+    another caller), the attempt row is already closed and quota already
+    released above, so this returns cleanly instead of raising and unwinding
+    that release. A still-`running` row with a mismatched version is the
+    only case worth raising for.
     """
+    pushed_success = classification.status == ResultStatus.SUCCESS and pushed
+    if classification.status == ResultStatus.SUCCESS and not pushed:
+        classification = replace(
+            classification,
+            outcome=AttemptOutcome.AGENT_FAILURE,
+            detail="success without push",
+        )
+
     attempt = await _current_attempt(session, run.id)
     ended_at = datetime.now(UTC)
     duration = max(0, int((ended_at - attempt.started_at).total_seconds()))
@@ -121,7 +154,7 @@ async def finalize_attempt(
     )
     await quota.release(session, run, duration)
 
-    if classification.status == ResultStatus.SUCCESS and pushed:
+    if pushed_success:
         await open_pr_and_wait(session, ops, run, project, alerts=alerts)
         return
 
@@ -133,10 +166,19 @@ async def finalize_attempt(
         extra={"error_message": classification.detail},
     )
     if not ok:
+        current = await session.get(Run, run.id, populate_existing=True)
+        if current.status != RunStatus.RUNNING.value:
+            return  # legitimate race (e.g. canceled) — nothing left to advance
         raise RuntimeError(f"finalize_attempt: lost CAS race on run {run.id} (running->failed)")
 
     failed_run = await session.get(Run, run.id, populate_existing=True)
-    await advance_failed(session, failed_run, classification=classification, quota=quota)
+    await advance_failed(
+        session,
+        failed_run,
+        outcome=classification.outcome,
+        exhausted_until=classification.exhausted_until,
+        quota=quota,
+    )
 
     if classification.outcome == AttemptOutcome.AUTH_FAILURE:
         await alerts.auth_failure(failed_run.provider or "unknown")
@@ -196,7 +238,8 @@ async def advance_failed(
     session: AsyncSession,
     run: Run,
     *,
-    classification: Classification,
+    outcome: AttemptOutcome | None,
+    exhausted_until: datetime | None,
     quota: QuotaPort,
 ) -> None:
     """Behavioral decision 8, verbatim (thin plan): route a `failed` run on.
@@ -205,12 +248,18 @@ async def advance_failed(
     T7's window-headroom refinement of the `blocked_quota` wake time can
     extend this function without changing its signature or its callers.
 
-    `classification` is threaded through from `finalize_attempt` rather than
-    re-read from `run_attempts`: the outcome this ladder branches on is
-    already on the row `finalize_attempt` just wrote, but `exhausted_until`
-    (the provider's own reported reset time) has no durable column to
-    survive in — it only ever exists on the `Classification` the caller
-    already holds.
+    Takes `outcome` and `exhausted_until` directly rather than the whole
+    `Classification` `finalize_attempt` holds: those are the two values this
+    ladder actually branches on, and `failed` is reachable from more callers
+    than just `finalize_attempt`'s `running -> failed` — SPEC §3.2 also gives
+    `claimed`, `awaiting_ci`, `awaiting_review`, and `merging` a `-> failed`
+    edge, none of which have any provider `Classification` to hand this
+    function at all. `exhausted_until` is *this attempt's* provider-reported
+    reset time carried on `Classification`; it is not the same thing as
+    `provider_accounts.exhausted_until` (that column is the account-level
+    durable record T7's quota ledger owns) — it has no durable column of its
+    own to be re-read from, so it must be threaded through by whichever
+    caller already holds it.
 
     Every non-exempt outcome — `agent_failure`, `infra_failure`,
     `auth_failure`, `policy_block`, `timeout`, `canceled` — shares the same
@@ -219,10 +268,8 @@ async def advance_failed(
     `parked_reason` CHECK constraint has no dedicated slot for the others
     yet).
     """
-    if classification.outcome in BUDGET_EXEMPT_OUTCOMES:
-        next_attempt_at = classification.exhausted_until or (
-            datetime.now(UTC) + timedelta(minutes=15)
-        )
+    if outcome in BUDGET_EXEMPT_OUTCOMES:
+        next_attempt_at = exhausted_until or (datetime.now(UTC) + timedelta(minutes=15))
         ok = await transition_run(
             session,
             run_id=run.id,
