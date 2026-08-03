@@ -59,9 +59,11 @@ best-effort `remove_label` — without it, every merged milestone re-queues
 itself on the next 60 s intake, since a run PR merges into `unattended`
 rather than the default branch and GitHub therefore closes nothing), and
 the run branch's delete. Neither may unwind the merge: a failing GitHub
-call there is caught, logged, and left to converge (`sync_backlog`'s
-absent-from-ready-set sweep for the label, `cleanup_terminal`'s sweep for
-the branch). See `_land_merged`'s docstring for which error classes each
+call there is caught, logged, and self-heals via `cleanup_terminal`'s
+branch sweep, or (on label-removal failure) `sync_backlog` re-marking the
+still-labeled item eligible, costing one duplicate run before
+`ux_runs_one_active_per_item` blocks further intake and the label
+self-heals. See `_land_merged`'s docstring for which error classes each
 catch covers and why.
 
 `cleanup_terminal` is decision 1, verbatim: on a `canceled` run *with* a
@@ -190,9 +192,11 @@ async def _land_merged(
     loses `merge_commit_sha`, and re-enters this function via the
     merged-out-of-band short circuit on every subsequent pass, forever. A
     permissions/ruleset 403 (no `retry-after`, no zeroed rate-limit header,
-    so a plain `GitHubApiError`) is exactly that shape. Convergence lives
-    elsewhere instead: `sync_backlog`'s absent-from-ready-set sweep for the
-    label, `cleanup_terminal`'s sweep for the branch.
+    so a plain `GitHubApiError`) is exactly that shape. Self-healing happens
+    instead: `cleanup_terminal`'s branch sweep, or (on label-removal failure)
+    `sync_backlog` re-marks the still-labeled item eligible, costing one
+    duplicate run before `ux_runs_one_active_per_item` blocks further intake
+    and the label self-heals.
 
     (`cleanup_terminal` deliberately keeps the narrow `GitHubUnavailable`
     catch: nothing is won before its GitHub calls, so an escaping error

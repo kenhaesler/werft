@@ -606,8 +606,9 @@ async def test_a_failing_remove_label_never_unwinds_the_landed_merge(db_session)
     200. A permission/ruleset 403 on the label removal — a plain
     `GitHubApiError`, not the transient family — must not propagate into
     `_run_unit` and roll the merge CAS back: the `is_eligible=False` flag is
-    the DB-side guarantee, and `sync_backlog`'s absent-from-ready-set sweep
-    converges the label state on its own."""
+    the DB-side guarantee. A failed removal triggers one duplicate run when
+    `sync_backlog` re-marks the item eligible—then blocked per-item—before
+    the label self-heals at that merge."""
     project = await seed_project(db_session, lifecycle="oracle_gated")
     item = await seed_backlog_item(db_session, project, 42)
     run = await seed_run(db_session, project, item, pr_number=101)
