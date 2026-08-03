@@ -19,8 +19,9 @@ from sqlalchemy import select, text
 from werft.db.models import BacklogItem, Project, Run, RunEvent
 from werft.db.transitions import transition_run
 from werft.domain.runs import RunStatus
-from werft.github.client import GitHubUnavailable
-from werft.github.ops import MergeBlocked, MergeShaMismatch, PullRequest
+from werft.github.client import GitHubApiError, GitHubUnavailable
+from werft.github.ops import READY_LABEL, MergeBlocked, MergeShaMismatch, PullRequest
+from werft.orchestrator.backlog import intake
 from werft.orchestrator.merge_flow import advance_merging, cleanup_terminal
 
 # -- fakes / spies ------------------------------------------------------------
@@ -52,6 +53,7 @@ class FakeRepoOps:
         squash_merge_error: Exception | None = None,
         close_pr_error: Exception | None = None,
         delete_ref_error: Exception | None = None,
+        remove_label_error: Exception | None = None,
     ) -> None:
         self._prs = list(prs or [])
         self._update_branch_error = update_branch_error
@@ -59,11 +61,13 @@ class FakeRepoOps:
         self._squash_merge_error = squash_merge_error
         self._close_pr_error = close_pr_error
         self._delete_ref_error = delete_ref_error
+        self._remove_label_error = remove_label_error
         self.get_pr_calls: list[int] = []
         self.update_branch_calls: list[tuple[int, str]] = []
         self.squash_merge_calls: list[tuple[int, str, str]] = []
         self.close_pr_calls: list[int] = []
         self.delete_ref_calls: list[str] = []
+        self.remove_label_calls: list[tuple[int, str]] = []
         self.oracle_check_calls: list[str] = []
 
     async def get_pr(self, number: int) -> PullRequest | None:
@@ -94,6 +98,11 @@ class FakeRepoOps:
         self.delete_ref_calls.append(branch)
         if self._delete_ref_error is not None:
             raise self._delete_ref_error
+
+    async def remove_label(self, issue_number: int, name: str) -> None:
+        self.remove_label_calls.append((issue_number, name))
+        if self._remove_label_error is not None:
+            raise self._remove_label_error
 
     async def oracle_check(self, ref: str):
         self.oracle_check_calls.append(ref)
@@ -525,6 +534,115 @@ async def test_pr_merged_out_of_band_lands_merged_with_null_sha(db_session) -> N
     assert updated.status == "merged"
     assert updated.merge_commit_sha is None  # unknown; never guessed
     assert ops.delete_ref_calls == [f"werft/run-{run.id}"]
+
+
+# -- _land_merged: closing the merged-run re-intake loop -------------------------
+
+
+async def test_merged_run_marks_its_backlog_item_ineligible_and_drops_the_ready_label(
+    db_session,
+) -> None:
+    """A run PR merges into `unattended`, never the repository's *default*
+    branch, so GitHub's own "closes #N" linkage can never fire — the issue
+    stays open and labeled. Nothing else in the system ever makes the item
+    ineligible (`sync_backlog` only drops items that leave the ready set),
+    and a `merged` run sits outside `ux_runs_one_active_per_item`'s
+    predicate, so within 60 s `intake` would queue a *second* run for work
+    that is already merged. The `is_eligible=False` write, in the same
+    transaction as the won merge CAS, is the guarantee; the label removal is
+    the operator-visible echo of it."""
+    project = await seed_project(db_session, lifecycle="oracle_gated")
+    item = await seed_backlog_item(db_session, project, 42)
+    run = await seed_run(db_session, project, item, pr_number=101)
+    ops = FakeRepoOps(
+        prs=[make_pr(101, mergeable=True, mergeable_state="clean")],
+        squash_merge_result="feedbeef",
+    )
+
+    await advance_merging(db_session, ops, run, project, alerts=SpyAlertSink())
+    await db_session.commit()
+
+    assert (await fresh_run(db_session, run.id)).status == "merged"
+    refreshed_item = await db_session.get(BacklogItem, item.id, populate_existing=True)
+    assert refreshed_item.is_eligible is False
+    assert ops.remove_label_calls == [(42, READY_LABEL)]
+
+
+async def test_merged_out_of_band_run_also_marks_its_item_ineligible(db_session) -> None:
+    """The merged-out-of-band short circuit lands the same `merged` status
+    through the same `_land_merged` — so it must close the same re-intake
+    loop, not just the process-driven merge."""
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 7)
+    run = await seed_run(db_session, project, item, pr_number=101)
+    ops = FakeRepoOps(prs=[make_pr(101, state="closed", merged=True)])
+
+    await advance_merging(db_session, ops, run, project, alerts=SpyAlertSink())
+    await db_session.commit()
+
+    refreshed_item = await db_session.get(BacklogItem, item.id, populate_existing=True)
+    assert refreshed_item.is_eligible is False
+    assert ops.remove_label_calls == [(7, READY_LABEL)]
+
+
+async def test_a_failing_remove_label_never_unwinds_the_landed_merge(db_session) -> None:
+    """The merge already landed on GitHub the moment `squash_merge` returned
+    200. A permission/ruleset 403 on the label removal — a plain
+    `GitHubApiError`, not the transient family — must not propagate into
+    `_run_unit` and roll the merge CAS back: the `is_eligible=False` flag is
+    the DB-side guarantee, and `sync_backlog`'s absent-from-ready-set sweep
+    converges the label state on its own."""
+    project = await seed_project(db_session, lifecycle="oracle_gated")
+    item = await seed_backlog_item(db_session, project, 42)
+    run = await seed_run(db_session, project, item, pr_number=101)
+    ops = FakeRepoOps(
+        prs=[make_pr(101, mergeable=True, mergeable_state="clean")],
+        squash_merge_result="feedbeef",
+        remove_label_error=GitHubApiError(403, "Resource not accessible by integration"),
+    )
+
+    await advance_merging(db_session, ops, run, project, alerts=SpyAlertSink())  # must not raise
+    await db_session.commit()
+
+    updated = await fresh_run(db_session, run.id)
+    assert updated.status == "merged"
+    assert updated.merge_commit_sha == "feedbeef"
+    refreshed_item = await db_session.get(BacklogItem, item.id, populate_existing=True)
+    assert refreshed_item.is_eligible is False  # the DB-side guarantee still stands
+
+
+async def test_intake_after_a_merged_run_creates_no_second_run_for_the_same_issue(
+    db_session,
+) -> None:
+    """The whole point, end to end: the 60 s poll's `intake` right after a
+    merge must find nothing eligible. Before this fix it INSERTed a
+    duplicate `queued` run for the same backlog item on every poll, forever
+    — T7 would dispatch an agent against already-merged work, produce no
+    diff, and burn the retry ladder into a park, once per merged item."""
+    project = await seed_project(db_session, lifecycle="oracle_gated")
+    item = await seed_backlog_item(db_session, project, 42)
+    run = await seed_run(db_session, project, item, pr_number=101)
+    ops = FakeRepoOps(
+        prs=[make_pr(101, mergeable=True, mergeable_state="clean")],
+        squash_merge_result="feedbeef",
+    )
+
+    await advance_merging(db_session, ops, run, project, alerts=SpyAlertSink())
+    await db_session.commit()
+
+    assert await intake(db_session, project) == 0
+    runs = (
+        (
+            await db_session.execute(
+                select(Run)
+                .where(Run.project_id == project.id)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [r.id for r in runs] == [run.id]
 
 
 # -- advance_merging: GitHubUnavailable containment ----------------------------

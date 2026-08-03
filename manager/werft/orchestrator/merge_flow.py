@@ -49,13 +49,17 @@ guessed. A gone PR (404) or a `closed`-but-not-`merged` PR is the same
 infra edge `ci_watch.py` uses for `awaiting_ci` (SPEC §3.2): `merging ->
 failed`, out-of-band and never a park.
 
-Every winning CAS above is followed by *at most* one more GitHub call:
-`_land_merged`'s branch delete. It runs strictly after the `merging ->
-merged` CAS has already committed-in-transaction — a `GitHubUnavailable`
-there is caught, logged, and does not touch run state; the branch is
-already gone from Werft's perspective (deletion is idempotent — GitHub may
-have auto-deleted it on merge already) and `cleanup_terminal`'s sweep is
-the backstop that retries it.
+A won `merging -> merged` CAS is followed by `_land_merged`'s two pieces of
+after-the-fact housekeeping, both strictly *after* the CAS: retiring the
+backlog item (`is_eligible=False` in the same transaction, plus a
+best-effort `remove_label` — without it, every merged milestone re-queues
+itself on the next 60 s intake, since a run PR merges into `unattended`
+rather than the default branch and GitHub therefore closes nothing), and
+the run branch's delete. Neither may unwind the merge: a failing GitHub
+call there is caught, logged, and left to converge (`sync_backlog`'s
+absent-from-ready-set sweep for the label, `cleanup_terminal`'s sweep for
+the branch). See `_land_merged`'s docstring for which error classes each
+catch covers and why.
 
 `cleanup_terminal` is decision 1, verbatim: on a `canceled` run *with* a
 PR, close it and delete `werft/run-<id>` (SPEC §6.1: ephemeral, deleted on
@@ -75,15 +79,15 @@ from typing import Any
 from uuid import UUID
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from werft.db.models import Project, Run, RunEvent
+from werft.db.models import BacklogItem, Project, Run, RunEvent
 from werft.db.transitions import transition_run
 from werft.domain.projects import ProjectLifecycle
 from werft.domain.runs import ParkedReason, RunStatus, run_branch_name
-from werft.github.client import GitHubUnavailable
-from werft.github.ops import MergeBlocked, MergeShaMismatch, PullRequest, RepoOps
+from werft.github.client import GitHubApiError, GitHubUnavailable
+from werft.github.ops import READY_LABEL, MergeBlocked, MergeShaMismatch, PullRequest, RepoOps
 from werft.observe.alerts import AlertSink
 
 logger = structlog.get_logger(__name__)
@@ -159,11 +163,30 @@ async def _park(
 async def _land_merged(
     session: AsyncSession, ops: RepoOps, run: Run, *, merge_commit_sha: str | None
 ) -> None:
-    """`merging -> merged`, then a best-effort branch delete strictly
-    *after* the CAS has won — a `GitHubUnavailable` on the delete must
-    never undo the merge transition (the merge already landed on GitHub;
-    only Werft's own bookkeeping of the branch is stale), so it is caught,
-    logged, and left for `cleanup_terminal`'s sweep to retry."""
+    """`merging -> merged`, then retire the backlog item and tear the branch
+    down — everything strictly *after* the CAS has won.
+
+    **Retiring the item is not optional bookkeeping.** A run PR merges into
+    `project.unattended_branch`, never the repository's *default* branch, so
+    GitHub's own issue auto-close never fires for it: the issue stays open
+    and still labeled. `sync_backlog` only ever marks an item ineligible by
+    finding it *absent* from the ready set, and a `merged` run sits outside
+    `ux_runs_one_active_per_item`'s `WHERE status NOT IN
+    ('merged','canceled')` predicate — so without the `is_eligible=False`
+    write below, the next 60 s `intake` INSERTs a *second* `queued` run for
+    work that is already merged, forever. That write shares this
+    transaction with the CAS, so it is exactly as durable as the merge
+    itself and is the actual guarantee.
+
+    The label removal is the operator-visible echo of that flag, and is
+    strictly best-effort: **every** `GitHubApiError` (the whole family, not
+    just the transient one) is caught, because nothing GitHub says about a
+    label may unwind a merge that has already landed. `sync_backlog`'s
+    absent-from-ready-set sweep converges the rest on its own. The branch
+    delete is best-effort for the same reason (the merge is real; only
+    Werft's bookkeeping of the branch is stale) — `cleanup_terminal`'s sweep
+    is its retry.
+    """
     ok = await transition_run(
         session,
         run_id=run.id,
@@ -174,6 +197,21 @@ async def _land_merged(
     if not ok:
         await _reject_lost_cas_unless_raced(session, run, "merging->merged")
         return
+
+    await session.execute(
+        update(BacklogItem).where(BacklogItem.id == run.backlog_item_id).values(is_eligible=False)
+    )
+    item = await session.get(BacklogItem, run.backlog_item_id)
+    if item is not None:
+        try:
+            await ops.remove_label(item.github_issue_number, READY_LABEL)
+        except GitHubApiError as exc:
+            logger.warning(
+                "merge_flow.remove_label_failed",
+                run_id=str(run.id),
+                issue=item.github_issue_number,
+                error=str(exc),
+            )
 
     branch = _branch_name(run)
     try:

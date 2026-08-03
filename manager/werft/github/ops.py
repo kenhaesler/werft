@@ -97,6 +97,13 @@ def _parse_pr(data: dict[str, Any]) -> PullRequest:
     )
 
 
+#: The operator-owned dispatch label (SPEC §6.3 onboarding, SPEC §6.2
+#: intake). Read here by `list_ready_issues`, written by onboarding's
+#: `ensure_label`, and removed by `merge_flow` once a run's work has landed
+#: — one definition, because all three have to name the same string.
+READY_LABEL = "werft:ready"
+
+
 def _error_message(response: httpx.Response) -> str:
     try:
         body = response.json()
@@ -326,7 +333,7 @@ class RepoOps:
         the tell) are filtered out of `data` before returning — belt-and-
         braces with A4's DB-level assertion of the same filter."""
         result = await self._client.get_conditional(
-            self._repo_path("/issues"), params={"labels": "werft:ready", "state": "open"}
+            self._repo_path("/issues"), params={"labels": READY_LABEL, "state": "open"}
         )
         if result.data is None:
             return result
@@ -343,6 +350,15 @@ class RepoOps:
             self._repo_path("/labels"),
             json={"name": name, "color": color},
             expect=(201, 422),
+        )
+
+    async def remove_label(self, issue_number: int, name: str) -> None:
+        """Drop label `name` from issue `issue_number`. A 404 (the issue
+        never carried it, or an operator already unlabeled it by hand) is
+        the desired end state, so it is a no-op rather than an error —
+        which also makes a re-driven caller after a crash safe."""
+        await self._client.request(
+            "DELETE", self._repo_path(f"/issues/{issue_number}/labels/{name}"), expect=(200, 404)
         )
 
     async def apply_partial_protection(self, branch: str) -> None:

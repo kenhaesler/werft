@@ -39,11 +39,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from werft.db.models import Project, ProjectEvent
 from werft.domain.errors import PermanentError
-from werft.github.ops import RepoOps
+from werft.github.ops import READY_LABEL, RepoOps
 
-#: `intake`'s eligibility (via `RepoOps.list_ready_issues`) reads this exact
-#: label/color off GitHub issues — SPEC §6.3's onboarding step, verbatim.
-_READY_LABEL_NAME = "werft:ready"
+#: The label's colour is onboarding's alone; the *name* is
+#: `werft.github.ops.READY_LABEL`, shared with the reader
+#: (`list_ready_issues`) and the remover (`merge_flow._land_merged`) — SPEC
+#: §6.3's onboarding step, verbatim.
 _READY_LABEL_COLOR = "0e8a16"
 
 
@@ -82,7 +83,7 @@ async def onboard_project(
 
     await ops.ensure_branch(unattended_branch, from_sha=main_sha)
     await admin_ops.apply_partial_protection(unattended_branch)
-    await ops.ensure_label(_READY_LABEL_NAME, _READY_LABEL_COLOR)
+    await ops.ensure_label(READY_LABEL, _READY_LABEL_COLOR)
 
     inserted = await session.execute(
         insert(Project)

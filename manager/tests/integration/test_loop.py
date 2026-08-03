@@ -90,6 +90,7 @@ class FakeRepoOps:
         self._close_pr_error = close_pr_error
         self._delete_ref_error = delete_ref_error
         self.list_ready_issues_calls = 0
+        self.remove_label_calls: list[tuple[int, str]] = []
         self.get_pr_calls: list[int] = []
         self.oracle_check_calls: list[str] = []
         self.squash_merge_calls: list[int] = []
@@ -102,6 +103,9 @@ class FakeRepoOps:
     async def list_ready_issues(self) -> ConditionalResult:
         self.list_ready_issues_calls += 1
         return self._ready_issues
+
+    async def remove_label(self, issue_number: int, name: str) -> None:
+        self.remove_label_calls.append((issue_number, name))
 
     async def get_pr(self, number: int) -> PullRequest | None:
         self.get_pr_calls.append(number)
@@ -155,6 +159,7 @@ class DelayedSquashMergeOps:
         self._release = release
         self.get_pr_calls: list[int] = []
         self.squash_merge_calls: list[int] = []
+        self.remove_label_calls: list[tuple[int, str]] = []
 
     async def get_pr(self, number: int) -> PullRequest | None:
         self.get_pr_calls.append(number)
@@ -164,6 +169,9 @@ class DelayedSquashMergeOps:
         self.squash_merge_calls.append(number)
         await self._release.wait()
         return "deadc0de"
+
+    async def remove_label(self, issue_number: int, name: str) -> None:
+        self.remove_label_calls.append((issue_number, name))
 
     async def delete_ref(self, branch: str) -> None:
         return None

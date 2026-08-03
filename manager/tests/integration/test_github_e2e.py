@@ -46,7 +46,7 @@ from werft.db.models import BacklogItem, Project, ProjectEvent, Run, RunEvent
 from werft.db.transitions import transition_run
 from werft.domain.runs import RunStatus
 from werft.github.client import ConditionalResult
-from werft.github.ops import CheckState, MergeBlocked, MergeShaMismatch, PullRequest
+from werft.github.ops import READY_LABEL, CheckState, MergeBlocked, MergeShaMismatch, PullRequest
 from werft.orchestrator.backlog import intake, sync_backlog
 from werft.orchestrator.ci_watch import advance_awaiting_ci, check_flip
 from werft.orchestrator.finalize import NullQuota, finalize_attempt
@@ -125,6 +125,7 @@ class FakeRepoOps:
         self.oracle_check_calls: list[str] = []
         self.list_ready_issues_calls: int = 0
         self.ensure_label_calls: list[tuple[str, str]] = []
+        self.remove_label_calls: list[tuple[int, str]] = []
         self.apply_partial_protection_calls: list[str] = []
         self.apply_strict_protection_calls: list[str] = []
 
@@ -210,6 +211,20 @@ class FakeRepoOps:
     # -- labels + protection --------------------------------------------------
     async def ensure_label(self, name: str, color: str) -> None:
         self.ensure_label_calls.append((name, color))
+
+    async def remove_label(self, issue_number: int, name: str) -> None:
+        """Mutates the shared state the way GitHub would: an issue that
+        loses `werft:ready` drops straight out of the ready set the next
+        `list_ready_issues` returns — which is what makes `sync_backlog`'s
+        absent-from-ready-set sweep the convergence backstop for a label
+        removal that failed."""
+        self.remove_label_calls.append((issue_number, name))
+        for issue in list(self.state.ready_issues):
+            if issue["number"] != issue_number:
+                continue
+            issue["labels"] = [label for label in issue.get("labels", []) if label["name"] != name]
+            if not any(label["name"] == READY_LABEL for label in issue["labels"]):
+                self.state.ready_issues.remove(issue)
 
     async def apply_partial_protection(self, branch: str) -> None:
         self.apply_partial_protection_calls.append(branch)
@@ -461,6 +476,16 @@ async def test_bootstrap_round_trip_onboard_through_merge_and_cleanup(db_session
     events = await run_events_of_type(db_session, run.id, "cleanup")
     assert len(events) == 1
     assert events[0].payload == {"deleted_branch": f"werft/run-{run.id}"}
+
+    # The merged item must retire, or the very next 60 s poll queues a
+    # second run for work that is already merged (the run PR merged into
+    # `unattended`, not the default branch, so GitHub closes nothing).
+    assert ops.remove_label_calls == [(42, READY_LABEL)]
+    await sync_backlog(db_session, ops, project)
+    assert await intake(db_session, project) == 0
+    await db_session.commit()
+    all_runs = (await db_session.execute(select(Run).where(Run.project_id == project.id))).all()
+    assert len(all_runs) == 1
 
 
 # -- scenario 2: oracle_gated green -------------------------------------------
@@ -732,7 +757,11 @@ async def test_idempotence_sweep_kill_minus_9_equivalence_at_each_github_stage(d
     assert accepted
     await db_session.commit()
     stale_merging = SimpleNamespace(
-        id=run.id, version=run.version, pr_number=run.pr_number, branch_name=None
+        id=run.id,
+        version=run.version,
+        pr_number=run.pr_number,
+        branch_name=None,
+        backlog_item_id=run.backlog_item_id,
     )
 
     await advance_merging(db_session, ops, stale_merging, project, alerts=alerts)

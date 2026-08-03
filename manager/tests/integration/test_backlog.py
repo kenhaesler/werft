@@ -282,6 +282,20 @@ async def test_intake_skips_paused_project(db_session) -> None:
 
 
 async def test_intake_creates_fresh_run_after_previous_reaches_merged(db_session) -> None:
+    """The partial index's own semantics, in isolation: a `merged` run sits
+    outside `ux_runs_one_active_per_item`'s predicate, so it is not a
+    conflict and an item that is *still eligible* gets a fresh run.
+
+    This drives the run to `merged` with raw SQL precisely to bypass
+    `merge_flow._land_merged`, which in production retires the item
+    (`is_eligible=False` + `remove_label`) in the same transaction as the
+    merge CAS — that retirement, not this index, is what stops a merged
+    milestone re-queuing itself every 60 s (see
+    `test_merge_flow.py::test_intake_after_a_merged_run_creates_no_second_run_for_the_same_issue`).
+    What this test pins is the requeue path that remains legitimate: an
+    operator re-labels a merged item, `sync_backlog` marks it eligible
+    again, and intake must then be free to queue follow-up work.
+    """
     project = await seed_project(db_session)
     item = await seed_backlog_item(db_session, project, 1)
 

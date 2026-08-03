@@ -14,7 +14,7 @@ import pytest
 
 from werft.domain.errors import PermanentError
 from werft.github.client import ConditionalResult, GitHubClient
-from werft.github.ops import CheckState, MergeBlocked, MergeShaMismatch, RepoOps
+from werft.github.ops import READY_LABEL, CheckState, MergeBlocked, MergeShaMismatch, RepoOps
 
 API_URL = "https://api.github.test"
 OWNER = "ken"
@@ -309,6 +309,22 @@ async def test_ensure_label_creates_when_absent(ops, transport):
 async def test_ensure_label_is_a_no_op_when_it_already_exists(ops, transport):
     transport.enqueue(422, {"message": "Validation Failed", "errors": [{"code": "already_exists"}]})
     await ops.ensure_label("werft:ready", "0e8a16")  # must not raise
+
+
+async def test_remove_label_deletes_that_one_label_from_the_issue(ops, transport):
+    transport.enqueue(200, [])
+    await ops.remove_label(42, READY_LABEL)
+    request = transport.requests[0]
+    assert request.method == "DELETE"
+    assert request.url.path == f"/repos/{OWNER}/{REPO}/issues/42/labels/werft:ready"
+
+
+async def test_remove_label_tolerates_404_already_gone(ops, transport):
+    """A 404 means the label (or the issue's association with it) is already
+    gone — an operator unlabeled it by hand, or a prior, crashed call already
+    landed. That is the desired end state, so it is a no-op, not an error."""
+    transport.enqueue(404, {"message": "Label does not exist"})
+    await ops.remove_label(42, READY_LABEL)  # must not raise
 
 
 # -- branch protection ---------------------------------------------------

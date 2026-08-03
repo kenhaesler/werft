@@ -210,7 +210,15 @@ async def open_pr_and_wait(
     item = await session.get(BacklogItem, run.backlog_item_id)
     head = run_branch_name(run.id)
     title = f"werft: {item.title} (#{item.github_issue_number})"
-    body = f"Closes #{item.github_issue_number}\n\nWerft run: {run.id}"
+    # A plain reference, deliberately *not* a `Closes #N` keyword: GitHub
+    # auto-closes a linked issue only when the PR merges into the
+    # repository's **default** branch, and every run PR targets
+    # `project.unattended_branch` instead (SPEC §6.1). The keyword would
+    # therefore be inert here — a promise the topology cannot keep, which
+    # reads to an operator as "Werft closes my issues" while it silently
+    # never does. Retiring the backlog item is `merge_flow._land_merged`'s
+    # job (`is_eligible=False` + `remove_label`), not GitHub's.
+    body = f"Issue: #{item.github_issue_number}\n\nWerft run: {run.id}"
     pr = await ops.open_pr(head, project.unattended_branch, title, body)
 
     is_bootstrap = project.lifecycle == ProjectLifecycle.BOOTSTRAP
