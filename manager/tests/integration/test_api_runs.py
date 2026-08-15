@@ -18,6 +18,7 @@ prescribes ("use httpx.AsyncClient... with dependency_overrides injecting
 the test session").
 """
 
+import json
 import uuid
 from collections.abc import AsyncIterator
 
@@ -29,7 +30,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from werft.api.routes import get_session
 from werft.app import create_app
 from werft.config.settings import Settings
-from werft.db.models import BacklogItem, Project, Run
+from werft.db.models import Artifact, BacklogItem, Project, ProviderAccount, Run
+from werft.db.transitions import transition_run
+from werft.domain.runs import RunStatus
 
 # -- seeding ------------------------------------------------------------
 
@@ -109,13 +112,149 @@ async def seed_attempt(
     attempt_no: int = 1,
     outcome: str | None = None,
     provider: str = "claude",
+    duration_seconds: int | None = None,
+    ended: bool = False,
 ) -> None:
     await session.execute(
         text(
-            "INSERT INTO run_attempts (run_id, attempt_no, provider, outcome, started_at) "
-            "VALUES (:r, :n, :prov, :o, now())"
+            "INSERT INTO run_attempts "
+            "(run_id, attempt_no, provider, outcome, duration_seconds, started_at, ended_at) "
+            "VALUES (:r, :n, :prov, :o, :dur, now(), CASE WHEN :ended THEN now() ELSE NULL END)"
         ),
-        {"r": run.id, "n": attempt_no, "prov": provider, "o": outcome},
+        {
+            "r": run.id,
+            "n": attempt_no,
+            "prov": provider,
+            "o": outcome,
+            "dur": duration_seconds,
+            "ended": ended,
+        },
+    )
+    await session.commit()
+
+
+async def update_run_detail_fields(
+    session,
+    run: Run,
+    *,
+    branch_name: str | None = None,
+    base_sha: str | None = None,
+    merge_commit_sha: str | None = None,
+    error_message: str | None = None,
+    result: dict | None = None,
+) -> None:
+    """Sets the detail-only columns `RunDetail` surfaces beyond `RunSummary`.
+    A plain `UPDATE` — the transition trigger only enforces legality and
+    writes a `run_events` row when `status` itself changes (`runs.py`'s
+    `runs_enforce_transition`), so this never needs a legal status edge."""
+    await session.execute(
+        text(
+            "UPDATE runs SET branch_name = :branch, base_sha = :base, "
+            "merge_commit_sha = :merge_sha, error_message = :err, "
+            "result = CAST(:result AS jsonb) WHERE id = :id"
+        ),
+        {
+            "branch": branch_name,
+            "base": base_sha,
+            "merge_sha": merge_commit_sha,
+            "err": error_message,
+            "result": json.dumps(result) if result is not None else None,
+            "id": run.id,
+        },
+    )
+    await session.commit()
+
+
+async def seed_artifact(
+    session,
+    run: Run,
+    *,
+    path: str = "log.jsonl",
+    size: int = 1024,
+    content_hash: str | None = "sha256:deadbeef",
+) -> Artifact:
+    aid = (
+        await session.execute(
+            text(
+                "INSERT INTO artifacts (run_id, path, bytes, content_hash) "
+                "VALUES (:r, :p, :b, :h) RETURNING id"
+            ),
+            {"r": run.id, "p": path, "b": size, "h": content_hash},
+        )
+    ).scalar_one()
+    await session.commit()
+    return await session.get(Artifact, aid)
+
+
+async def seed_provider_account(
+    session,
+    *,
+    provider: str = "claude",
+    label: str = "primary",
+    rolling_window_hours: int = 5,
+    ceiling_seconds: int = 18000,
+    exhausted_until: str | None = None,
+    exhausted_source: str | None = None,
+    last_reading_utilization: float | None = None,
+    last_reading_source: str | None = None,
+    last_reading_at_offset_seconds: int | None = None,
+) -> ProviderAccount:
+    pid = (
+        await session.execute(
+            text(
+                "INSERT INTO provider_accounts "
+                "(provider, label, rolling_window_hours, ceiling_seconds, "
+                "exhausted_until, exhausted_source, last_reading_utilization, "
+                "last_reading_source, last_reading_at) "
+                "VALUES (:prov, :label, :rwh, :ceiling, :exh_until, :exh_source, "
+                ":lr_util, :lr_source, "
+                "CASE WHEN CAST(:lr_offset AS double precision) IS NULL THEN NULL "
+                "ELSE now() - make_interval(secs => CAST(:lr_offset AS double precision)) END) "
+                "RETURNING id"
+            ),
+            {
+                "prov": provider,
+                "label": label,
+                "rwh": rolling_window_hours,
+                "ceiling": ceiling_seconds,
+                "exh_until": exhausted_until,
+                "exh_source": exhausted_source,
+                "lr_util": last_reading_utilization,
+                "lr_source": last_reading_source,
+                "lr_offset": last_reading_at_offset_seconds,
+            },
+        )
+    ).scalar_one()
+    await session.commit()
+    return await session.get(ProviderAccount, pid)
+
+
+async def seed_quota_ledger_entry(
+    session,
+    account: ProviderAccount,
+    run: Run,
+    *,
+    attempt_no: int = 1,
+    reserved_wallclock_s: int = 100,
+    actual_wallclock_s: int | None = None,
+    consumed_offset_seconds: int = 0,
+) -> None:
+    await session.execute(
+        text(
+            "INSERT INTO quota_ledger "
+            "(provider_account_id, run_id, attempt_no, reserved_wallclock_s, "
+            "actual_wallclock_s, consumed_at) "
+            "VALUES (:acct, :run, :n, :reserved, :actual, "
+            "now() - make_interval(secs => :offset))"
+        ),
+        {
+            "acct": account.id,
+            "run": run.id,
+            "n": attempt_no,
+            "reserved": reserved_wallclock_s,
+            "actual": actual_wallclock_s,
+            "offset": consumed_offset_seconds,
+        },
     )
     await session.commit()
 
@@ -480,3 +619,389 @@ async def test_runs_endpoint_through_the_real_lifespan_with_no_overrides(
     body = resp.json()
     assert isinstance(body["runs"], list)
     assert isinstance(body["total"], int)
+
+
+# -- run detail (Task 11 / B2) -----------------------------------------------
+
+
+async def test_run_detail_shape_and_fields(db_session, token_file, auth_headers) -> None:
+    project = await seed_project(db_session, owner="acme", repo="widgets")
+    item = await seed_backlog_item(db_session, project, 42, title="fix the thing")
+    run = await seed_run(db_session, project, item, status="queued", pr_number=7)
+    await update_run_detail_fields(
+        db_session,
+        run,
+        branch_name="werft/run-abc",
+        base_sha="deadbeef",
+        merge_commit_sha="c0ffee",
+        error_message="boom",
+        result={"summary": "ok", "files_changed": 3},
+    )
+    # Drive one legal transition so a `status_changed` run_events row exists
+    # in addition to the `created` row the AFTER INSERT trigger always
+    # writes (SPEC §3.2's trigger, not application code).
+    moved = await transition_run(
+        db_session, run_id=run.id, expected_version=0, new_status=RunStatus.CLAIMED
+    )
+    assert moved
+
+    await seed_attempt(
+        db_session, run, attempt_no=1, outcome="ci_red", duration_seconds=90, ended=True
+    )
+    await seed_attempt(
+        db_session, run, attempt_no=2, outcome="ci_green", duration_seconds=120, ended=True
+    )
+    await seed_artifact(db_session, run, path="log.jsonl", size=2048, content_hash="sha256:abc")
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(f"/api/v1/runs/{run.id}", headers=auth_headers)
+
+    assert resp.status_code == 200
+    body = resp.json()
+
+    expected_fields = {
+        "id",
+        "project_slug",
+        "status",
+        "issue_number",
+        "issue_title",
+        "attempt_count",
+        "max_attempts",
+        "latest_outcome",
+        "parked_reason",
+        "pr_number",
+        "pr_url",
+        "created_at",
+        "updated_at",
+        "branch_name",
+        "base_sha",
+        "merge_commit_sha",
+        "error_message",
+        "result",
+        "events",
+        "attempts",
+        "artifacts",
+    }
+    assert set(body.keys()) == expected_fields
+
+    assert body["id"] == str(run.id)
+    assert body["project_slug"] == project.slug
+    assert body["status"] == "claimed"
+    assert body["issue_number"] == 42
+    assert body["issue_title"] == "fix the thing"
+    assert body["pr_number"] == 7
+    assert body["pr_url"] == "https://github.com/acme/widgets/pull/7"
+    assert body["branch_name"] == "werft/run-abc"
+    assert body["base_sha"] == "deadbeef"
+    assert body["merge_commit_sha"] == "c0ffee"
+    assert body["error_message"] == "boom"
+    assert body["result"] == {"summary": "ok", "files_changed": 3}
+    assert body["latest_outcome"] == "ci_green"  # highest attempt_no
+
+    # events: the AFTER-INSERT trigger's 'created' row, then the
+    # transition trigger's 'status_changed' row — chronological order.
+    event_types = [e["event_type"] for e in body["events"]]
+    assert event_types == ["created", "status_changed"]
+    status_changed = body["events"][1]
+    assert status_changed["payload"]["from"] == "queued"
+    assert status_changed["payload"]["to"] == "claimed"
+    assert {"id", "event_type", "payload", "created_at"} <= set(body["events"][0].keys())
+
+    attempts = body["attempts"]
+    assert [a["attempt_no"] for a in attempts] == [1, 2]
+    assert attempts[0]["outcome"] == "ci_red"
+    assert attempts[0]["duration_seconds"] == 90
+    assert attempts[0]["ended_at"] is not None
+    assert attempts[1]["provider"] == "claude"
+
+    artifacts = body["artifacts"]
+    assert len(artifacts) == 1
+    assert artifacts[0]["path"] == "log.jsonl"
+    assert artifacts[0]["bytes"] == 2048
+    # RunDetail's embedded artifact shape omits content_hash — that's the
+    # standalone /artifacts endpoint's row, not this one.
+    assert set(artifacts[0].keys()) == {"path", "bytes", "collected_at"}
+
+
+async def test_run_detail_404_for_unknown_id(db_session, token_file, auth_headers) -> None:
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(f"/api/v1/runs/{uuid.uuid4()}", headers=auth_headers)
+    assert resp.status_code == 404
+
+
+async def test_run_detail_malformed_uuid_is_404_or_422(
+    db_session, token_file, auth_headers
+) -> None:
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/v1/runs/not-a-uuid", headers=auth_headers)
+    assert resp.status_code in (404, 422)
+
+
+async def test_run_detail_no_attempts_or_artifacts_is_empty_lists(
+    db_session, token_file, auth_headers
+) -> None:
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item, status="queued")
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(f"/api/v1/runs/{run.id}", headers=auth_headers)
+
+    body = resp.json()
+    assert body["attempts"] == []
+    assert body["artifacts"] == []
+    assert [e["event_type"] for e in body["events"]] == ["created"]
+    assert body["latest_outcome"] is None
+
+
+# -- quota status (Task 11 / B2) ---------------------------------------------
+
+
+async def test_quota_status_shape_and_sums(db_session, token_file, auth_headers) -> None:
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run1 = await seed_run(db_session, project, item)
+    item2 = await seed_backlog_item(db_session, project, 2)
+    run2 = await seed_run(db_session, project, item2)
+    item3 = await seed_backlog_item(db_session, project, 3)
+    run3 = await seed_run(db_session, project, item3)
+    item4 = await seed_backlog_item(db_session, project, 4)
+    run4 = await seed_run(db_session, project, item4)
+
+    account = await seed_provider_account(
+        db_session,
+        provider="claude",
+        label="primary",
+        rolling_window_hours=5,
+        ceiling_seconds=10_000,
+        exhausted_source=None,
+    )
+
+    # In-window, actual set: actual wins over reserved (COALESCE precedence).
+    await seed_quota_ledger_entry(
+        db_session,
+        account,
+        run1,
+        reserved_wallclock_s=100,
+        actual_wallclock_s=120,
+        consumed_offset_seconds=60,
+    )
+    # In-window, no actual yet: falls back to reserved for `consumed_seconds`
+    # *and* counts toward `reserved_seconds` (actual IS NULL).
+    await seed_quota_ledger_entry(
+        db_session,
+        account,
+        run2,
+        reserved_wallclock_s=50,
+        actual_wallclock_s=None,
+        consumed_offset_seconds=60,
+    )
+    # Outside the 5h rolling window, no actual: excluded from
+    # `consumed_seconds` (too old) but `reserved_seconds` is not
+    # window-scoped — an outstanding reservation still counts regardless of
+    # age (SPEC §7's "reserved" is a live-commitment figure, not a windowed
+    # utilization figure).
+    await seed_quota_ledger_entry(
+        db_session,
+        account,
+        run3,
+        reserved_wallclock_s=999,
+        actual_wallclock_s=None,
+        consumed_offset_seconds=6 * 3600,
+    )
+    # Outside the window, actual set: excluded from both sums.
+    await seed_quota_ledger_entry(
+        db_session,
+        account,
+        run4,
+        reserved_wallclock_s=10,
+        actual_wallclock_s=500,
+        consumed_offset_seconds=6 * 3600,
+    )
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/v1/quota", headers=auth_headers)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body.keys()) == {"accounts"}
+    assert len(body["accounts"]) == 1
+    acct = body["accounts"][0]
+
+    expected_fields = {
+        "provider",
+        "label",
+        "ceiling_seconds",
+        "consumed_seconds",
+        "reserved_seconds",
+        "headroom_seconds",
+        "exhausted_until",
+        "exhausted_source",
+        "last_reading_utilization",
+        "last_reading_source",
+        "last_reading_at",
+    }
+    assert set(acct.keys()) == expected_fields
+
+    assert acct["provider"] == "claude"
+    assert acct["label"] == "primary"
+    assert acct["ceiling_seconds"] == 10_000
+    assert acct["consumed_seconds"] == 120 + 50
+    assert acct["reserved_seconds"] == 50 + 999
+    assert acct["headroom_seconds"] == 10_000 - (120 + 50) - (50 + 999)
+
+
+async def test_quota_empty_account_has_zero_consumed_and_reserved(
+    db_session, token_file, auth_headers
+) -> None:
+    await seed_provider_account(db_session, provider="claude", label="empty", ceiling_seconds=500)
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/v1/quota", headers=auth_headers)
+
+    accounts = {a["label"]: a for a in resp.json()["accounts"]}
+    empty = accounts["empty"]
+    assert empty["consumed_seconds"] == 0
+    assert empty["reserved_seconds"] == 0
+    assert empty["headroom_seconds"] == 500
+
+
+async def test_quota_headroom_floors_at_zero(db_session, token_file, auth_headers) -> None:
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item)
+    account = await seed_provider_account(
+        db_session, provider="claude", label="tight", ceiling_seconds=100
+    )
+    await seed_quota_ledger_entry(
+        db_session, account, run, reserved_wallclock_s=500, actual_wallclock_s=500
+    )
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/v1/quota", headers=auth_headers)
+
+    accounts = {a["label"]: a for a in resp.json()["accounts"]}
+    tight = accounts["tight"]
+    assert tight["consumed_seconds"] == 500
+    assert tight["headroom_seconds"] == 0  # never negative
+
+
+async def test_quota_exhausted_and_last_reading_fields_pass_through(
+    db_session, token_file, auth_headers
+) -> None:
+    await seed_provider_account(
+        db_session,
+        provider="claude",
+        label="watched",
+        exhausted_source="provider_header",
+        last_reading_utilization=87.5,
+        last_reading_source="usage_api",
+        last_reading_at_offset_seconds=30,
+    )
+    # exhausted_until needs a real timestamptz; seed via raw SQL offset like
+    # the other datetime columns in this file.
+    await db_session.execute(
+        text(
+            "UPDATE provider_accounts SET exhausted_until = now() + make_interval(mins => 20) "
+            "WHERE label = 'watched'"
+        )
+    )
+    await db_session.commit()
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/v1/quota", headers=auth_headers)
+
+    accounts = {a["label"]: a for a in resp.json()["accounts"]}
+    watched = accounts["watched"]
+    assert watched["exhausted_until"] is not None
+    assert watched["exhausted_source"] == "provider_header"
+    assert watched["last_reading_utilization"] == 87.5
+    assert watched["last_reading_source"] == "usage_api"
+    assert watched["last_reading_at"] is not None
+
+
+# -- artifact listing (Task 11 / B2) -----------------------------------------
+
+
+async def test_artifacts_endpoint_returns_rows(db_session, token_file, auth_headers) -> None:
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item)
+    await seed_artifact(db_session, run, path="a.log", size=10, content_hash="sha256:aaa")
+    await seed_artifact(db_session, run, path="b.log", size=20, content_hash="sha256:bbb")
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(f"/api/v1/runs/{run.id}/artifacts", headers=auth_headers)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body.keys()) == {"artifacts"}
+    rows = body["artifacts"]
+    assert len(rows) == 2
+    assert {r["path"] for r in rows} == {"a.log", "b.log"}
+    by_path = {r["path"]: r for r in rows}
+    assert by_path["a.log"]["bytes"] == 10
+    assert by_path["a.log"]["content_hash"] == "sha256:aaa"
+    assert set(rows[0].keys()) == {"path", "bytes", "collected_at", "content_hash"}
+
+
+async def test_artifacts_endpoint_empty_for_run_with_no_artifacts(
+    db_session, token_file, auth_headers
+) -> None:
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item)
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(f"/api/v1/runs/{run.id}/artifacts", headers=auth_headers)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"artifacts": []}
+
+
+async def test_artifacts_endpoint_404_for_unknown_run(db_session, token_file, auth_headers) -> None:
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(f"/api/v1/runs/{uuid.uuid4()}/artifacts", headers=auth_headers)
+    assert resp.status_code == 404
+
+
+# -- auth wiring reaches the new endpoints too -------------------------------
+
+
+async def test_new_b2_endpoints_require_auth(db_session, token_file) -> None:
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item)
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        detail_resp = await client.get(f"/api/v1/runs/{run.id}")
+        quota_resp = await client.get("/api/v1/quota")
+        artifacts_resp = await client.get(f"/api/v1/runs/{run.id}/artifacts")
+
+    assert detail_resp.status_code == 401
+    assert quota_resp.status_code == 401
+    assert artifacts_resp.status_code == 401
