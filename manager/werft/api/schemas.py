@@ -8,7 +8,7 @@ wire, not at import time.
 """
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -116,3 +116,34 @@ class ArtifactOut(BaseModel):
 
 class ArtifactsResponse(BaseModel):
     artifacts: list[ArtifactOut]
+
+
+class OnboardRequest(BaseModel):
+    """`POST /api/v1/projects/onboard`'s body (SPEC §6.3) — the closed set
+    of fields `onboard_project` needs; main/unattended branch names stay at
+    their defaults ("main"/"unattended"), not exposed here."""
+
+    slug: str
+    owner: str
+    repo: str
+
+
+class FlipRequest(BaseModel):
+    """`POST /api/v1/projects/{id}/flip`'s body (SPEC §3.1) — the manual
+    repair flip, either direction."""
+
+    to: Literal["oracle_gated", "bootstrap"]
+
+
+class ProjectOut(BaseModel):
+    """The project shape both `onboard` (201) and `flip` (200) return —
+    `owner`/`repo` mirror `OnboardRequest`'s own field names rather than the
+    `github_owner`/`github_repo` column names underneath."""
+
+    id: UUID
+    slug: str
+    owner: str
+    repo: str
+    lifecycle: str
+    onboarded_at: datetime | None
+    created_at: datetime

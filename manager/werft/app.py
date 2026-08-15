@@ -224,11 +224,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             private_key_pem=private_key_pem,
             api_url=resolved.github_api_url,
         )
+        # The same two factories the orchestrator's poll loop uses are also
+        # what the operator API's mutation routes need (onboard, manual
+        # flip, accept's best-effort inline `advance_merging`) — one
+        # composition root, one set of factories, published on `app.state`
+        # rather than each route minting its own `GitHubClient`/`AppAuth`.
+        app.state.ops_for = _ops_factory(auth, http, resolved.github_api_url, MANAGER_PERMISSIONS)
+        app.state.admin_ops_for = _admin_ops_factory(auth, http, resolved.github_api_url)
         orchestrator = Orchestrator(
             app.state.session_factory,
-            _ops_factory(auth, http, resolved.github_api_url, MANAGER_PERMISSIONS),
-            _admin_ops_factory(auth, http, resolved.github_api_url),
-            alerts=NullAlertSink(),
+            app.state.ops_for,
+            app.state.admin_ops_for,
+            alerts=app.state.alerts,
             quota=NullQuota(),
             settings=resolved,
         )
@@ -250,6 +257,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await engine.dispose()
 
     app = FastAPI(title="werft-manager", lifespan=lifespan)
+    # Set before the lifespan ever runs (like `require_token` above) so the
+    # operator API's mutation routes have a well-defined GitHub-unconfigured
+    # default (`None`/`None`/`NullAlertSink()`) even in tests that override
+    # `get_session` and never enter `lifespan_context` at all. When GitHub
+    # creds are configured, the lifespan overwrites `ops_for`/`admin_ops_for`
+    # with the real factories; `alerts` is deliberately the same instance the
+    # orchestrator itself uses — a later task (B5) swaps it for a real sink
+    # here, once, for both consumers.
+    app.state.ops_for = None
+    app.state.admin_ops_for = None
+    app.state.alerts = NullAlertSink()
     app.include_router(healthz_router)
     app.include_router(api_router, prefix="/api/v1", dependencies=[Depends(require_token)])
     return app

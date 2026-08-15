@@ -1,7 +1,9 @@
-"""HTTP routes (SPEC §9 operator surface, thin-loop minimum: this task
-ships the runs list, run detail, quota status, and artifact listing —
-artifact *serving*, review accept/reject, run cancel/requeue, and project
-onboard/flip land in later tasks).
+"""HTTP routes (SPEC §9 operator surface): runs list, run detail, quota
+status, artifact listing, and the six-endpoint mutation set — review
+accept/reject, run cancel/requeue, project onboard, and the manual
+lifecycle flip (Task 12/B3's CLOSED write set; see `_run_summary_query`'s
+callers below for the exact list — artifact *serving* is the one surface
+still outstanding).
 
 Two routers, wired separately by the composition root in `app.py`:
 `healthz_router` carries no auth dependency (the watchdog must always be
@@ -11,8 +13,10 @@ time, once `app.py` has read the token file.
 """
 
 from collections.abc import AsyncIterator
-from uuid import UUID
+from types import SimpleNamespace
+from uuid import UUID, uuid4
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,6 +25,9 @@ from werft.api.schemas import (
     ArtifactOut,
     ArtifactsResponse,
     ArtifactSummary,
+    FlipRequest,
+    OnboardRequest,
+    ProjectOut,
     QuotaAccount,
     QuotaResponse,
     RunAttemptOut,
@@ -39,6 +46,15 @@ from werft.db.models import (
     RunAttempt,
     RunEvent,
 )
+from werft.db.transitions import transition_run
+from werft.domain.errors import PermanentError
+from werft.domain.projects import ProjectLifecycle
+from werft.domain.runs import TERMINAL_STATUSES, ParkedReason, RunStatus
+from werft.orchestrator.ci_watch import flip_project
+from werft.orchestrator.merge_flow import advance_merging
+from werft.orchestrator.onboard import onboard_project
+
+logger = structlog.get_logger(__name__)
 
 healthz_router = APIRouter()
 
@@ -85,22 +101,12 @@ def _latest_outcome_subquery():
     )
 
 
-@api_router.get("/runs", response_model=RunsListResponse)
-async def list_runs(
-    status: str | None = None,
-    project: str | None = None,
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
-    session: AsyncSession = Depends(get_session),  # noqa: B008 - FastAPI's DI pattern
-) -> RunsListResponse:
-    """`GET /api/v1/runs` — `RunSummary` rows ordered `created_at DESC, id
-    DESC` (SPEC §9; the `id` tiebreak keeps pagination stable across rows
-    that share a `created_at`). `pr_url` is derived from the project's
-    `github_owner`/`github_repo` plus `pr_number`, never stored.
-    """
+def _run_summary_query():
+    """The `RunSummary` column set plus its two joins, unfiltered — shared
+    by `list_runs` (paged, optionally filtered) and `_get_run_summary`
+    below (one row, by id) so both ever define the shape exactly once."""
     latest_outcome = _latest_outcome_subquery()
-
-    base = (
+    return (
         select(
             Run.id,
             Project.slug.label("project_slug"),
@@ -120,6 +126,40 @@ async def list_runs(
         .join(Project, Run.project_id == Project.id)
         .join(BacklogItem, Run.backlog_item_id == BacklogItem.id)
     )
+
+
+def _row_to_run_summary(row) -> RunSummary:
+    return RunSummary(
+        id=row.id,
+        project_slug=row.project_slug,
+        status=row.status,
+        issue_number=row.issue_number,
+        issue_title=row.issue_title,
+        attempt_count=row.attempt_count,
+        max_attempts=row.max_attempts,
+        latest_outcome=row.latest_outcome,
+        parked_reason=row.parked_reason,
+        pr_number=row.pr_number,
+        pr_url=_pr_url(row.github_owner, row.github_repo, row.pr_number),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+@api_router.get("/runs", response_model=RunsListResponse)
+async def list_runs(
+    status: str | None = None,
+    project: str | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_session),  # noqa: B008 - FastAPI's DI pattern
+) -> RunsListResponse:
+    """`GET /api/v1/runs` — `RunSummary` rows ordered `created_at DESC, id
+    DESC` (SPEC §9; the `id` tiebreak keeps pagination stable across rows
+    that share a `created_at`). `pr_url` is derived from the project's
+    `github_owner`/`github_repo` plus `pr_number`, never stored.
+    """
+    base = _run_summary_query()
     if status is not None:
         base = base.where(Run.status == status)
     if project is not None:
@@ -137,24 +177,7 @@ async def list_runs(
     page = base.order_by(Run.created_at.desc(), Run.id.desc()).limit(limit).offset(offset)
     rows = (await session.execute(page)).all()
 
-    runs = [
-        RunSummary(
-            id=row.id,
-            project_slug=row.project_slug,
-            status=row.status,
-            issue_number=row.issue_number,
-            issue_title=row.issue_title,
-            attempt_count=row.attempt_count,
-            max_attempts=row.max_attempts,
-            latest_outcome=row.latest_outcome,
-            parked_reason=row.parked_reason,
-            pr_number=row.pr_number,
-            pr_url=_pr_url(row.github_owner, row.github_repo, row.pr_number),
-            created_at=row.created_at,
-            updated_at=row.updated_at,
-        )
-        for row in rows
-    ]
+    runs = [_row_to_run_summary(row) for row in rows]
     return RunsListResponse(runs=runs, total=total)
 
 
@@ -406,3 +429,261 @@ async def get_quota(
         for row in rows
     ]
     return QuotaResponse(accounts=accounts)
+
+
+# -- mutations (SPEC §9, the closed write set — Task 12/B3) ------------------
+#
+# Every run mutation below follows the same shape: fetch-or-404, check the
+# precondition *in Python* before ever attempting the CAS, then
+# `transition_run`. Checking the precondition first means the only way the
+# CAS itself can still lose is a genuine concurrent race (another request
+# moved the row between the read and the `UPDATE`) — the DB trigger's own
+# "illegal run status transition" exception is never reached either way,
+# because a version-matched-but-status-wrong row can't occur (this code path
+# is the only writer of `runs.status`, and status/version always move
+# together), and a lost race means zero rows match the `WHERE ... AND
+# version = ...`, so the trigger never fires at all. That is what keeps a
+# wrong-state or raced request a 409, never an unhandled 500 from a raised
+# DB exception.
+
+
+async def _get_run_summary(session: AsyncSession, run_id: UUID) -> RunSummary:
+    """Re-reads one run in the exact `RunSummary` shape `list_runs` returns
+    (controller ruling: every run mutation answers with the refreshed run,
+    unwrapped, same shape as the list) — a plain column `select`, not
+    `session.get`, so it always reflects what was just committed rather than
+    a possibly-stale identity-mapped `Run` instance."""
+    row = (await session.execute(_run_summary_query().where(Run.id == run_id))).one()
+    return _row_to_run_summary(row)
+
+
+def _project_out(project: Project) -> ProjectOut:
+    return ProjectOut(
+        id=project.id,
+        slug=project.slug,
+        owner=project.github_owner,
+        repo=project.github_repo,
+        lifecycle=project.lifecycle,
+        onboarded_at=project.onboarded_at,
+        created_at=project.created_at,
+    )
+
+
+async def _get_run_for_mutation(session: AsyncSession, run_id: UUID) -> Run:
+    run = await session.get(Run, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return run
+
+
+@api_router.post("/runs/{run_id}/review/accept", response_model=RunSummary)
+async def accept_review(
+    run_id: UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_session),  # noqa: B008 - FastAPI's DI pattern
+) -> RunSummary:
+    """`POST /api/v1/runs/{id}/review/accept` — CAS `awaiting_review ->
+    merging` (SPEC §9), 409 on the wrong current state or a lost CAS race.
+
+    On a won CAS, drives one best-effort inline `advance_merging` tick
+    (controller ruling: run mutations are GitHub-less-safe) — skipped
+    entirely when `app.state.ops_for` is `None` (no GitHub creds
+    configured), and every error out of it is swallowed (logged, never
+    raised): the 30 s poller tick is the actual guarantee this accept only
+    tries to shortcut, so a failure here must never turn an accepted review
+    into a 500.
+    """
+    run = await _get_run_for_mutation(session, run_id)
+    if run.status != RunStatus.AWAITING_REVIEW.value:
+        raise HTTPException(status_code=409, detail=f"run is {run.status}, not awaiting_review")
+
+    ok = await transition_run(
+        session, run_id=run_id, expected_version=run.version, new_status=RunStatus.MERGING
+    )
+    if not ok:
+        raise HTTPException(status_code=409, detail="run state changed concurrently")
+    await session.commit()
+
+    ops_for = request.app.state.ops_for
+    if ops_for is not None:
+        run = await session.get(Run, run_id, populate_existing=True)
+        project = await session.get(Project, run.project_id)
+        try:
+            await advance_merging(
+                session, ops_for(project), run, project, alerts=request.app.state.alerts
+            )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            logger.warning("api.accept_advance_merging_failed", run_id=str(run_id), exc_info=True)
+
+    return await _get_run_summary(session, run_id)
+
+
+@api_router.post("/runs/{run_id}/review/reject", response_model=RunSummary)
+async def reject_review(
+    run_id: UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_session),  # noqa: B008 - FastAPI's DI pattern
+) -> RunSummary:
+    """`POST /api/v1/runs/{id}/review/reject` — CAS `awaiting_review ->
+    parked` with `parked_reason='review_rejected'` (SPEC §9), then fires
+    `alerts.run_parked` — only after the CAS has won, the same "alert after
+    the write, never before" discipline `merge_flow._park` and
+    `ci_watch.advance_awaiting_ci` use.
+    """
+    run = await _get_run_for_mutation(session, run_id)
+    if run.status != RunStatus.AWAITING_REVIEW.value:
+        raise HTTPException(status_code=409, detail=f"run is {run.status}, not awaiting_review")
+
+    ok = await transition_run(
+        session,
+        run_id=run_id,
+        expected_version=run.version,
+        new_status=RunStatus.PARKED,
+        extra={"parked_reason": ParkedReason.REVIEW_REJECTED.value},
+    )
+    if not ok:
+        raise HTTPException(status_code=409, detail="run state changed concurrently")
+    await session.commit()
+
+    project = await session.get(Project, run.project_id)
+    await request.app.state.alerts.run_parked(
+        project.slug, run_id, ParkedReason.REVIEW_REJECTED.value
+    )
+
+    return await _get_run_summary(session, run_id)
+
+
+@api_router.post("/runs/{run_id}/cancel", response_model=RunSummary)
+async def cancel_run(
+    run_id: UUID,
+    session: AsyncSession = Depends(get_session),  # noqa: B008 - FastAPI's DI pattern
+) -> RunSummary:
+    """`POST /api/v1/runs/{id}/cancel` — CAS `<non-terminal> -> canceled`
+    (SPEC §9; SPEC §3.2's canceled edges are every non-terminal status), 409
+    if the run is already terminal. Cleanup (closing any open PR, deleting
+    the run branch) happens out-of-band via the tick sweep's
+    `cleanup_terminal` — this endpoint only flips the status.
+    """
+    run = await _get_run_for_mutation(session, run_id)
+    if run.status in TERMINAL_STATUSES:
+        raise HTTPException(status_code=409, detail=f"run is already {run.status}")
+
+    ok = await transition_run(
+        session, run_id=run_id, expected_version=run.version, new_status=RunStatus.CANCELED
+    )
+    if not ok:
+        raise HTTPException(status_code=409, detail="run state changed concurrently")
+    await session.commit()
+
+    return await _get_run_summary(session, run_id)
+
+
+@api_router.post("/runs/{run_id}/requeue", response_model=RunSummary)
+async def requeue_run(
+    run_id: UUID,
+    session: AsyncSession = Depends(get_session),  # noqa: B008 - FastAPI's DI pattern
+) -> RunSummary:
+    """`POST /api/v1/runs/{id}/requeue` — CAS `parked -> queued`, resetting
+    `attempt_count` to 0 and `next_attempt_at` to now (plan Behavioral
+    decision 7: a human explicitly granting a fresh retry budget — not a
+    resume of the one that was already spent). 409 from any state but
+    `parked`.
+    """
+    run = await _get_run_for_mutation(session, run_id)
+    if run.status != RunStatus.PARKED.value:
+        raise HTTPException(status_code=409, detail=f"run is {run.status}, not parked")
+
+    ok = await transition_run(
+        session,
+        run_id=run_id,
+        expected_version=run.version,
+        new_status=RunStatus.QUEUED,
+        extra={"attempt_count": 0, "next_attempt_at": func.now()},
+    )
+    if not ok:
+        raise HTTPException(status_code=409, detail="run state changed concurrently")
+    await session.commit()
+
+    return await _get_run_summary(session, run_id)
+
+
+@api_router.post("/projects/onboard", response_model=ProjectOut, status_code=201)
+async def onboard(
+    body: OnboardRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),  # noqa: B008 - FastAPI's DI pattern
+) -> ProjectOut:
+    """`POST /api/v1/projects/onboard` — SPEC §6.3's one-time bootstrap
+    setup, driven through `orchestrator/onboard.py`'s `onboard_project`.
+    Requires GitHub creds (controller ruling: unlike the run mutations,
+    onboard cannot proceed without them) — 503 when `app.state.ops_for`/
+    `admin_ops_for` are unset. `onboard_project`'s `PermanentError` maps to
+    409 for a duplicate slug/repo, 422 for an unreachable installation
+    (main branch/repo not found).
+
+    No `Project` row exists yet for `app.state.ops_for`'s per-project cache
+    key to key off of — a throwaway `SimpleNamespace` carrying just the
+    owner/repo the operator supplied plus a fresh id stands in; the
+    factories only ever read those three attributes off whatever they're
+    given (see `app.py::_ops_factory`/`_admin_ops_factory`).
+    """
+    ops_for = request.app.state.ops_for
+    admin_ops_for = request.app.state.admin_ops_for
+    if ops_for is None or admin_ops_for is None:
+        raise HTTPException(status_code=503, detail="GitHub App not configured")
+
+    target = SimpleNamespace(id=uuid4(), github_owner=body.owner, github_repo=body.repo)
+    try:
+        project = await onboard_project(
+            session,
+            ops_for(target),
+            admin_ops_for(target),
+            slug=body.slug,
+            owner=body.owner,
+            repo=body.repo,
+        )
+    except PermanentError as exc:
+        await session.rollback()
+        message = str(exc)
+        status_code = 409 if "already onboarded" in message else 422
+        raise HTTPException(status_code=status_code, detail=message) from exc
+
+    await session.commit()
+    return _project_out(project)
+
+
+@api_router.post("/projects/{project_id}/flip", response_model=ProjectOut)
+async def flip(
+    project_id: UUID,
+    body: FlipRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),  # noqa: B008 - FastAPI's DI pattern
+) -> ProjectOut:
+    """`POST /api/v1/projects/{id}/flip` — the manual repair flip (SPEC
+    §3.1), either direction, delegating to `ci_watch.flip_project` (the same
+    idempotent guard the automatic doctrine-#1 flip uses). Requires GitHub
+    creds (503 when unconfigured, same controller ruling as onboard); a
+    no-op guard miss (project already at the requested `to` lifecycle) is
+    409, never a silent 200.
+    """
+    admin_ops_for = request.app.state.admin_ops_for
+    if admin_ops_for is None:
+        raise HTTPException(status_code=503, detail="GitHub App not configured")
+
+    project = await session.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+
+    to = ProjectLifecycle(body.to)
+    flipped = await flip_project(
+        session, admin_ops_for(project), project, to=to, alerts=request.app.state.alerts
+    )
+    if not flipped:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=f"project already {to.value}")
+    await session.commit()
+
+    project = await session.get(Project, project_id, populate_existing=True)
+    return _project_out(project)
