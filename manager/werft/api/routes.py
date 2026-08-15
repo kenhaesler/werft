@@ -12,12 +12,17 @@ able to reach it, token configured or not); `api_router` is mounted under
 time, once `app.py` has read the token file.
 """
 
+import os
+import re
+import stat
 from collections.abc import AsyncIterator
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -340,6 +345,137 @@ async def list_artifacts(
         for row in rows
     ]
     return ArtifactsResponse(artifacts=artifacts)
+
+
+def _artifact_containment_ok(base_dir: Path, candidate: Path) -> bool:
+    """SPEC §8's containment re-check: `candidate`'s fully-resolved real
+    path (`os.path.realpath` — every `..`/`.` collapsed, every symlink,
+    including in a *parent* directory, followed) must stay under
+    `base_dir`'s own real path.
+
+    Deliberately answers only "does this escape the tree", not "open this
+    path" — the caller runs its own `os.lstat` on `candidate` *unresolved*
+    for that, precisely because resolving it here would erase the one
+    distinction that second check exists to make: a symlink whose target
+    happens to sit inside `base_dir` passes containment (nothing here
+    escapes), but must still 404 as a symlink. Returning the resolved path
+    from this function and letting the caller `lstat` *that* would silently
+    defeat the symlink check — `os.path.realpath` follows the very
+    symlink `os.lstat` is supposed to catch, so by the time `lstat` ran
+    it'd be inspecting the (regular-file) target, not the link.
+
+    `Path.__truediv__` (how `candidate` gets built) silently discards the
+    left operand when the right one is itself absolute (a POSIX leading
+    `/`, or a Windows drive like `C:\\`) — an absolute `rel_path` doesn't
+    need special-casing here either: the join still produces *some* path,
+    `realpath` still resolves it, and the prefix check below still rejects
+    it exactly like a `../` escape would. One check catches both shapes.
+    """
+    real_base = os.path.realpath(base_dir)
+    real_candidate = os.path.realpath(candidate)
+    try:
+        return os.path.commonpath([real_base, real_candidate]) == real_base
+    except ValueError:
+        # Windows: commonpath raises when the two paths don't share a
+        # drive — an absolute rel_path naming a different drive than
+        # artifacts_root is exactly the escape this check exists to catch,
+        # just reported as an exception instead of a plain mismatch.
+        return False
+
+
+_HEADER_UNSAFE_CHARS = re.compile(r'[\x00-\x1f\x7f"\\<>]')
+
+
+def _ascii_fallback_filename(name: str) -> str:
+    """The quoted-string `filename` fallback (SPEC §8): strips ASCII
+    control characters — CR/LF above all, which would otherwise split the
+    header into two — double quotes and backslashes (the quoted-string
+    escape character), and `<`/`>` (so a script tag embedded in a
+    collected artifact's filename can never round-trip into this header
+    intact), then drops any remaining non-ASCII bytes outright — the
+    RFC 5987 `filename*` parameter below carries the faithful UTF-8 name
+    for clients that understand it.
+    """
+    stripped = _HEADER_UNSAFE_CHARS.sub("", name)
+    ascii_only = stripped.encode("ascii", "ignore").decode("ascii")
+    return ascii_only or "artifact"
+
+
+def _content_disposition_header(filename: str) -> str:
+    """SPEC §8's exact artifact response header:
+    `attachment; filename="<ascii-sanitized>"; filename*=UTF-8''<urlencoded>`.
+    Both parts are derived from the same untrusted, collector-supplied
+    filename, so both must independently be safe against header injection —
+    `quote(..., safe="")` percent-encodes every byte outside RFC 3986's
+    unreserved set, including the quotes/control characters/angle brackets
+    the ASCII fallback strips outright.
+    """
+    ascii_name = _ascii_fallback_filename(filename)
+    encoded = quote(filename, safe="")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
+
+
+@api_router.get("/runs/{run_id}/artifacts/{artifact_path:path}")
+async def get_artifact_file(
+    run_id: UUID,
+    artifact_path: str,
+    request: Request,
+    session: AsyncSession = Depends(get_session),  # noqa: B008 - FastAPI's DI pattern
+) -> Response:
+    """`GET /api/v1/runs/{id}/artifacts/{path}` — the artifact's raw bytes
+    (SPEC §8: "the evidence surface is a stored-XSS surface" — an artifact
+    is a file an *attempt* produced, so its name and bytes are as untrusted
+    as anything else that attempt touched; this route exists so a browser
+    never renders one inline).
+
+    The `artifacts` row is the index, not the filesystem: a `(run_id,
+    path)` pair with no matching row 404s before any `os.*` call at all, so
+    a path that was never collected — or one a request forged purely to
+    probe the filesystem — can't even reach the containment check below. A
+    row that *does* exist still gets re-checked against its resolved, real
+    path (`os.path.realpath`) staying under this run's own `artifacts/`
+    directory: the DB is trusted to say *whether* a path was collected,
+    never trusted, on its own, to say *where on disk* it's safe to open (a
+    row is only ever written by the collector, but defense in depth costs
+    nothing here and the brief calls for it explicitly). Separately, the
+    artifact path's own final component is `os.lstat`-ed *unresolved*
+    (never `os.stat`, and never the containment check's already-resolved
+    path — see `_artifact_containment_ok`'s docstring for why that
+    distinction matters): a symlink there 404s regardless of where it
+    points, even a target that would itself have passed containment.
+    """
+    row = (
+        await session.execute(
+            select(Artifact.path).where(Artifact.run_id == run_id, Artifact.path == artifact_path)
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="artifact not found")
+
+    artifacts_root: str = request.app.state.artifacts_root
+    base_dir = Path(artifacts_root) / str(run_id) / "artifacts"
+    candidate = base_dir / artifact_path
+    if not _artifact_containment_ok(base_dir, candidate):
+        raise HTTPException(status_code=404, detail="artifact not found")
+
+    # `candidate`, unresolved — never the containment check's realpath'd
+    # value, which would have already dereferenced a symlink at this exact
+    # spot and made this check unable to see it (see
+    # `_artifact_containment_ok`'s docstring).
+    try:
+        file_stat = os.lstat(candidate)
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="artifact not found") from exc
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise HTTPException(status_code=404, detail="artifact not found")
+
+    data = candidate.read_bytes()
+    filename = PurePosixPath(artifact_path).name
+    headers = {
+        "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": _content_disposition_header(filename),
+    }
+    return Response(content=data, media_type="application/octet-stream", headers=headers)
 
 
 @api_router.get("/quota", response_model=QuotaResponse)

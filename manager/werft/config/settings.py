@@ -28,3 +28,8 @@ class Settings(BaseSettings):
     # means "not configured" — `werft/api/auth.py` fails closed (403) rather
     # than treating an unmounted secret as "auth disabled".
     api_token_file: str = ""
+
+    # SPEC §8: artifact metadata lives in the DB, bytes on disk under
+    # `{artifacts_root}/{run_id}/artifacts/` — the root the collector writes
+    # to and `werft/api/routes.py`'s artifact-download route reads from.
+    artifacts_root: str = "/srv/werft/runs"

@@ -268,6 +268,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.ops_for = None
     app.state.admin_ops_for = None
     app.state.alerts = NullAlertSink()
+    # Read straight off `resolved` rather than deferred to the lifespan: the
+    # artifact-download route (api/routes.py) needs it on every request, and
+    # tests that override `get_session` and never enter `lifespan_context`
+    # (test_api_runs.py's style) still need a well-defined value.
+    app.state.artifacts_root = resolved.artifacts_root
     app.include_router(healthz_router)
     app.include_router(api_router, prefix="/api/v1", dependencies=[Depends(require_token)])
     return app
