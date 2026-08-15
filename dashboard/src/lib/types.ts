@@ -54,7 +54,7 @@ export interface Artifact {
   path: string;
   bytes: number;
   collected_at: string;
-  content_hash: string;
+  content_hash: string | null;
 }
 
 export interface ArtifactsResponse {

@@ -327,16 +327,27 @@ async def get_quota(
     consumed/reserved/ceiling/headroom/exhaustion/last-reading, each its own
     field — the operator is never asked to do arithmetic).
 
-    `consumed_seconds` sums `COALESCE(actual_wallclock_s, reserved_wallclock_s)`
-    for ledger entries within the account's own `rolling_window_hours` —
-    the provisional reservation stands in for the actual until the attempt
-    reports one, so an in-flight attempt still counts toward utilization.
+    `consumed_seconds` and `reserved_seconds` are disjoint buckets over the
+    *same* `quota_ledger` rows, partitioned on `actual_wallclock_s IS
+    [NOT] NULL` — every ledger row is counted in exactly one of the two, so
+    `headroom_seconds = ceiling - consumed - reserved` never double-counts
+    a row. (An earlier version had `consumed_seconds` fall back to
+    `reserved_wallclock_s` via `COALESCE` for still-open rows — that made
+    an in-window, unresolved reservation land in *both* sums and subtract
+    twice from headroom; review caught it, this is the fix.)
+
+    `consumed_seconds` sums `actual_wallclock_s` for ledger entries that
+    have reported one, within the account's own `rolling_window_hours`.
     `reserved_seconds` is a *live-commitment* figure, not a windowed one:
     it sums `reserved_wallclock_s` for every entry that has no
     `actual_wallclock_s` yet, regardless of age — an attempt that started
     outside the rolling window and never resolved is still an outstanding
     claim on capacity. `headroom_seconds` is `ceiling - consumed - reserved`,
-    floored at zero rather than surfaced negative.
+    floored at zero rather than surfaced negative. Whether an in-window,
+    *still-open* reservation should also nudge `consumed_seconds` (a
+    "how much of my window am I about to spend" reading) is a possible
+    refinement left to T7, which owns the reservation lifecycle end to
+    end; this endpoint only reads what's already in the ledger.
     """
     # `make_interval`'s positional signature is (years, months, weeks, days,
     # hours, mins, secs); zeros fill the leading params so the fifth
@@ -346,17 +357,9 @@ async def get_quota(
     window_floor = func.now() - func.make_interval(0, 0, 0, 0, ProviderAccount.rolling_window_hours)
 
     consumed_subq = (
-        select(
-            func.coalesce(
-                func.sum(
-                    func.coalesce(
-                        QuotaLedgerEntry.actual_wallclock_s, QuotaLedgerEntry.reserved_wallclock_s
-                    )
-                ),
-                0,
-            )
-        )
+        select(func.coalesce(func.sum(QuotaLedgerEntry.actual_wallclock_s), 0))
         .where(QuotaLedgerEntry.provider_account_id == ProviderAccount.id)
+        .where(QuotaLedgerEntry.actual_wallclock_s.is_not(None))
         .where(QuotaLedgerEntry.consumed_at > window_floor)
         .correlate(ProviderAccount)
         .scalar_subquery()

@@ -785,7 +785,8 @@ async def test_quota_status_shape_and_sums(db_session, token_file, auth_headers)
         exhausted_source=None,
     )
 
-    # In-window, actual set: actual wins over reserved (COALESCE precedence).
+    # In-window, actual set: counts toward `consumed_seconds` only —
+    # `actual_wallclock_s IS NOT NULL` excludes it from `reserved_seconds`.
     await seed_quota_ledger_entry(
         db_session,
         account,
@@ -794,8 +795,10 @@ async def test_quota_status_shape_and_sums(db_session, token_file, auth_headers)
         actual_wallclock_s=120,
         consumed_offset_seconds=60,
     )
-    # In-window, no actual yet: falls back to reserved for `consumed_seconds`
-    # *and* counts toward `reserved_seconds` (actual IS NULL).
+    # In-window, no actual yet: counts toward `reserved_seconds` only (the
+    # `consumed`/`reserved` buckets are disjoint — a still-open reservation
+    # must land in exactly one, never both, or `headroom_seconds` would
+    # subtract it twice).
     await seed_quota_ledger_entry(
         db_session,
         account,
@@ -805,10 +808,10 @@ async def test_quota_status_shape_and_sums(db_session, token_file, auth_headers)
         consumed_offset_seconds=60,
     )
     # Outside the 5h rolling window, no actual: excluded from
-    # `consumed_seconds` (too old) but `reserved_seconds` is not
-    # window-scoped — an outstanding reservation still counts regardless of
-    # age (SPEC §7's "reserved" is a live-commitment figure, not a windowed
-    # utilization figure).
+    # `consumed_seconds` (it has no `actual_wallclock_s` to sum anyway) and
+    # `reserved_seconds` is not window-scoped — an outstanding reservation
+    # still counts regardless of age (SPEC §7's "reserved" is a
+    # live-commitment figure, not a windowed utilization figure).
     await seed_quota_ledger_entry(
         db_session,
         account,
@@ -817,7 +820,8 @@ async def test_quota_status_shape_and_sums(db_session, token_file, auth_headers)
         actual_wallclock_s=None,
         consumed_offset_seconds=6 * 3600,
     )
-    # Outside the window, actual set: excluded from both sums.
+    # Outside the window, actual set: excluded from `consumed_seconds` (too
+    # old) and from `reserved_seconds` (actual is not null).
     await seed_quota_ledger_entry(
         db_session,
         account,
@@ -856,9 +860,109 @@ async def test_quota_status_shape_and_sums(db_session, token_file, auth_headers)
     assert acct["provider"] == "claude"
     assert acct["label"] == "primary"
     assert acct["ceiling_seconds"] == 10_000
-    assert acct["consumed_seconds"] == 120 + 50
-    assert acct["reserved_seconds"] == 50 + 999
-    assert acct["headroom_seconds"] == 10_000 - (120 + 50) - (50 + 999)
+    assert acct["consumed_seconds"] == 120  # run1 only: actual set, in-window
+    assert acct["reserved_seconds"] == 50 + 999  # run2 + run3: open, any age
+    # Every ledger row counted exactly once: 120 (run1) + 50 (run2) +
+    # 999 (run3) = 1169 of committed capacity; run4 contributes nothing
+    # (outside the window, actual already resolved).
+    assert acct["headroom_seconds"] == 10_000 - 120 - (50 + 999)
+
+
+async def test_quota_sums_do_not_bleed_between_accounts(
+    db_session, token_file, auth_headers
+) -> None:
+    """Both correlated subqueries filter on
+    `provider_account_id == ProviderAccount.id`; a query that dropped that
+    predicate would sum every account's ledger rows into every account's
+    row. Two accounts, each with its own ledger entries, pins that each
+    account's sums reflect only its own rows."""
+    project = await seed_project(db_session)
+    item_a = await seed_backlog_item(db_session, project, 1)
+    run_a = await seed_run(db_session, project, item_a)
+    item_b = await seed_backlog_item(db_session, project, 2)
+    run_b = await seed_run(db_session, project, item_b)
+
+    account_a = await seed_provider_account(
+        db_session, provider="claude", label="account-a", ceiling_seconds=10_000
+    )
+    account_b = await seed_provider_account(
+        db_session, provider="claude", label="account-b", ceiling_seconds=10_000
+    )
+    await seed_quota_ledger_entry(
+        db_session, account_a, run_a, reserved_wallclock_s=10, actual_wallclock_s=200
+    )
+    await seed_quota_ledger_entry(
+        db_session, account_b, run_b, reserved_wallclock_s=300, actual_wallclock_s=None
+    )
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/v1/quota", headers=auth_headers)
+
+    accounts = {a["label"]: a for a in resp.json()["accounts"]}
+    assert accounts["account-a"]["consumed_seconds"] == 200
+    assert accounts["account-a"]["reserved_seconds"] == 0
+    assert accounts["account-b"]["consumed_seconds"] == 0
+    assert accounts["account-b"]["reserved_seconds"] == 300
+
+
+async def test_quota_windows_on_each_accounts_own_rolling_window_hours(
+    db_session, token_file, auth_headers
+) -> None:
+    """A hardcoded window (e.g. always 5h) would pass
+    `test_quota_status_shape_and_sums` by coincidence. Two accounts with
+    different `rolling_window_hours`, each given one same-aged (90 min old)
+    ledger entry: the 1h-window account must have already aged it out of
+    `consumed_seconds` while the 10h-window account still counts it —
+    proof the window comes from each row's own account, not a shared
+    constant."""
+    project = await seed_project(db_session)
+    item_narrow = await seed_backlog_item(db_session, project, 1)
+    run_narrow = await seed_run(db_session, project, item_narrow)
+    item_wide = await seed_backlog_item(db_session, project, 2)
+    run_wide = await seed_run(db_session, project, item_wide)
+
+    narrow = await seed_provider_account(
+        db_session,
+        provider="claude",
+        label="narrow-window",
+        rolling_window_hours=1,
+        ceiling_seconds=10_000,
+    )
+    wide = await seed_provider_account(
+        db_session,
+        provider="claude",
+        label="wide-window",
+        rolling_window_hours=10,
+        ceiling_seconds=10_000,
+    )
+    ninety_minutes = 90 * 60
+    await seed_quota_ledger_entry(
+        db_session,
+        narrow,
+        run_narrow,
+        reserved_wallclock_s=10,
+        actual_wallclock_s=42,
+        consumed_offset_seconds=ninety_minutes,
+    )
+    await seed_quota_ledger_entry(
+        db_session,
+        wide,
+        run_wide,
+        reserved_wallclock_s=10,
+        actual_wallclock_s=42,
+        consumed_offset_seconds=ninety_minutes,
+    )
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/v1/quota", headers=auth_headers)
+
+    accounts = {a["label"]: a for a in resp.json()["accounts"]}
+    assert accounts["narrow-window"]["consumed_seconds"] == 0  # 90min > 1h window
+    assert accounts["wide-window"]["consumed_seconds"] == 42  # 90min < 10h window
 
 
 async def test_quota_empty_account_has_zero_consumed_and_reserved(
