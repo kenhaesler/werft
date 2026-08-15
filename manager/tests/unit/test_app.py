@@ -30,9 +30,14 @@ async def test_healthz_reports_ok() -> None:
 async def test_create_app_without_creds_boots_clean_and_healthz_still_answers() -> None:
     """The composition root's own contract: no GitHub App creds configured
     (the default `Settings()`, as in tests/dev) means the lifespan never
-    even tries to build an engine/httpx client/orchestrator — just
-    `/healthz`, entered through the real lifespan context (not a bare
-    `ASGITransport`, which never runs lifespan at all)."""
+    builds an httpx client or starts the orchestrator. The DB engine and
+    session factory are still built unconditionally — the API layer
+    (`/api/v1/runs`) needs `app.state.session_factory` regardless of GitHub
+    config, and `create_async_engine` is lazy (no connection opens until a
+    route actually issues a query), so an unconnected engine costs nothing
+    at boot on this path. `/healthz` is entered through the real lifespan
+    context (not a bare `ASGITransport`, which never runs lifespan at
+    all)."""
     app = create_app(Settings())
     transport = httpx.ASGITransport(app=app)
 

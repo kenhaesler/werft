@@ -12,12 +12,15 @@ file I/O, and no route ever touches `Settings` directly.
 import secrets
 from collections.abc import Callable
 
-from fastapi import HTTPException, Request
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-_BEARER_PREFIX = "Bearer "
+_bearer_scheme = HTTPBearer(auto_error=False)
+
+_UNAUTHORIZED_HEADERS = {"WWW-Authenticate": "Bearer"}
 
 
-def make_require_token(token: str | None) -> Callable[[Request], None]:
+def make_require_token(token: str | None) -> Callable[..., None]:
     """Build a FastAPI dependency bound to one fixed token.
 
     `token is None` means the secret was never configured — an empty
@@ -28,20 +31,39 @@ def make_require_token(token: str | None) -> Callable[[Request], None]:
     A configured token still requires a well-formed
     `Authorization: Bearer <token>` header; a missing header, a wrong
     scheme, or a credential that doesn't match via `secrets.compare_digest`
-    (constant-time, so a wrong guess can't be timed against the real value)
-    is 401.
+    is 401 — with a `WWW-Authenticate: Bearer` header, per RFC 9110.
+
+    Parsing is delegated to FastAPI's own `HTTPBearer(auto_error=False)`
+    sub-dependency rather than hand-rolled `str.startswith`: the scheme
+    name in `Authorization` is case-insensitive (RFC 9110 §11.1), which a
+    literal `"Bearer "` prefix match gets wrong, and `HTTPBearer` also
+    documents `/api/v1` in OpenAPI's `securitySchemes` for free.
     """
 
-    def require_token(request: Request) -> None:
+    def require_token(
+        creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),  # noqa: B008 - FastAPI's DI pattern
+    ) -> None:
         if token is None:
             raise HTTPException(status_code=403, detail="api token not configured")
 
-        header = request.headers.get("Authorization")
-        if header is None or not header.startswith(_BEARER_PREFIX):
-            raise HTTPException(status_code=401, detail="missing or malformed authorization header")
+        if creds is None or creds.scheme.lower() != "bearer":
+            raise HTTPException(
+                status_code=401,
+                detail="missing or malformed authorization header",
+                headers=_UNAUTHORIZED_HEADERS,
+            )
 
-        credential = header[len(_BEARER_PREFIX) :]
-        if not credential or not secrets.compare_digest(credential, token):
-            raise HTTPException(status_code=401, detail="invalid token")
+        credential = creds.credentials
+        # `secrets.compare_digest` requires ASCII-only `str` operands;
+        # Starlette decodes headers as latin-1, so a non-ASCII credential
+        # (or a non-ASCII byte in the token file) raises `TypeError` rather
+        # than comparing false. Comparing the raw bytes instead sidesteps
+        # that constraint entirely while staying constant-time.
+        credential_bytes = credential.encode("utf-8", "surrogateescape")
+        token_bytes = token.encode("utf-8", "surrogateescape")
+        if not credential or not secrets.compare_digest(credential_bytes, token_bytes):
+            raise HTTPException(
+                status_code=401, detail="invalid token", headers=_UNAUTHORIZED_HEADERS
+            )
 
     return require_token

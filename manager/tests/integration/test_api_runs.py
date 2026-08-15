@@ -324,6 +324,92 @@ async def test_limit_offset_and_total_count_all_matches(
     assert body["runs"][0]["id"] == str(desc_order[1].id)
 
 
+async def test_pagination_is_stable_across_tied_created_at(
+    db_session, token_file, auth_headers
+) -> None:
+    """`created_at` alone is not a stable sort key: Postgres's `now()` (the
+    column default) is transaction-start time, so two rows inserted by the
+    same statement share the exact same `created_at`. `Run.id` (uuidv7,
+    time-ordered) breaks that tie deterministically; without it, paging one
+    row at a time (limit=1) over tied rows can show the same row on two
+    pages, or skip one entirely, depending on how Postgres happens to order
+    equal timestamps on a given execution.
+
+    Both runs are inserted by one `INSERT ... SELECT` statement sharing a
+    single `now()` call, guaranteeing identical `created_at` values rather
+    than merely hoping two separate statements land on the same timestamp.
+    """
+    project = await seed_project(db_session)
+    item1 = await seed_backlog_item(db_session, project, 1)
+    item2 = await seed_backlog_item(db_session, project, 2)
+
+    inserted_ids = (
+        (
+            await db_session.execute(
+                text(
+                    "WITH ts AS (SELECT now() AS created_at) "
+                    "INSERT INTO runs "
+                    "(project_id, backlog_item_id, status, attempt_count, "
+                    "max_attempts, created_at) "
+                    "SELECT :p, b, 'queued', 0, 3, ts.created_at "
+                    "FROM (VALUES (CAST(:b1 AS uuid)), (CAST(:b2 AS uuid))) AS v(b), ts "
+                    "RETURNING id"
+                ),
+                {"p": project.id, "b1": item1.id, "b2": item2.id},
+            )
+        )
+        .scalars()
+        .all()
+    )
+    await db_session.commit()
+    assert len(inserted_ids) == 2
+    expected_ids = {str(i) for i in inserted_ids}
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        page0 = await client.get(
+            "/api/v1/runs", params={"limit": 1, "offset": 0}, headers=auth_headers
+        )
+        page1 = await client.get(
+            "/api/v1/runs", params={"limit": 1, "offset": 1}, headers=auth_headers
+        )
+
+    ids0 = {r["id"] for r in page0.json()["runs"]}
+    ids1 = {r["id"] for r in page1.json()["runs"]}
+    assert len(ids0) == 1
+    assert len(ids1) == 1
+    assert ids0.isdisjoint(ids1)  # no row repeated across pages
+    assert ids0 | ids1 == expected_ids  # no row skipped
+
+
+# -- pagination bounds --------------------------------------------------------
+
+
+async def test_negative_limit_is_422(db_session, token_file, auth_headers) -> None:
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/v1/runs", params={"limit": -1}, headers=auth_headers)
+    assert resp.status_code == 422
+
+
+async def test_limit_above_cap_is_422(db_session, token_file, auth_headers) -> None:
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/v1/runs", params={"limit": 201}, headers=auth_headers)
+    assert resp.status_code == 422
+
+
+async def test_negative_offset_is_422(db_session, token_file, auth_headers) -> None:
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/v1/runs", params={"offset": -1}, headers=auth_headers)
+    assert resp.status_code == 422
+
+
 # -- auth wiring end-to-end --------------------------------------------------
 
 
@@ -358,3 +444,39 @@ async def test_healthz_stays_open_even_when_token_unconfigured(db_session) -> No
         resp = await client.get("/healthz")
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
+
+
+# -- lifespan -> route wiring seam, no overrides -----------------------------
+
+
+async def test_runs_endpoint_through_the_real_lifespan_with_no_overrides(
+    migrated_db: str, tmp_path
+) -> None:
+    """Every other test in this file overrides `get_session` with the
+    `db_session` fixture's session directly, and `test_app.py`'s own
+    lifespan tests only ever reach `/healthz`. `get_session` (routes.py)
+    reads `request.app.state.session_factory`, populated unconditionally by
+    the lifespan (app.py) — a typo'd attribute name on either side of that
+    seam would leave every other test in the suite green while 500ing in
+    production, because nothing else ever exercises the real path between
+    them.
+
+    This test enters the real `lifespan_context` (no `dependency_overrides`
+    at all) against the real migrated test Postgres and drives one request
+    for `/api/v1/runs` through the complete `create_app` wiring, auth
+    included.
+    """
+    token_path = tmp_path / "api-token"
+    token_path.write_text(TOKEN)
+    settings = Settings(database_url=migrated_db, api_token_file=str(token_path))
+    app = create_app(settings)
+
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/api/v1/runs", headers={"Authorization": f"Bearer {TOKEN}"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert isinstance(body["runs"], list)
+    assert isinstance(body["total"], int)

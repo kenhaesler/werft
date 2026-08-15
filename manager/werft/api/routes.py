@@ -12,7 +12,7 @@ time, once `app.py` has read the token file.
 
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -52,12 +52,14 @@ def _pr_url(owner: str, repo: str, pr_number: int | None) -> str | None:
 async def list_runs(
     status: str | None = None,
     project: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     session: AsyncSession = Depends(get_session),  # noqa: B008 - FastAPI's DI pattern
 ) -> RunsListResponse:
-    """`GET /api/v1/runs` — `RunSummary` rows ordered `created_at DESC`
-    (SPEC §9). `latest_outcome` is the `run_attempts.outcome` of the row
+    """`GET /api/v1/runs` — `RunSummary` rows ordered `created_at DESC, id
+    DESC` (SPEC §9; the `id` tiebreak keeps pagination stable across rows
+    that share a `created_at`). `latest_outcome` is the `run_attempts.outcome`
+    of the row
     with the highest `attempt_no` for that run (a correlated scalar
     subquery, not a join — a run can have several attempts and this must
     stay one row per run); null when the run has no attempts yet, or when
@@ -102,7 +104,13 @@ async def list_runs(
     count_result = await session.execute(select(func.count()).select_from(base.subquery()))
     total = count_result.scalar_one()
 
-    page = base.order_by(Run.created_at.desc()).limit(limit).offset(offset)
+    # `created_at` alone is not a stable sort key: Postgres's `now()` (the
+    # column default) is transaction-start time, so two runs inserted in
+    # separate statements within the same transaction — or two concurrent
+    # transactions — can land on the exact same timestamp. `Run.id` is a
+    # uuidv7 (time-ordered), so it breaks ties deterministically without
+    # reordering rows that already differ by `created_at`.
+    page = base.order_by(Run.created_at.desc(), Run.id.desc()).limit(limit).offset(offset)
     rows = (await session.execute(page)).all()
 
     runs = [

@@ -26,7 +26,10 @@ def _protected_app(token: str | None) -> FastAPI:
     return app
 
 
-async def _get(app: FastAPI, headers: dict[str, str] | None = None) -> httpx.Response:
+HeaderArg = dict[str, str] | list[tuple[bytes, bytes]] | None
+
+
+async def _get(app: FastAPI, headers: HeaderArg = None) -> httpx.Response:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         return await client.get("/protected", headers=headers)
@@ -70,4 +73,35 @@ async def test_correct_token_passes() -> None:
 @pytest.mark.parametrize("header", ["Bearer", "Bearer "])
 async def test_bearer_scheme_with_no_credential_is_401(header: str) -> None:
     resp = await _get(_protected_app("s3cr3t"), headers={"Authorization": header})
+    assert resp.status_code == 401
+
+
+async def test_lowercase_bearer_scheme_passes() -> None:
+    """RFC 9110 §11.1: auth-scheme tokens are case-insensitive. A literal
+    `"Bearer "`-prefix match (the pre-fix implementation) rejects a
+    perfectly legal `Authorization: bearer <token>` header with 401 even
+    though the credential is correct."""
+    resp = await _get(_protected_app("s3cr3t"), headers={"Authorization": "bearer s3cr3t"})
+    assert resp.status_code == 200
+
+
+async def test_401_responses_carry_www_authenticate_bearer_header() -> None:
+    resp = await _get(_protected_app("s3cr3t"), headers={"Authorization": "Bearer wrong"})
+    assert resp.status_code == 401
+    assert resp.headers["www-authenticate"] == "Bearer"
+
+
+async def test_non_ascii_credential_is_401_not_500() -> None:
+    """`secrets.compare_digest` only accepts ASCII-only `str` operands;
+    Starlette decodes header bytes as latin-1, so a non-ASCII credential
+    (e.g. `café`) used to raise `TypeError` from inside the dependency,
+    which FastAPI surfaces as a 500 rather than a 401.
+
+    httpx's own `dict[str, str]` header encoding is ASCII-only (it raises
+    `UnicodeEncodeError` before a request is even sent), so the non-ASCII
+    byte has to go in as a raw header tuple — latin-1-encoded, matching
+    exactly what Starlette decodes `Authorization` headers as on the wire.
+    """
+    headers = [(b"Authorization", "Bearer café".encode("latin-1"))]
+    resp = await _get(_protected_app("s3cr3t"), headers=headers)
     assert resp.status_code == 401
