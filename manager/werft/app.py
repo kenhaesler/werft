@@ -44,6 +44,7 @@ from typing import Any
 from uuid import UUID
 
 import httpx
+import structlog
 from fastapi import Depends, FastAPI
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -58,6 +59,33 @@ from werft.github.ops import RepoOps
 from werft.observe.alerts import NtfyAlertSink, NullAlertSink
 from werft.orchestrator.finalize import NullQuota
 from werft.orchestrator.loop import Orchestrator
+
+logger = structlog.get_logger(__name__)
+
+#: Cap on `NtfyAlertSink.drain()` at shutdown. `NtfyAlertSink.drain()`
+#: already never raises from an individual spawned task's own exception
+#: (alerts.py: `gather(..., return_exceptions=True)`) — this instead bounds
+#: the one failure mode that isn't a task exception at all: a slow or
+#: unreachable ntfy host simply taking too long. Comfortably inside the 5 s
+#: whole-lifespan-exit budget `test_app.py` pins, leaving headroom for the
+#: orchestrator task join, `http.aclose()`, and `engine.dispose()` that run
+#: after it in the same teardown.
+_NTFY_DRAIN_TIMEOUT = 2.0
+
+
+async def _drain_ntfy_bounded(alerts: NtfyAlertSink) -> None:
+    """`await alerts.drain()`, but never let it run past `_NTFY_DRAIN_TIMEOUT`
+    — the caller's `finally` (aclose/dispose) must run either way, so a
+    timeout here is logged and swallowed rather than left to propagate and
+    skip that cleanup. A genuine external cancellation of the *caller* (not
+    one this function's own timeout triggered) is not swallowed — it still
+    propagates after the caller's `finally` runs, exactly like the
+    orchestrator task join a few lines below in `lifespan` already treats
+    its own exceptions."""
+    try:
+        await asyncio.wait_for(alerts.drain(), timeout=_NTFY_DRAIN_TIMEOUT)
+    except TimeoutError:
+        logger.warning("ntfy.drain_timed_out", timeout=_NTFY_DRAIN_TIMEOUT)
 
 
 def _ops_factory(
@@ -234,10 +262,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             try:
                 yield
             finally:
-                if ntfy_http is not None:
-                    await app.state.alerts.drain()
-                    await ntfy_http.aclose()
-                await engine.dispose()
+                try:
+                    if ntfy_http is not None:
+                        await _drain_ntfy_bounded(app.state.alerts)
+                finally:
+                    if ntfy_http is not None:
+                        await ntfy_http.aclose()
+                    await engine.dispose()
             return
 
         private_key_pem = Path(resolved.github_app_private_key_file).read_text()
@@ -276,12 +307,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # Always run, even if awaiting the orchestrator's task itself
                 # raised (e.g. an ExceptionGroup surfacing out of a crashed
                 # loop) — a teardown that skips these on that path leaks the
-                # httpx client's connections and the engine's pool.
-                if ntfy_http is not None:
-                    await app.state.alerts.drain()
-                    await ntfy_http.aclose()
-                await http.aclose()
-                await engine.dispose()
+                # httpx client's connections and the engine's pool. Same
+                # discipline for the ntfy drain, nested one level further:
+                # `_drain_ntfy_bounded` is itself bounded (never blocks past
+                # `_NTFY_DRAIN_TIMEOUT`), and this `finally` guarantees
+                # aclose()/dispose() run even on the timeout it swallows.
+                try:
+                    if ntfy_http is not None:
+                        await _drain_ntfy_bounded(app.state.alerts)
+                finally:
+                    if ntfy_http is not None:
+                        await ntfy_http.aclose()
+                    await http.aclose()
+                    await engine.dispose()
 
     app = FastAPI(title="werft-manager", lifespan=lifespan)
     # Set before the lifespan ever runs (like `require_token` above) so the

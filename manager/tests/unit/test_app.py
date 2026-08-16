@@ -2,6 +2,7 @@ import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -124,6 +125,62 @@ async def test_lifespan_wires_ntfy_alert_sink_when_ntfy_url_configured() -> None
 
     async with app.router.lifespan_context(app):
         assert isinstance(app.state.alerts, NtfyAlertSink)
+
+
+async def test_lifespan_with_github_and_ntfy_still_closes_resources_when_drain_hangs(
+    tmp_path: Path, pg_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for review finding 1, exercised in the branch it actually
+    bites: **both** GitHub creds and `ntfy_url` configured (unlike the two
+    tests above, which each configure only one). A `drain()` that never
+    returns — standing in for an unreachable/very slow ntfy host — must not
+    prevent `ntfy_http.aclose()`, the GitHub `http.aclose()`, or
+    `engine.dispose()` from running: `_drain_ntfy_bounded` (app.py) bounds
+    the drain and the surrounding `finally` runs cleanup regardless.
+
+    Patches `NtfyAlertSink.__init__` to capture the actual `httpx.AsyncClient`
+    app.py builds for it (not observable through `app.state`, which only
+    exposes the sink, not its client) and `NtfyAlertSink.drain` to hang
+    forever. The outer `wait_for(..., timeout=5)` is the same load-bearing
+    pattern `test_create_app_with_creds_starts_and_stops_orchestrator_within_five_seconds`
+    already uses — it fails the test on its own if shutdown doesn't
+    complete in time, which is exactly what an unfixed, unbounded
+    `await drain()` would do."""
+    key_file = tmp_path / "app-key.pem"
+    key_file.write_text(_generate_private_key_pem())
+
+    captured_http: list[httpx.AsyncClient] = []
+    original_init = NtfyAlertSink.__init__
+
+    def capturing_init(self: NtfyAlertSink, http: httpx.AsyncClient, **kwargs: Any) -> None:
+        captured_http.append(http)
+        original_init(self, http, **kwargs)
+
+    async def hanging_drain(self: NtfyAlertSink) -> None:
+        await asyncio.Event().wait()  # never set; simulates an unreachable host
+
+    monkeypatch.setattr(NtfyAlertSink, "__init__", capturing_init)
+    monkeypatch.setattr(NtfyAlertSink, "drain", hanging_drain)
+
+    settings = Settings(
+        database_url=pg_url,
+        github_app_client_id="Iv1.test1234",
+        github_app_private_key_file=str(key_file),
+        github_api_url="https://github-api.invalid.test",
+        ntfy_url="https://ntfy.invalid.test",
+        ntfy_topic="werft-test",
+    )
+    app = create_app(settings)
+    lifespan_cm = app.router.lifespan_context(app)
+
+    await lifespan_cm.__aenter__()
+    assert len(captured_http) == 1
+    ntfy_http = captured_http[0]
+    assert not ntfy_http.is_closed
+
+    await asyncio.wait_for(lifespan_cm.__aexit__(None, None, None), timeout=5)
+
+    assert ntfy_http.is_closed
 
 
 # -- _ops_factory: ETag-cache-preserving memoization (fix 1) ------------------

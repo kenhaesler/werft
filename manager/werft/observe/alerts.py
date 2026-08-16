@@ -110,10 +110,21 @@ class NtfyAlertSink:
     async def drain(self) -> None:
         """Await every currently-pending spawned task. Not part of
         `AlertSink` — only this implementation buffers work past its own
-        method calls, so only this implementation needs a way to flush it."""
+        method calls, so only this implementation needs a way to flush it.
+
+        `return_exceptions=True`: `_post` already catches every `Exception`
+        itself, but a task cancelled out from under `drain()` (rather than
+        raising on its own) surfaces as a `CancelledError` `gather` would
+        otherwise re-raise from *this* call — which callers (app.py's
+        shutdown) bound with a timeout precisely so a slow ntfy host can't
+        consume their whole teardown budget. `return_exceptions=True` keeps
+        that per-task outcome contained here instead of unwinding out of
+        `drain()` itself; a genuine external cancellation of the `drain()`
+        call (not of one child task) still propagates as normal — bounding
+        that is the caller's job, not this method's."""
         pending = list(self._tasks)
         if pending:
-            await asyncio.gather(*pending)
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def review_waiting(self, project_slug: str, run_id: UUID, pr_url: str) -> None:
         self._fire(

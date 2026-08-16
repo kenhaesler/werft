@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
+import structlog.testing
 
 from werft.observe.alerts import AlertSink, NtfyAlertSink
 
@@ -44,6 +45,7 @@ CASES = [
         lambda sink: sink.review_waiting("acme", RUN_ID, "https://github.test/acme/pr/1"),
         "Review waiting: acme",
         "default",
+        "eyes",
         "https://github.test/acme/pr/1",
     ),
     (
@@ -51,6 +53,7 @@ CASES = [
         lambda sink: sink.run_parked("acme", RUN_ID, "ci_red"),
         "Run parked: acme",
         "default",
+        "warning",
         "ci_red",
     ),
     (
@@ -58,6 +61,7 @@ CASES = [
         lambda sink: sink.project_flipped("acme"),
         "Project flipped: acme",
         "default",
+        "rocket",
         "acme",
     ),
     (
@@ -65,6 +69,7 @@ CASES = [
         lambda sink: sink.auth_failure("claude"),
         "Auth failure: claude",
         "high",
+        "closed_lock_with_key",
         "claude",
     ),
     (
@@ -72,6 +77,7 @@ CASES = [
         lambda sink: sink.quota_exhausted_until("claude", datetime(2026, 8, 16, 12, 0, tzinfo=UTC)),
         "Quota exhausted: claude",
         "default",
+        "hourglass_flowing_sand",
         "2026-08-16T12:00:00+00:00",
     ),
     (
@@ -79,13 +85,18 @@ CASES = [
         lambda sink: sink.disk_threshold(92.5),
         "Disk threshold: 92.5%",
         "high",
+        "floppy_disk",
         "92.5",
     ),
 ]
 
 
-@pytest.mark.parametrize("name,call,title,priority,body_substr", CASES, ids=[c[0] for c in CASES])
-async def test_method_posts_url_topic_title_priority_body(name, call, title, priority, body_substr):
+@pytest.mark.parametrize(
+    "name,call,title,priority,tags,body_substr", CASES, ids=[c[0] for c in CASES]
+)
+async def test_method_posts_url_topic_title_priority_tags_body(
+    name, call, title, priority, tags, body_substr
+):
     seen: list[httpx.Request] = []
     sink = sink_with(recording_handler(seen))
 
@@ -97,6 +108,7 @@ async def test_method_posts_url_topic_title_priority_body(name, call, title, pri
     assert str(request.url) == f"{URL}/{TOPIC}"
     assert request.headers["title"] == title
     assert request.headers["priority"] == priority
+    assert request.headers["tags"] == tags
     body = request.content.decode()
     assert body_substr in body
     assert "\n" not in body
@@ -152,8 +164,13 @@ async def test_a_500_response_is_swallowed_not_raised():
 
     sink = sink_with(handler)
 
-    await sink.project_flipped("acme")  # must not raise
-    await sink.drain()  # must not raise; no "exception never retrieved"
+    with structlog.testing.capture_logs() as captured:
+        await sink.project_flipped("acme")  # must not raise
+        await sink.drain()  # must not raise; no "exception never retrieved"
+
+    warnings = [e for e in captured if e.get("event") == "ntfy.post_failed"]
+    assert len(warnings) == 1
+    assert warnings[0]["log_level"] == "warning"
 
 
 async def test_a_connect_error_is_swallowed_not_raised():
@@ -162,8 +179,13 @@ async def test_a_connect_error_is_swallowed_not_raised():
 
     sink = sink_with(handler)
 
-    await sink.project_flipped("acme")  # must not raise
-    await sink.drain()  # must not raise; no "exception never retrieved"
+    with structlog.testing.capture_logs() as captured:
+        await sink.project_flipped("acme")  # must not raise
+        await sink.drain()  # must not raise; no "exception never retrieved"
+
+    warnings = [e for e in captured if e.get("event") == "ntfy.post_failed"]
+    assert len(warnings) == 1
+    assert warnings[0]["log_level"] == "warning"
 
 
 async def test_drain_with_nothing_pending_is_a_noop():
