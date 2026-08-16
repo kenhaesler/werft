@@ -444,6 +444,104 @@ async def test_accept_kick_waits_for_a_held_merging_lock_before_touching_github(
     assert ops.squash_merge_calls == [(7, "head-sha-1", f"werft: {project.slug} run {run.id}")]
 
 
+async def test_accept_kick_skips_the_decision_table_when_a_sweep_already_merged_the_run(
+    db_session, migrated_db, token_file, auth_headers
+) -> None:
+    """Winning the lock *second* must be a no-op, not a second opinion.
+
+    `advance_merging` has no status guard of its own — the poller's guard is
+    its `WHERE status = 'merging'` discovery query, taken inside the lock —
+    so a kick that re-reads a row some sweep already advanced would re-drive
+    the whole decision table on it. Here the sweep landed the merge while
+    holding the lock (`merging -> merged`, real `merge_commit_sha`), so the
+    PR now reads `merged=True`: unguarded, the kick takes the
+    merged-out-of-band branch and CASes `merged -> merged` with
+    `merge_commit_sha=None`. That CAS *wins* — the transition trigger only
+    checks legality when the status actually changes (`NEW.status IS
+    DISTINCT FROM OLD.status`), so nothing rejects it — and a legitimately
+    merged run silently loses its merge commit sha, with no event row to
+    show for it.
+
+    The rival advance runs on its own engine, committed, exactly as the
+    orchestrator's own session would — and the row is left untouched by the
+    kick down to its `version`."""
+    project = await seed_project(db_session, owner="acme", repo="widgets")
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item, status="awaiting_review", pr_number=7)
+
+    # The PR as GitHub reports it *after* the sweep's merge landed.
+    pr = PullRequest(
+        number=7,
+        state="closed",
+        merged=True,
+        head_ref=f"werft/run-{run.id}",
+        head_sha="head-sha-1",
+        base_ref=project.unattended_branch,
+        mergeable=None,
+        mergeable_state="unknown",
+        html_url="https://github.com/acme/widgets/pull/7",
+    )
+    ops = FakeMergeOps(pr)
+    app = make_client_app(db_session, token_file=token_file, ops_for=ops_for_factory(ops))
+    lock = app.state.merging_lock
+    rival_engine = create_async_engine(migrated_db)
+
+    async def run_status() -> str:
+        async with rival_engine.connect() as conn:
+            return (
+                await conn.execute(text("SELECT status FROM runs WHERE id = :id"), {"id": run.id})
+            ).scalar_one()
+
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            await lock.acquire()
+            task = asyncio.create_task(
+                client.post(f"/api/v1/runs/{run.id}/review/accept", headers=auth_headers)
+            )
+            try:
+                # Wait for the accept CAS to commit (`merging` is the only
+                # state a sweep could have picked this row up from), then
+                # land the sweep's merge while the kick is still parked on
+                # the lock.
+                for _ in range(200):
+                    if await run_status() == "merging":
+                        break
+                    await asyncio.sleep(0.01)
+                else:  # pragma: no cover - the CAS commits well inside 2 s
+                    raise AssertionError("the accept CAS never committed")
+
+                async with rival_engine.begin() as conn:
+                    await conn.execute(
+                        text(
+                            "UPDATE runs SET status = 'merged', version = version + 1, "
+                            "merge_commit_sha = 'sweep-sha-9' WHERE id = :id"
+                        ),
+                        {"id": run.id},
+                    )
+            except BaseException:
+                task.cancel()
+                raise
+            finally:
+                lock.release()
+
+            resp = await asyncio.wait_for(task, timeout=10)
+    finally:
+        await rival_engine.dispose()
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "merged"
+
+    fresh = await db_session.get(Run, run.id, populate_existing=True)
+    assert fresh.status == "merged"
+    assert fresh.merge_commit_sha == "sweep-sha-9"  # the sweep's, not NULLed
+    assert fresh.version == 2  # accept's CAS, then the sweep's — nothing else
+    # The decision table never ran a second time.
+    assert ops.squash_merge_calls == []
+    assert ops.remove_label_calls == []
+    assert ops.delete_ref_calls == []
+
+
 async def test_accept_404_for_unknown_run(db_session, token_file, auth_headers) -> None:
     app = make_client_app(db_session, token_file=token_file)
     transport = ASGITransport(app=app)

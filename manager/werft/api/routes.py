@@ -644,6 +644,21 @@ async def accept_review(
     exactly as `_advance_all_merging` holds it across `_run_unit`, so the
     row is never visible as `merging` to a rival discovery query after this
     kick has already decided its outcome.
+
+    Winning the lock second is the other half of that contract, and it is
+    why the re-read is followed by a status guard rather than used as-is.
+    `advance_merging` has no status check of its own — the poller's guard is
+    its `WHERE status = 'merging'` discovery query, taken *inside* the lock,
+    and this is that query's equivalent. A sweep that held the lock first
+    may already have landed the merge (`merging -> merged`, with the real
+    `merge_commit_sha`): re-driving the decision table on that row reads a
+    now-`merged` PR, takes the merged-out-of-band branch, and CASes
+    `merged -> merged` with `merge_commit_sha=None` — which *wins*, because
+    the transition trigger only checks legality when the status actually
+    changes, so a legitimately merged run would silently lose its merge
+    commit sha. Where the sweep instead moved the row to `awaiting_ci` (the
+    oracle-gated sha-mismatch path), re-driving would attempt a merge on a
+    run that has yet to re-earn green.
     """
     run = await _get_run_for_mutation(session, run_id)
     if run.status != RunStatus.AWAITING_REVIEW.value:
@@ -665,11 +680,12 @@ async def accept_review(
                 # `advance_merging`'s CAS is checked against this row's
                 # version.
                 run = await session.get(Run, run_id, populate_existing=True)
-                project = await session.get(Project, run.project_id)
-                await advance_merging(
-                    session, ops_for(project), run, project, alerts=request.app.state.alerts
-                )
-                await session.commit()
+                if run is not None and run.status == RunStatus.MERGING.value:
+                    project = await session.get(Project, run.project_id)
+                    await advance_merging(
+                        session, ops_for(project), run, project, alerts=request.app.state.alerts
+                    )
+                    await session.commit()
         except Exception:
             await session.rollback()
             logger.warning("api.accept_advance_merging_failed", run_id=str(run_id), exc_info=True)
