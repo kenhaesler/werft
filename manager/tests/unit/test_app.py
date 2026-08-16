@@ -16,6 +16,7 @@ from werft.config.settings import Settings
 from werft.db.models import Project
 from werft.github.auth import ADMIN_PERMISSIONS, MANAGER_PERMISSIONS, AppAuth, InstallationToken
 from werft.github.client import GitHubUnavailable
+from werft.observe.alerts import NtfyAlertSink, NullAlertSink
 
 
 async def test_healthz_reports_ok() -> None:
@@ -97,6 +98,32 @@ async def test_create_app_with_creds_starts_and_stops_orchestrator_within_five_s
         assert resp.status_code == 200
     finally:
         await asyncio.wait_for(lifespan_cm.__aexit__(None, None, None), timeout=5)
+
+
+# -- NtfyAlertSink wiring (Task 14) -------------------------------------------
+
+
+async def test_create_app_without_ntfy_url_keeps_null_alert_sink() -> None:
+    """`Settings.ntfy_url` empty (the default) means the composition root
+    never touches ntfy — `app.state.alerts` stays the `NullAlertSink` set
+    at construction time, before *and* during the lifespan."""
+    app = create_app(Settings())
+    assert isinstance(app.state.alerts, NullAlertSink)
+
+    async with app.router.lifespan_context(app):
+        assert isinstance(app.state.alerts, NullAlertSink)
+
+
+async def test_lifespan_wires_ntfy_alert_sink_when_ntfy_url_configured() -> None:
+    """`Settings.ntfy_url` configured swaps `app.state.alerts` for a real
+    `NtfyAlertSink` on lifespan entry, and shutdown (`drain()` +
+    `aclose()`) completes clean even with nothing ever sent — the wiring
+    itself must not require a live ntfy server to boot or shut down."""
+    settings = Settings(ntfy_url="https://ntfy.invalid.test", ntfy_topic="werft-test")
+    app = create_app(settings)
+
+    async with app.router.lifespan_context(app):
+        assert isinstance(app.state.alerts, NtfyAlertSink)
 
 
 # -- _ops_factory: ETag-cache-preserving memoization (fix 1) ------------------

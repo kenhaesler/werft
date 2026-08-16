@@ -26,6 +26,14 @@ The static bearer token guarding `/api/v1` (SPEC §9) is read once here,
 synchronously, from its file mount (SPEC §10: secrets are file mounts,
 never env) — before the app is even constructed, not inside the lifespan —
 because `include_router`'s `dependencies=` is fixed at router-mount time.
+
+`NtfyAlertSink` (SPEC §9.5) is wired independently of the GitHub branch —
+`app.state.alerts` is a consumer of both the orchestrator and the API
+layer's mutation routes (routes.py's accept endpoint), so its httpx client
+is built and torn down in the lifespan regardless of whether GitHub creds
+are configured, with `Settings.ntfy_url` empty meaning "keep the
+`NullAlertSink` default". Shutdown calls `drain()` before closing that
+client — the same bounded-teardown discipline as the GitHub httpx client.
 """
 
 import asyncio
@@ -47,7 +55,7 @@ from werft.db.models import Project
 from werft.github.auth import ADMIN_PERMISSIONS, MANAGER_PERMISSIONS, AppAuth
 from werft.github.client import GitHubClient
 from werft.github.ops import RepoOps
-from werft.observe.alerts import NullAlertSink
+from werft.observe.alerts import NtfyAlertSink, NullAlertSink
 from werft.orchestrator.finalize import NullQuota
 from werft.orchestrator.loop import Orchestrator
 
@@ -181,12 +189,13 @@ def _admin_ops_factory(
     return build
 
 
-def _read_api_token(path: str) -> str | None:
-    """Read the static bearer token once, at startup, from its file mount
-    (SPEC §10: secrets are file mounts, never env). An empty path or a
-    path that doesn't resolve to a file both mean "not configured" —
-    `make_require_token` fails closed on `None` rather than treating a
-    missing mount as "auth disabled"."""
+def _read_token_file(path: str) -> str | None:
+    """Read a secret token once, at startup, from its file mount (SPEC §10:
+    secrets are file mounts, never env). An empty path or a path that
+    doesn't resolve to a file both mean "not configured" (`None`) —
+    callers decide what that means: `make_require_token` fails closed on
+    `None` rather than treating a missing mount as "auth disabled";
+    `NtfyAlertSink` just omits the `Authorization` header."""
     if not path:
         return None
     token_path = Path(path)
@@ -197,22 +206,37 @@ def _read_api_token(path: str) -> str | None:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings or Settings()
-    require_token = make_require_token(_read_api_token(resolved.api_token_file))
+    require_token = make_require_token(_read_token_file(resolved.api_token_file))
+    ntfy_token = _read_token_file(resolved.ntfy_token_file)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         engine = create_engine_from_url(resolved.database_url)
         app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
+        # `NtfyAlertSink` is independent of GitHub config — the API layer's
+        # accept route (routes.py) fires `alerts.run_parked` even when no
+        # orchestrator is running — so its httpx client is owned here,
+        # before the GitHub branch, and closed in both branches below.
+        ntfy_http: httpx.AsyncClient | None = None
+        if resolved.ntfy_url:
+            ntfy_http = httpx.AsyncClient()
+            app.state.alerts = NtfyAlertSink(
+                ntfy_http, url=resolved.ntfy_url, topic=resolved.ntfy_topic, token=ntfy_token
+            )
+
         if not resolved.github_app_client_id:
             # No GitHub App configured: the orchestrator never starts — no
-            # httpx client, no GitHub call — but the API layer still needs
-            # a session factory to serve /api/v1/runs. The engine above is
-            # a lazy connection pool, so building it here opens no
+            # GitHub httpx client, no GitHub call — but the API layer still
+            # needs a session factory to serve /api/v1/runs. The engine
+            # above is a lazy connection pool, so building it here opens no
             # connection until a route actually issues a query.
             try:
                 yield
             finally:
+                if ntfy_http is not None:
+                    await app.state.alerts.drain()
+                    await ntfy_http.aclose()
                 await engine.dispose()
             return
 
@@ -253,6 +277,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # raised (e.g. an ExceptionGroup surfacing out of a crashed
                 # loop) — a teardown that skips these on that path leaks the
                 # httpx client's connections and the engine's pool.
+                if ntfy_http is not None:
+                    await app.state.alerts.drain()
+                    await ntfy_http.aclose()
                 await http.aclose()
                 await engine.dispose()
 
@@ -263,8 +290,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # `get_session` and never enter `lifespan_context` at all. When GitHub
     # creds are configured, the lifespan overwrites `ops_for`/`admin_ops_for`
     # with the real factories; `alerts` is deliberately the same instance the
-    # orchestrator itself uses — a later task (B5) swaps it for a real sink
-    # here, once, for both consumers.
+    # orchestrator itself uses — the lifespan swaps it for `NtfyAlertSink`,
+    # once, for both consumers, when `ntfy_url` is configured.
     app.state.ops_for = None
     app.state.admin_ops_for = None
     app.state.alerts = NullAlertSink()

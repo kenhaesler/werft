@@ -33,3 +33,13 @@ class Settings(BaseSettings):
     # `{artifacts_root}/{run_id}/artifacts/` — the root the collector writes
     # to and `werft/api/routes.py`'s artifact-download route reads from.
     artifacts_root: str = "/srv/werft/runs"
+
+    # Alerts (SPEC §9.5): `NtfyAlertSink`'s publish target. An empty
+    # `ntfy_url` means "not configured" — the composition root (app.py)
+    # keeps `NullAlertSink` until it's set. The ro-mounted file holding the
+    # ntfy access token (SPEC §10: secrets are file mounts, never env);
+    # empty/missing means "no Authorization header" (a private topic on a
+    # self-hosted ntfy instance may not require one).
+    ntfy_url: str = ""
+    ntfy_topic: str = "werft"
+    ntfy_token_file: str = ""
