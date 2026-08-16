@@ -24,6 +24,7 @@ from uuid import UUID, uuid4
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from werft.api.schemas import (
@@ -57,7 +58,7 @@ from werft.domain.projects import ProjectLifecycle
 from werft.domain.runs import TERMINAL_STATUSES, ParkedReason, RunStatus
 from werft.orchestrator.ci_watch import flip_project
 from werft.orchestrator.merge_flow import advance_merging
-from werft.orchestrator.onboard import onboard_project
+from werft.orchestrator.onboard import duplicate_project_message, onboard_project
 
 logger = structlog.get_logger(__name__)
 
@@ -631,6 +632,18 @@ async def accept_review(
     raised): the 30 s poller tick is the actual guarantee this accept only
     tries to shortcut, so a failure here must never turn an accepted review
     into a 500.
+
+    That kick runs under `app.state.merging_lock` — the orchestrator's own
+    `merging_lock`, published by the composition root (`app.py`). The CAS
+    above commits `merging` before the kick starts, so the in-process
+    poller's `_advance_all_merging` discovery query can already see this
+    row while the kick is still inside `get_pr`/`squash_merge`: without the
+    shared lock the same row reaches two concurrent `squash_merge` calls,
+    and the loser's 405 (`MergeBlocked`) parks a run whose PR actually
+    merged. The lock is held across the commit as well as the GitHub calls,
+    exactly as `_advance_all_merging` holds it across `_run_unit`, so the
+    row is never visible as `merging` to a rival discovery query after this
+    kick has already decided its outcome.
     """
     run = await _get_run_for_mutation(session, run_id)
     if run.status != RunStatus.AWAITING_REVIEW.value:
@@ -645,13 +658,18 @@ async def accept_review(
 
     ops_for = request.app.state.ops_for
     if ops_for is not None:
-        run = await session.get(Run, run_id, populate_existing=True)
-        project = await session.get(Project, run.project_id)
         try:
-            await advance_merging(
-                session, ops_for(project), run, project, alerts=request.app.state.alerts
-            )
-            await session.commit()
+            async with request.app.state.merging_lock:
+                # Re-read inside the lock: a poller sweep that won the lock
+                # first may already have advanced this run, and
+                # `advance_merging`'s CAS is checked against this row's
+                # version.
+                run = await session.get(Run, run_id, populate_existing=True)
+                project = await session.get(Project, run.project_id)
+                await advance_merging(
+                    session, ops_for(project), run, project, alerts=request.app.state.alerts
+                )
+                await session.commit()
         except Exception:
             await session.rollback()
             logger.warning("api.accept_advance_merging_failed", run_id=str(run_id), exc_info=True)
@@ -727,8 +745,19 @@ async def requeue_run(
     """`POST /api/v1/runs/{id}/requeue` — CAS `parked -> queued`, resetting
     `attempt_count` to 0 and `next_attempt_at` to now (plan Behavioral
     decision 7: a human explicitly granting a fresh retry budget — not a
-    resume of the one that was already spent). 409 from any state but
-    `parked`.
+    resume of the one that was already spent), and clearing `parked_reason`.
+    409 from any state but `parked`.
+
+    `parked_reason` is cleared here because this endpoint is the only exit
+    from `parked` back into the working states, and nothing downstream ever
+    nulls the column: every other writer sets it, at a park. Left behind, it
+    is reported by `/runs` and `/runs/{id}` — and rendered by the dashboard's
+    own "Parked reason" column — for a run that is queued, running, or even
+    merged, until some later park happens to overwrite it. `error_message`
+    is deliberately *not* cleared: it is the run's rolling last-error field,
+    written on every failure path and left in place across the `failed ->
+    queued` retry too, so nulling it only here would make the two retry
+    paths disagree about what a requeued run remembers.
     """
     run = await _get_run_for_mutation(session, run_id)
     if run.status != RunStatus.PARKED.value:
@@ -739,7 +768,7 @@ async def requeue_run(
         run_id=run_id,
         expected_version=run.version,
         new_status=RunStatus.QUEUED,
-        extra={"attempt_count": 0, "next_attempt_at": func.now()},
+        extra={"attempt_count": 0, "next_attempt_at": func.now(), "parked_reason": None},
     )
     if not ok:
         raise HTTPException(status_code=409, detail="run state changed concurrently")
@@ -761,6 +790,16 @@ async def onboard(
     `admin_ops_for` are unset. `onboard_project`'s `PermanentError` maps to
     409 for a duplicate slug/repo, 422 for an unreachable installation
     (main branch/repo not found).
+
+    A *concurrent* duplicate answers 409 too, by the other route: two
+    onboards of the same slug/repo both pass `onboard_project`'s duplicate
+    `SELECT` — taken before its GitHub round trips — and the loser's INSERT
+    violates `projects`' unique constraints instead. That `IntegrityError`
+    is caught here and answered with the same 409 body as the sequential
+    duplicate, rather than escaping as an unhandled 500 (nothing in this app
+    registers an exception handler). The losing transaction rolls back, so
+    nothing partial survives, and every GitHub call it already made is
+    idempotent — the winner's project is unaffected.
 
     No `Project` row exists yet for `app.state.ops_for`'s per-project cache
     key to key off of — a throwaway `SimpleNamespace` carrying just the
@@ -788,6 +827,11 @@ async def onboard(
         message = str(exc)
         status_code = 409 if "already onboarded" in message else 422
         raise HTTPException(status_code=status_code, detail=message) from exc
+    except IntegrityError as exc:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409, detail=duplicate_project_message(body.slug, body.owner, body.repo)
+        ) from exc
 
     await session.commit()
     return _project_out(project)

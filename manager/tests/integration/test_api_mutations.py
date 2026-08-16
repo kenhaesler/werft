@@ -20,13 +20,14 @@ exposes a raw HTTP body to a caller; the exact-argument call log is the
 API-level equivalent of `test_github_ops.py`'s verbatim dict assertions).
 """
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from werft.api.routes import get_session
 from werft.app import create_app
@@ -34,6 +35,7 @@ from werft.config.settings import Settings
 from werft.db.models import BacklogItem, Project, Run
 from werft.github.ops import READY_LABEL, PullRequest
 from werft.observe.alerts import NullAlertSink
+from werft.orchestrator.onboard import duplicate_project_message
 
 # -- seeding ------------------------------------------------------------
 
@@ -80,13 +82,14 @@ async def seed_run(
     max_attempts: int = 3,
     pr_number: int | None = None,
     next_attempt_at_offset_seconds: float | None = None,
+    parked_reason: str | None = None,
 ) -> Run:
     rid = (
         await session.execute(
             text(
                 "INSERT INTO runs (project_id, backlog_item_id, status, attempt_count, "
-                "max_attempts, pr_number, next_attempt_at) "
-                "VALUES (:p, :b, :s, :ac, :ma, :pr, "
+                "max_attempts, pr_number, parked_reason, next_attempt_at) "
+                "VALUES (:p, :b, :s, :ac, :ma, :pr, :parked_reason, "
                 "CASE WHEN CAST(:offset AS double precision) IS NULL THEN now() "
                 "ELSE now() - make_interval(secs => CAST(:offset AS double precision)) END) "
                 "RETURNING id"
@@ -98,6 +101,7 @@ async def seed_run(
                 "ac": attempt_count,
                 "ma": max_attempts,
                 "pr": pr_number,
+                "parked_reason": parked_reason,
                 "offset": next_attempt_at_offset_seconds,
             },
         )
@@ -318,6 +322,128 @@ async def test_accept_without_ops_configured_still_advances_state_no_crash(
     assert fresh.status == "merging"
 
 
+async def test_accept_kick_holds_the_shared_merging_lock_while_it_talks_to_github(
+    db_session, token_file, auth_headers
+) -> None:
+    """The inline kick must run *inside* `app.state.merging_lock` — the same
+    lock instance `Orchestrator._advance_all_merging` holds across discovery
+    + advance (`orchestrator/loop.py`).
+
+    The accept CAS commits `merging` before the kick starts, so the poller's
+    discovery query (`WHERE status = 'merging'`, same process, same event
+    loop) can already see this row while the kick sits in `get_pr`/
+    `squash_merge`. Unlocked, both callers reach `ops.squash_merge` for one
+    row: the winner merges the PR, the loser gets GitHub's 405 ->
+    `MergeBlocked` and parks the run, so a merged PR ends up recorded
+    `parked/merge_blocked` with a NULL `merge_commit_sha` and a spurious
+    operator alert.
+
+    Asserted at the seam that cannot be faked: the fake ops records
+    `merging_lock.locked()` at the moment of its first GitHub call. Drop the
+    `async with` from the route and the recorded value is `False`."""
+    project = await seed_project(db_session, owner="acme", repo="widgets")
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item, status="awaiting_review", pr_number=7)
+
+    pr = PullRequest(
+        number=7,
+        state="open",
+        merged=False,
+        head_ref=f"werft/run-{run.id}",
+        head_sha="head-sha-1",
+        base_ref=project.unattended_branch,
+        mergeable=True,
+        mergeable_state="clean",
+        html_url="https://github.com/acme/widgets/pull/7",
+    )
+
+    app = make_client_app(db_session, token_file=token_file)
+    lock = app.state.merging_lock
+
+    class LockObservingOps(FakeMergeOps):
+        def __init__(self) -> None:
+            super().__init__(pr)
+            self.lock_held_at_github_call: list[bool] = []
+
+        async def get_pr(self, number: int) -> PullRequest:
+            self.lock_held_at_github_call.append(lock.locked())
+            return await super().get_pr(number)
+
+    ops = LockObservingOps()
+    app.state.ops_for = ops_for_factory(ops)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(f"/api/v1/runs/{run.id}/review/accept", headers=auth_headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "merged"
+    assert ops.lock_held_at_github_call == [True]
+    assert not lock.locked()  # and released again on the way out
+
+
+async def test_accept_kick_waits_for_a_held_merging_lock_before_touching_github(
+    db_session, token_file, auth_headers
+) -> None:
+    """The other half of the same property: with the shared lock already
+    held — standing in for a poller sweep mid-`_advance_all_merging` — the
+    accept kick must not reach GitHub at all until it is released.
+
+    The `pytest.raises(TimeoutError)` is the load-bearing assertion: it
+    fails if the request reaches `ops.get_pr` while the lock is held, which
+    is exactly what an unlocked kick does (there it arrives in milliseconds,
+    far inside the 1 s window). The request still answers 200/`merged` once
+    the lock is free, so the fix costs the accept path nothing but the
+    wait."""
+    project = await seed_project(db_session, owner="acme", repo="widgets")
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item, status="awaiting_review", pr_number=7)
+
+    pr = PullRequest(
+        number=7,
+        state="open",
+        merged=False,
+        head_ref=f"werft/run-{run.id}",
+        head_sha="head-sha-1",
+        base_ref=project.unattended_branch,
+        mergeable=True,
+        mergeable_state="clean",
+        html_url="https://github.com/acme/widgets/pull/7",
+    )
+    reached_github = asyncio.Event()
+
+    class SignallingOps(FakeMergeOps):
+        async def get_pr(self, number: int) -> PullRequest:
+            reached_github.set()
+            return await super().get_pr(number)
+
+    ops = SignallingOps(pr)
+    app = make_client_app(db_session, token_file=token_file, ops_for=ops_for_factory(ops))
+    lock = app.state.merging_lock
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await lock.acquire()
+        task = asyncio.create_task(
+            client.post(f"/api/v1/runs/{run.id}/review/accept", headers=auth_headers)
+        )
+        try:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(reached_github.wait(), timeout=1.0)
+            assert ops.squash_merge_calls == []
+        except BaseException:
+            task.cancel()  # never leave the request in flight past a failure
+            raise
+        finally:
+            lock.release()
+
+        resp = await asyncio.wait_for(task, timeout=10)
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "merged"
+    assert ops.squash_merge_calls == [(7, "head-sha-1", f"werft: {project.slug} run {run.id}")]
+
+
 async def test_accept_404_for_unknown_run(db_session, token_file, auth_headers) -> None:
     app = make_client_app(db_session, token_file=token_file)
     transport = ASGITransport(app=app)
@@ -402,9 +528,16 @@ async def test_cancel_on_merged_run_is_409(db_session, token_file, auth_headers)
 # -- requeue --------------------------------------------------------------
 
 
-async def test_requeue_resets_attempt_count_and_next_attempt_at(
+async def test_requeue_resets_attempt_count_next_attempt_at_and_clears_parked_reason(
     db_session, token_file, auth_headers
 ) -> None:
+    """Requeue is the only exit from `parked` back into the working states,
+    and no other writer ever nulls `parked_reason` — every one of them sets
+    it, at a park. Left behind, the reason is reported by `/runs` and
+    `/runs/{id}` (and rendered by the dashboard's "Parked reason" column)
+    for a run that is queued, running, or even merged. Asserted in the
+    requeue response itself *and* in a follow-up read, since the response is
+    a re-read of the row rather than an echo of the request."""
     project = await seed_project(db_session)
     item = await seed_backlog_item(db_session, project, 1)
     run = await seed_run(
@@ -414,6 +547,7 @@ async def test_requeue_resets_attempt_count_and_next_attempt_at(
         status="parked",
         attempt_count=3,
         next_attempt_at_offset_seconds=3600,
+        parked_reason="ci_red",
     )
     stale_next_attempt_at = run.next_attempt_at
 
@@ -421,15 +555,21 @@ async def test_requeue_resets_attempt_count_and_next_attempt_at(
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.post(f"/api/v1/runs/{run.id}/requeue", headers=auth_headers)
+        detail = await client.get(f"/api/v1/runs/{run.id}", headers=auth_headers)
 
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "queued"
     assert body["attempt_count"] == 0
+    assert body["parked_reason"] is None
+
+    assert detail.status_code == 200
+    assert detail.json()["parked_reason"] is None
 
     fresh = await db_session.get(Run, run.id, populate_existing=True)
     assert fresh.attempt_count == 0
     assert fresh.next_attempt_at > stale_next_attempt_at
+    assert fresh.parked_reason is None
 
 
 async def test_requeue_only_works_from_parked(db_session, token_file, auth_headers) -> None:
@@ -519,6 +659,59 @@ async def test_onboard_duplicate_slug_is_409(db_session, token_file, auth_header
         )
 
     assert second.status_code == 409
+
+
+async def test_onboard_concurrent_duplicate_is_409_not_500(
+    db_session, migrated_db, token_file, auth_headers
+) -> None:
+    """`onboard_project`'s duplicate `SELECT` runs before four awaited
+    GitHub round trips, so a second onboard of the same slug/repo can commit
+    its own row inside that window: both requests pass the check, and the
+    loser's INSERT violates `projects`' unique constraints. Uncaught, that
+    `IntegrityError` is a 500 on a path whose own docstring promises 409.
+
+    The race is simulated deterministically rather than by timing — the
+    rival row is inserted, and committed, from a second engine at the last
+    GitHub call this request makes, i.e. squarely between the request's own
+    check and its INSERT."""
+    tag = uuid.uuid4().hex[:8]
+    slug, owner, repo = f"race-{tag}", "acme", f"widgets-{tag}"
+    rival_engine = create_async_engine(migrated_db)
+
+    class RacingOps(FakeRepoOps):
+        async def ensure_label(self, name: str, color: str) -> None:
+            await super().ensure_label(name, color)
+            async with rival_engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO projects (slug, github_owner, github_repo) "
+                        "VALUES (:slug, :owner, :repo)"
+                    ),
+                    {"slug": slug, "owner": owner, "repo": repo},
+                )
+
+    ops = RacingOps()
+    admin_ops = FakeAdminOps()
+    app = make_client_app(
+        db_session,
+        token_file=token_file,
+        ops_for=ops_for_factory(ops),
+        admin_ops_for=admin_ops_for_factory(admin_ops),
+    )
+    transport = ASGITransport(app=app)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/api/v1/projects/onboard",
+                json={"slug": slug, "owner": owner, "repo": repo},
+                headers=auth_headers,
+            )
+    finally:
+        await rival_engine.dispose()
+
+    assert resp.status_code == 409
+    # Same body as the sequential duplicate — one race, one answer.
+    assert resp.json() == {"detail": duplicate_project_message(slug, owner, repo)}
 
 
 async def test_onboard_unreachable_installation_is_422(

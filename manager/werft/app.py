@@ -27,6 +27,14 @@ synchronously, from its file mount (SPEC §10: secrets are file mounts,
 never env) — before the app is even constructed, not inside the lifespan —
 because `include_router`'s `dependencies=` is fixed at router-mount time.
 
+The orchestrator's `merging_lock` is published on `app.state` in that same
+GitHub branch: the accept route's inline `advance_merging` kick runs on
+this one event loop, alongside the poller's own `_advance_all_merging`, and
+the two must serialize on the *same* lock instance or the same `merging`
+row reaches two concurrent `squash_merge` calls (`orchestrator/loop.py`
+documents that race in full). `create_app` seeds a placeholder lock for the
+paths where no orchestrator exists at all.
+
 `NtfyAlertSink` (SPEC §9.5) is wired independently of the GitHub branch —
 `app.state.alerts` is a consumer of both the orchestrator and the API
 layer's mutation routes (routes.py's accept endpoint), so its httpx client
@@ -296,6 +304,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             quota=NullQuota(),
             settings=resolved,
         )
+        # The orchestrator's own merging lock, published for the accept
+        # route's inline `advance_merging` kick (api/routes.py). This branch
+        # is the only place an orchestrator exists at all — and it is
+        # exactly the branch that sets `ops_for`, the kick's own guard — so
+        # whenever the kick runs, the poller is running too and the two
+        # genuinely share this instance. The placeholder lock set in
+        # `create_app` below is only ever the one the kick takes when no
+        # orchestrator exists to contend with it.
+        app.state.merging_lock = orchestrator.merging_lock
 
         stop = asyncio.Event()
         task = asyncio.create_task(orchestrator.run(stop))
@@ -323,7 +340,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     await http.aclose()
                     await engine.dispose()
 
-    app = FastAPI(title="werft-manager", lifespan=lifespan)
+    # FastAPI's three default documentation routes are turned off, not
+    # merely left unlinked: they sit outside `/api/v1`, so the bearer
+    # dependency mounted on `api_router` never applies to them, and they
+    # would publish the whole operator surface — every mutation path and
+    # payload shape — to anything that can reach the port without a token.
+    # `/docs` and `/redoc` additionally pull Swagger UI/ReDoc bundles from a
+    # third-party CDN, an outbound fetch this Tailscale-only appliance has
+    # no business making. `app.openapi()` still builds the schema in-process
+    # for anyone who wants it (tests do); it is only the unauthenticated
+    # HTTP surface that is gone.
+    app = FastAPI(
+        title="werft-manager",
+        lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
     # Set before the lifespan ever runs (like `require_token` above) so the
     # operator API's mutation routes have a well-defined GitHub-unconfigured
     # default (`None`/`None`/`NullAlertSink()`) even in tests that override
@@ -335,6 +368,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.ops_for = None
     app.state.admin_ops_for = None
     app.state.alerts = NullAlertSink()
+    # Placeholder for the orchestrator's own lock (the lifespan's GitHub
+    # branch overwrites it with `orchestrator.merging_lock`), so the accept
+    # route's kick always has a lock to take — including in tests that never
+    # enter the lifespan, and on a GitHub-unconfigured boot where no
+    # orchestrator exists and the kick is skipped anyway. Constructing an
+    # `asyncio.Lock` outside a running loop is safe: it binds to a loop on
+    # first acquisition, and this process only ever has one.
+    app.state.merging_lock = asyncio.Lock()
     # Read straight off `resolved` rather than deferred to the lifespan: the
     # artifact-download route (api/routes.py) needs it on every request, and
     # tests that override `get_session` and never enter `lifespan_context`

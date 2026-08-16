@@ -18,6 +18,7 @@ from werft.db.models import Project
 from werft.github.auth import ADMIN_PERMISSIONS, MANAGER_PERMISSIONS, AppAuth, InstallationToken
 from werft.github.client import GitHubUnavailable
 from werft.observe.alerts import NtfyAlertSink, NullAlertSink
+from werft.orchestrator.loop import Orchestrator
 
 
 async def test_healthz_reports_ok() -> None:
@@ -99,6 +100,77 @@ async def test_create_app_with_creds_starts_and_stops_orchestrator_within_five_s
         assert resp.status_code == 200
     finally:
         await asyncio.wait_for(lifespan_cm.__aexit__(None, None, None), timeout=5)
+
+
+async def test_lifespan_publishes_the_orchestrators_own_merging_lock_on_app_state(
+    tmp_path: Path, pg_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`app.state.merging_lock` must be the *same object* as the running
+    `Orchestrator`'s `merging_lock`, not a lock of its own.
+
+    The accept route's inline `advance_merging` kick (api/routes.py) runs in
+    this process, on this event loop, concurrently with the poller's
+    `_advance_all_merging` — two locks would serialize nothing, and the same
+    `merging` row would still reach two concurrent `squash_merge` calls.
+    Captures the instance the lifespan constructs (the same
+    patch-`__init__`-and-record trick the ntfy drain test below uses), since
+    the orchestrator is otherwise lifespan-local and unobservable."""
+    key_file = tmp_path / "app-key.pem"
+    key_file.write_text(_generate_private_key_pem())
+
+    built: list[Orchestrator] = []
+    original_init = Orchestrator.__init__
+
+    def capturing_init(self: Orchestrator, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        built.append(self)
+
+    monkeypatch.setattr(Orchestrator, "__init__", capturing_init)
+
+    settings = Settings(
+        database_url=pg_url,
+        github_app_client_id="Iv1.test1234",
+        github_app_private_key_file=str(key_file),
+        github_api_url="https://github-api.invalid.test",
+    )
+    app = create_app(settings)
+    # Before the lifespan: a placeholder, so the kick always has *a* lock.
+    assert isinstance(app.state.merging_lock, asyncio.Lock)
+
+    lifespan_cm = app.router.lifespan_context(app)
+    await lifespan_cm.__aenter__()
+    try:
+        assert len(built) == 1
+        assert app.state.merging_lock is built[0].merging_lock
+    finally:
+        await asyncio.wait_for(lifespan_cm.__aexit__(None, None, None), timeout=5)
+
+
+async def test_default_docs_routes_are_not_served(tmp_path: Path) -> None:
+    """FastAPI's `/docs`, `/redoc` and `/openapi.json` sit outside `/api/v1`,
+    so the bearer dependency mounted on `api_router` never covers them: left
+    on, they publish the entire operator surface — every mutation path and
+    payload shape — to anything that reaches the port without a token, and
+    the two HTML pages additionally fetch their bundles from a third-party
+    CDN. Turned off at construction, they 404 like any unknown path.
+
+    The schema itself is untouched: `app.openapi()` still builds it
+    in-process, `HTTPBearer` security scheme included (api/auth.py relies on
+    that documentation), which is the distinction being pinned here — the
+    *route* is gone, not the schema."""
+    token_file = tmp_path / "api-token"
+    token_file.write_text("s3cr3t-token")
+    app = create_app(Settings(api_token_file=str(token_file)))
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for path in ("/docs", "/redoc", "/openapi.json"):
+            resp = await client.get(path)
+            assert resp.status_code == 404, path
+
+    schema = app.openapi()
+    assert "HTTPBearer" in schema["components"]["securitySchemes"]
+    assert "/api/v1/runs/{run_id}/review/accept" in schema["paths"]
 
 
 # -- NtfyAlertSink wiring (Task 14) -------------------------------------------

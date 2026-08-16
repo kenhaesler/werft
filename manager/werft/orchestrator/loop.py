@@ -36,13 +36,20 @@ Three independent loops, one process, one `asyncio.TaskGroup` (`run`):
 
 `tick_once` and `poll_checks_once` both drive `_advance_all_merging`, and
 their 15 s/30 s cadences are coprime enough to coincide: a single
-`asyncio.Lock` (`_merging_lock`) held around `_advance_all_merging`'s whole
+`asyncio.Lock` (`merging_lock`) held around `_advance_all_merging`'s whole
 body — discovery query included — serializes the two, so the same
 `merging` row is never handed to two concurrent `squash_merge` calls (the
 GitHub mutation happens before any CAS; a second, unguarded caller could
 double-merge or leave a merged PR recorded as `awaiting_ci`). A second
 scheduler process is out of scope by design (SPEC: one process, one
-scheduler) — this lock only needs to cover this one process's two loops.
+scheduler) — this lock only needs to cover this one process's loops.
+
+The API layer's accept route is the third caller of `advance_merging` in
+this process (its inline post-CAS kick, api/routes.py), and it runs on
+this same event loop — so the lock is deliberately **public**: the
+composition root publishes this exact instance on `app.state.merging_lock`
+and the route takes it around its own kick. A lock the route cannot reach
+is a lock that does not close the race it exists to close.
 
 Session ownership (SPEC §3.3 item 4, "short-lived `advance()` handlers"):
 the orchestrator owns every session. Each unit of work — one project's
@@ -125,7 +132,11 @@ class Orchestrator:
         #: `tick_once` and `poll_checks_once` both call it on independent
         #: cadences that periodically coincide, and only one of them may
         #: ever be mid-`squash_merge` for a given `merging` row at a time.
-        self._merging_lock = asyncio.Lock()
+        #: Public, and published by the composition root on
+        #: `app.state.merging_lock`: the accept route's inline
+        #: `advance_merging` kick runs on this same event loop and must take
+        #: this same instance, or it re-opens the race from the other side.
+        self.merging_lock = asyncio.Lock()
 
     # -- the per-unit session/transaction wrapper ----------------------------
 
@@ -342,7 +353,7 @@ class Orchestrator:
             )
 
     async def _advance_all_merging(self, kind: str, stop: asyncio.Event | None = None) -> None:
-        async with self._merging_lock:
+        async with self.merging_lock:
             async with self._session_factory() as session:
                 rows = (
                     await session.execute(
