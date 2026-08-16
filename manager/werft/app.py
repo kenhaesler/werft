@@ -46,6 +46,8 @@ from uuid import UUID
 import httpx
 import structlog
 from fastapi import Depends, FastAPI
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from werft.api.auth import make_require_token
@@ -340,4 +342,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.artifacts_root = resolved.artifacts_root
     app.include_router(healthz_router)
     app.include_router(api_router, prefix="/api/v1", dependencies=[Depends(require_token)])
+
+    # B7: the built dashboard is served, conditionally, at `/ui` —
+    # `StaticFiles` requires its directory to exist at construction time
+    # (unlike everything else in this function, which is happy to be
+    # configured against a not-yet-real path), so the mount only happens
+    # when `dashboard_dist` names a directory that's actually there. A
+    # manager deployed before the dashboard is built, or with the setting
+    # left unset, still boots — API-only, `/` unmounted (404) — rather than
+    # crashing at startup.
+    if resolved.dashboard_dist and Path(resolved.dashboard_dist).is_dir():
+        app.mount("/ui", StaticFiles(directory=resolved.dashboard_dist, html=True), name="ui")
+
+        @app.get("/")
+        async def _redirect_root_to_ui() -> RedirectResponse:
+            return RedirectResponse(url="/ui/", status_code=307)
+
     return app

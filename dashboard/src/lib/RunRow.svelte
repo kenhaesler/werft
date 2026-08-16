@@ -1,5 +1,6 @@
 <script lang="ts">
-  import type { RunSummary } from './types';
+  import { api, ApiError } from './api';
+  import type { Artifact, ArtifactsResponse, RunSummary } from './types';
 
   interface Props {
     run: RunSummary;
@@ -14,6 +15,29 @@
   const TERMINAL_STATES = new Set(['merged', 'canceled']);
 
   let isTerminal = $derived(TERMINAL_STATES.has(run.status));
+
+  // The artifact listing needs the bearer header (`/api/v1/...` requires
+  // it), so this can't be a plain `<a href>` — that would 401 and, worse,
+  // would mean a token-bearing URL if it ever were made to work (binding
+  // B4/B7 ruling: no tokens in URLs). Fetched on demand via the shared
+  // `api()` helper, which attaches `Authorization` from stored state.
+  let artifacts = $state<Artifact[] | null>(null);
+  let artifactsError = $state<string | null>(null);
+  let artifactsLoading = $state(false);
+
+  async function loadArtifacts(): Promise<void> {
+    artifactsLoading = true;
+    artifactsError = null;
+    try {
+      const response = await api<ArtifactsResponse>(`/runs/${run.id}/artifacts`);
+      artifacts = response.artifacts;
+    } catch (err) {
+      artifacts = null;
+      artifactsError = err instanceof ApiError ? `failed to load (${err.status})` : 'failed to load';
+    } finally {
+      artifactsLoading = false;
+    }
+  }
 </script>
 
 <tr class="run-row">
@@ -33,7 +57,22 @@
     {/if}
   </td>
   <td class="run-row__artifacts">
-    <a href={`/api/v1/runs/${run.id}/artifacts`}>Artifacts</a>
+    <button type="button" onclick={loadArtifacts}>Artifacts</button>
+    {#if artifactsLoading}
+      <span class="run-row__artifacts-status">loading…</span>
+    {:else if artifactsError}
+      <span class="run-row__artifacts-status">{artifactsError}</span>
+    {:else if artifacts}
+      {#if artifacts.length === 0}
+        <span class="run-row__artifacts-status">none</span>
+      {:else}
+        <ul class="run-row__artifacts-list">
+          {#each artifacts as artifact (artifact.path)}
+            <li>{artifact.path} ({artifact.bytes}b)</li>
+          {/each}
+        </ul>
+      {/if}
+    {/if}
   </td>
   <td class="run-row__actions">
     {#if run.status === 'awaiting_review'}

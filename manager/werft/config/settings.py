@@ -43,3 +43,10 @@ class Settings(BaseSettings):
     ntfy_url: str = ""
     ntfy_topic: str = "werft"
     ntfy_token_file: str = ""
+
+    # SPEC §9 operator surface, static-serving half (B7): the built Svelte
+    # dashboard's `dist/` directory. Empty (the default) means "not built /
+    # not deployed yet" — the composition root (app.py) mounts it at `/ui`
+    # only when this names a directory that actually exists at `create_app`
+    # time, so a manager deployed without a built dashboard still boots.
+    dashboard_dist: str = ""
