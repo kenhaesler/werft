@@ -469,7 +469,10 @@ async def get_artifact_file(
     if not stat.S_ISREG(file_stat.st_mode):
         raise HTTPException(status_code=404, detail="artifact not found")
 
-    data = candidate.read_bytes()
+    try:
+        data = candidate.read_bytes()
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="artifact not found") from exc
     filename = PurePosixPath(artifact_path).name
     headers = {
         "X-Content-Type-Options": "nosniff",

@@ -52,7 +52,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from werft.api.routes import _content_disposition_header, get_session
+from werft.api.routes import _artifact_containment_ok, _content_disposition_header, get_session
 from werft.app import create_app
 from werft.config.settings import Settings
 from werft.db.models import Artifact, BacklogItem, Project, Run
@@ -206,23 +206,75 @@ async def test_db_row_present_file_missing_is_404(
     assert resp.status_code == 404
 
 
+# -- file vanishes between the lstat check and the read ----------------------
+
+
+async def test_read_failure_between_lstat_and_read_is_404(
+    db_session, token_file, auth_headers, artifacts_root, monkeypatch
+) -> None:
+    """A file removed or made unreadable in the narrow window between the
+    route's `os.lstat` check and its `read_bytes()` call must still 404,
+    like every other miss on this route — never surface an unhandled
+    `OSError` as an unrelated 500. Monkeypatches `Path.read_bytes` to
+    simulate that race; a portable real-filesystem reproduction of a
+    mid-request unlink isn't available across the platforms this suite
+    runs on."""
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item)
+    await seed_artifact(db_session, run, path="log.jsonl")
+
+    file_path = artifact_file_path(artifacts_root, run, "log.jsonl")
+    file_path.parent.mkdir(parents=True)
+    file_path.write_bytes(b"data")
+
+    def _raise_oserror(self) -> bytes:
+        raise OSError("simulated race: file vanished after lstat")
+
+    monkeypatch.setattr(Path, "read_bytes", _raise_oserror)
+
+    app = make_client_app(db_session, token_file=token_file, artifacts_root=artifacts_root)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(f"/api/v1/runs/{run.id}/artifacts/log.jsonl", headers=auth_headers)
+
+    assert resp.status_code == 404
+
+
 # -- traversal path as a DB row itself ---------------------------------------
 
 
 async def test_traversal_path_row_404s_via_containment(
     db_session, token_file, auth_headers, artifacts_root
 ) -> None:
-    """The artifact row's own `path` is `../../etc/passwd` — inserted
+    """The artifact row's own `path` is `../../secret.txt` — inserted
     directly, bypassing whatever the (currently nonexistent) collector
     would normally validate, exactly as the brief specifies: "a
     `../../etc/passwd`-style path AS A DB ROW". The route's containment
     re-check (`os.path.realpath` against the run's own `artifacts/`
     directory), not any DB-side validation, is what must catch this.
+
+    Mutation-sensitive by construction: `secret.txt` is a *real* file
+    planted just outside `base_dir` (inside `artifacts_root`), and
+    `base_dir` itself is created on disk. Path resolution for
+    `<base_dir>/../../secret.txt` requires the OS to walk into `artifacts/`
+    before backing out of it, so if `base_dir` didn't exist the
+    subsequent `os.lstat` would 404 on ENOENT regardless of whether
+    containment ran — proving nothing about the containment check. With
+    `base_dir` present and `secret.txt` real, the *only* thing standing
+    between this request and a served 200 with `secret.txt`'s bytes is
+    `_artifact_containment_ok`; deleting that check makes this test fail
+    (see the fix report's mutation-testing evidence).
     """
     project = await seed_project(db_session)
     item = await seed_backlog_item(db_session, project, 1)
     run = await seed_run(db_session, project, item)
-    await seed_artifact(db_session, run, path="../../etc/passwd")
+    await seed_artifact(db_session, run, path="../../secret.txt")
+
+    secret = Path(artifacts_root) / "secret.txt"  # outside base_dir, inside artifacts_root
+    secret.write_bytes(b"TOP SECRET")
+    base_dir = artifact_file_path(artifacts_root, run, "")
+    base_dir.mkdir(parents=True)
 
     app = make_client_app(db_session, token_file=token_file, artifacts_root=artifacts_root)
     transport = ASGITransport(app=app)
@@ -230,11 +282,36 @@ async def test_traversal_path_row_404s_via_containment(
         # See module docstring: percent-encoded so httpx's client-side URL
         # normalization doesn't collapse the dot-segments before sending.
         resp = await client.get(
-            f"/api/v1/runs/{run.id}/artifacts/%2e%2e%2f%2e%2e%2fetc%2Fpasswd",
+            f"/api/v1/runs/{run.id}/artifacts/%2e%2e%2f%2e%2e%2fsecret.txt",
             headers=auth_headers,
         )
 
     assert resp.status_code == 404
+
+
+def test_artifact_containment_ok_rejects_escapes_and_allows_nested(tmp_path) -> None:
+    """Direct unit coverage of `_artifact_containment_ok` (SPEC §8's
+    containment control) — the mutation-sensitive integration test above
+    only pins one escape shape end to end; this pins the function itself
+    against every shape the implementer's self-review claimed to have
+    checked by hand."""
+    base_dir = tmp_path / "run-id" / "artifacts"
+    base_dir.mkdir(parents=True)
+
+    assert _artifact_containment_ok(base_dir, base_dir / "../../etc/passwd") is False
+    assert _artifact_containment_ok(base_dir, base_dir / "/etc/passwd") is False
+    assert _artifact_containment_ok(base_dir, base_dir / "normal/nested/file.txt") is True
+
+    if os.name == "nt":
+        # Windows drive-absolute escape only means anything on a platform
+        # where `\` is a path separator and `C:` is a recognized drive —
+        # `PurePosixPath.__truediv__` treats the same literal string as one
+        # (odd but genuinely contained) relative filename, so asserting
+        # rejection here would fail on Linux CI for the wrong reason.
+        assert (
+            _artifact_containment_ok(base_dir, base_dir / "C:\\Windows\\System32\\config\\SAM")
+            is False
+        )
 
 
 # -- symlink at the resolved artifact path -----------------------------------
@@ -334,7 +411,13 @@ async def test_hostile_filename_full_response_is_octet_stream_with_nosniff(
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "application/octet-stream"
     assert resp.headers["x-content-type-options"] == "nosniff"
-    assert resp.headers["content-disposition"] == _content_disposition_header(hostile_name)
+    # Literal expected string, not `_content_disposition_header(hostile_name)` —
+    # comparing against the same function that produced the header would pass
+    # even if the sanitizer regressed, since both sides would change together.
+    assert (
+        resp.headers["content-disposition"] == 'attachment; filename="caf-&amp;-report.html"; '
+        "filename*=UTF-8''caf%C3%A9-%26amp%3B-report.html"
+    )
 
 
 # -- auth wiring reaches the new route too -----------------------------------
