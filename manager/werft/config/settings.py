@@ -21,3 +21,32 @@ class Settings(BaseSettings):
     tick_seconds: int = 15
     issue_poll_seconds: int = 60
     check_poll_seconds: int = 30
+
+    # Operator API auth (SPEC §9: "Static bearer token, Tailscale-only, TLS
+    # via `tailscale cert`"). The ro-mounted file holding the static bearer
+    # token (SPEC §10: secrets are file mounts, never env). Empty default
+    # means "not configured" — `werft/api/auth.py` fails closed (403) rather
+    # than treating an unmounted secret as "auth disabled".
+    api_token_file: str = ""
+
+    # SPEC §8: artifact metadata lives in the DB, bytes on disk under
+    # `{artifacts_root}/{run_id}/artifacts/` — the root the collector writes
+    # to and `werft/api/routes.py`'s artifact-download route reads from.
+    artifacts_root: str = "/srv/werft/runs"
+
+    # Alerts (SPEC §9.5): `NtfyAlertSink`'s publish target. An empty
+    # `ntfy_url` means "not configured" — the composition root (app.py)
+    # keeps `NullAlertSink` until it's set. The ro-mounted file holding the
+    # ntfy access token (SPEC §10: secrets are file mounts, never env);
+    # empty/missing means "no Authorization header" (a private topic on a
+    # self-hosted ntfy instance may not require one).
+    ntfy_url: str = ""
+    ntfy_topic: str = "werft"
+    ntfy_token_file: str = ""
+
+    # SPEC §9 operator surface, static-serving half (B7): the built Svelte
+    # dashboard's `dist/` directory. Empty (the default) means "not built /
+    # not deployed yet" — the composition root (app.py) mounts it at `/ui`
+    # only when this names a directory that actually exists at `create_app`
+    # time, so a manager deployed without a built dashboard still boots.
+    dashboard_dist: str = ""

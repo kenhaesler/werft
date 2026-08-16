@@ -2,6 +2,7 @@ import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -16,6 +17,8 @@ from werft.config.settings import Settings
 from werft.db.models import Project
 from werft.github.auth import ADMIN_PERMISSIONS, MANAGER_PERMISSIONS, AppAuth, InstallationToken
 from werft.github.client import GitHubUnavailable
+from werft.observe.alerts import NtfyAlertSink, NullAlertSink
+from werft.orchestrator.loop import Orchestrator
 
 
 async def test_healthz_reports_ok() -> None:
@@ -30,9 +33,14 @@ async def test_healthz_reports_ok() -> None:
 async def test_create_app_without_creds_boots_clean_and_healthz_still_answers() -> None:
     """The composition root's own contract: no GitHub App creds configured
     (the default `Settings()`, as in tests/dev) means the lifespan never
-    even tries to build an engine/httpx client/orchestrator — just
-    `/healthz`, entered through the real lifespan context (not a bare
-    `ASGITransport`, which never runs lifespan at all)."""
+    builds an httpx client or starts the orchestrator. The DB engine and
+    session factory are still built unconditionally — the API layer
+    (`/api/v1/runs`) needs `app.state.session_factory` regardless of GitHub
+    config, and `create_async_engine` is lazy (no connection opens until a
+    route actually issues a query), so an unconnected engine costs nothing
+    at boot on this path. `/healthz` is entered through the real lifespan
+    context (not a bare `ASGITransport`, which never runs lifespan at
+    all)."""
     app = create_app(Settings())
     transport = httpx.ASGITransport(app=app)
 
@@ -92,6 +100,159 @@ async def test_create_app_with_creds_starts_and_stops_orchestrator_within_five_s
         assert resp.status_code == 200
     finally:
         await asyncio.wait_for(lifespan_cm.__aexit__(None, None, None), timeout=5)
+
+
+async def test_lifespan_publishes_the_orchestrators_own_merging_lock_on_app_state(
+    tmp_path: Path, pg_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`app.state.merging_lock` must be the *same object* as the running
+    `Orchestrator`'s `merging_lock`, not a lock of its own.
+
+    The accept route's inline `advance_merging` kick (api/routes.py) runs in
+    this process, on this event loop, concurrently with the poller's
+    `_advance_all_merging` — two locks would serialize nothing, and the same
+    `merging` row would still reach two concurrent `squash_merge` calls.
+    Captures the instance the lifespan constructs (the same
+    patch-`__init__`-and-record trick the ntfy drain test below uses), since
+    the orchestrator is otherwise lifespan-local and unobservable."""
+    key_file = tmp_path / "app-key.pem"
+    key_file.write_text(_generate_private_key_pem())
+
+    built: list[Orchestrator] = []
+    original_init = Orchestrator.__init__
+
+    def capturing_init(self: Orchestrator, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        built.append(self)
+
+    monkeypatch.setattr(Orchestrator, "__init__", capturing_init)
+
+    settings = Settings(
+        database_url=pg_url,
+        github_app_client_id="Iv1.test1234",
+        github_app_private_key_file=str(key_file),
+        github_api_url="https://github-api.invalid.test",
+    )
+    app = create_app(settings)
+    # Before the lifespan: a placeholder, so the kick always has *a* lock.
+    assert isinstance(app.state.merging_lock, asyncio.Lock)
+
+    lifespan_cm = app.router.lifespan_context(app)
+    await lifespan_cm.__aenter__()
+    try:
+        assert len(built) == 1
+        assert app.state.merging_lock is built[0].merging_lock
+    finally:
+        await asyncio.wait_for(lifespan_cm.__aexit__(None, None, None), timeout=5)
+
+
+async def test_default_docs_routes_are_not_served(tmp_path: Path) -> None:
+    """FastAPI's `/docs`, `/redoc` and `/openapi.json` sit outside `/api/v1`,
+    so the bearer dependency mounted on `api_router` never covers them: left
+    on, they publish the entire operator surface — every mutation path and
+    payload shape — to anything that reaches the port without a token, and
+    the two HTML pages additionally fetch their bundles from a third-party
+    CDN. Turned off at construction, they 404 like any unknown path.
+
+    The schema itself is untouched: `app.openapi()` still builds it
+    in-process, `HTTPBearer` security scheme included (api/auth.py relies on
+    that documentation), which is the distinction being pinned here — the
+    *route* is gone, not the schema."""
+    token_file = tmp_path / "api-token"
+    token_file.write_text("s3cr3t-token")
+    app = create_app(Settings(api_token_file=str(token_file)))
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for path in ("/docs", "/redoc", "/openapi.json"):
+            resp = await client.get(path)
+            assert resp.status_code == 404, path
+
+    schema = app.openapi()
+    assert "HTTPBearer" in schema["components"]["securitySchemes"]
+    assert "/api/v1/runs/{run_id}/review/accept" in schema["paths"]
+
+
+# -- NtfyAlertSink wiring (Task 14) -------------------------------------------
+
+
+async def test_create_app_without_ntfy_url_keeps_null_alert_sink() -> None:
+    """`Settings.ntfy_url` empty (the default) means the composition root
+    never touches ntfy — `app.state.alerts` stays the `NullAlertSink` set
+    at construction time, before *and* during the lifespan."""
+    app = create_app(Settings())
+    assert isinstance(app.state.alerts, NullAlertSink)
+
+    async with app.router.lifespan_context(app):
+        assert isinstance(app.state.alerts, NullAlertSink)
+
+
+async def test_lifespan_wires_ntfy_alert_sink_when_ntfy_url_configured() -> None:
+    """`Settings.ntfy_url` configured swaps `app.state.alerts` for a real
+    `NtfyAlertSink` on lifespan entry, and shutdown (`drain()` +
+    `aclose()`) completes clean even with nothing ever sent — the wiring
+    itself must not require a live ntfy server to boot or shut down."""
+    settings = Settings(ntfy_url="https://ntfy.invalid.test", ntfy_topic="werft-test")
+    app = create_app(settings)
+
+    async with app.router.lifespan_context(app):
+        assert isinstance(app.state.alerts, NtfyAlertSink)
+
+
+async def test_lifespan_with_github_and_ntfy_still_closes_resources_when_drain_hangs(
+    tmp_path: Path, pg_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for review finding 1, exercised in the branch it actually
+    bites: **both** GitHub creds and `ntfy_url` configured (unlike the two
+    tests above, which each configure only one). A `drain()` that never
+    returns — standing in for an unreachable/very slow ntfy host — must not
+    prevent `ntfy_http.aclose()`, the GitHub `http.aclose()`, or
+    `engine.dispose()` from running: `_drain_ntfy_bounded` (app.py) bounds
+    the drain and the surrounding `finally` runs cleanup regardless.
+
+    Patches `NtfyAlertSink.__init__` to capture the actual `httpx.AsyncClient`
+    app.py builds for it (not observable through `app.state`, which only
+    exposes the sink, not its client) and `NtfyAlertSink.drain` to hang
+    forever. The outer `wait_for(..., timeout=5)` is the same load-bearing
+    pattern `test_create_app_with_creds_starts_and_stops_orchestrator_within_five_seconds`
+    already uses — it fails the test on its own if shutdown doesn't
+    complete in time, which is exactly what an unfixed, unbounded
+    `await drain()` would do."""
+    key_file = tmp_path / "app-key.pem"
+    key_file.write_text(_generate_private_key_pem())
+
+    captured_http: list[httpx.AsyncClient] = []
+    original_init = NtfyAlertSink.__init__
+
+    def capturing_init(self: NtfyAlertSink, http: httpx.AsyncClient, **kwargs: Any) -> None:
+        captured_http.append(http)
+        original_init(self, http, **kwargs)
+
+    async def hanging_drain(self: NtfyAlertSink) -> None:
+        await asyncio.Event().wait()  # never set; simulates an unreachable host
+
+    monkeypatch.setattr(NtfyAlertSink, "__init__", capturing_init)
+    monkeypatch.setattr(NtfyAlertSink, "drain", hanging_drain)
+
+    settings = Settings(
+        database_url=pg_url,
+        github_app_client_id="Iv1.test1234",
+        github_app_private_key_file=str(key_file),
+        github_api_url="https://github-api.invalid.test",
+        ntfy_url="https://ntfy.invalid.test",
+        ntfy_topic="werft-test",
+    )
+    app = create_app(settings)
+    lifespan_cm = app.router.lifespan_context(app)
+
+    await lifespan_cm.__aenter__()
+    assert len(captured_http) == 1
+    ntfy_http = captured_http[0]
+    assert not ntfy_http.is_closed
+
+    await asyncio.wait_for(lifespan_cm.__aexit__(None, None, None), timeout=5)
+
+    assert ntfy_http.is_closed
 
 
 # -- _ops_factory: ETag-cache-preserving memoization (fix 1) ------------------

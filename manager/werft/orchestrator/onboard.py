@@ -30,8 +30,16 @@ Idempotent by construction on the GitHub side (`ensure_branch`/
 `werft/github/ops.py`), but not on Werft's own side: a duplicate `slug` or
 `(owner, repo)` is checked, by a plain `SELECT`, before any GitHub call is
 made at all — so a re-onboard attempt against an already-onboarded project
-costs zero GitHub round trips — and raises `PermanentError`; the future
-onboarding API endpoint maps that to a 409.
+costs zero GitHub round trips — and raises `PermanentError`; the onboarding
+API endpoint maps that to a 409.
+
+That `SELECT` is a fast path, not a guarantee: it is unsynchronized and
+sits before several awaited GitHub round trips, so two concurrent onboards
+of the same slug/repo both pass it and the loser is caught by the
+`projects` unique constraints instead, as an `IntegrityError` out of the
+INSERT below. The endpoint answers both the same way (see
+`duplicate_project_message`) — the DB constraints, not this check, are what
+actually keeps the row unique.
 """
 
 from sqlalchemy import and_, func, insert, or_, select
@@ -46,6 +54,19 @@ from werft.github.ops import READY_LABEL, RepoOps
 #: (`list_ready_issues`) and the remover (`merge_flow._land_merged`) — SPEC
 #: §6.3's onboarding step, verbatim.
 _READY_LABEL_COLOR = "0e8a16"
+
+
+def duplicate_project_message(slug: str, owner: str, repo: str) -> str:
+    """The one wording for "this repo is already onboarded".
+
+    Shared with the API layer: the duplicate `SELECT` below catches the
+    sequential case and raises it as a `PermanentError`, but a *concurrent*
+    onboard slips past that check (it is an unsynchronized read taken before
+    several awaited GitHub round trips) and only fails at the `projects`
+    unique constraints. The endpoint turns that `IntegrityError` into the
+    same 409 with the same body — one race, one answer, whichever way it is
+    detected."""
+    return f"project already onboarded: slug={slug!r} owner={owner!r} repo={repo!r}"
 
 
 async def onboard_project(
@@ -73,9 +94,7 @@ async def onboard_project(
         )
     )
     if duplicate.scalar_one_or_none() is not None:
-        raise PermanentError(
-            f"project already onboarded: slug={slug!r} owner={owner!r} repo={repo!r}"
-        )
+        raise PermanentError(duplicate_project_message(slug, owner, repo))
 
     main_sha = await ops.get_ref_sha(main_branch)
     if main_sha is None:

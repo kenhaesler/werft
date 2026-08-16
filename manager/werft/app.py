@@ -1,20 +1,47 @@
 """Composition root (SPEC §1 layering: the only module allowed to import
 from every layer below it).
 
-Lifespan wiring: the GitHub-backed orchestrator only starts when a GitHub
-App client id is configured (`Settings.github_app_client_id`) — tests and
-local dev boot clean, healthz-only, with no engine, no httpx client, and no
-GitHub call ever made. When creds are present, the lifespan reads the
-App's private key file, builds one engine, one `httpx.AsyncClient`, one
-`AppAuth`, a manager-permission `RepoOps` factory (`MANAGER_PERMISSIONS`)
-for day-to-day polling, and an admin-permission `TransientAdminOps` factory
-for the one branch-protection call onboarding/the doctrine-#1 flip need
-(SPEC §6.3) — then starts `Orchestrator.run` as a background task. Shutdown
-sets the stop event and awaits that task before disposing the engine/http
-client — both run unconditionally even if awaiting the task itself raises
-(an `ExceptionGroup` from a crashed loop must still leave a clean
-teardown) — so a clean SIGTERM/lifespan-exit drains every in-flight unit
-of work first.
+Lifespan wiring: the lifespan always builds one DB engine and one
+`async_sessionmaker`, stashed on `app.state.session_factory` — the API
+layer's `get_session` dependency (SPEC §9 operator surface) needs it
+regardless of GitHub configuration, and `create_async_engine` is lazy (no
+connection is opened until a route actually issues a query), so this costs
+nothing when nothing queries it. The GitHub-backed orchestrator, on the
+other hand, only starts when a GitHub App client id is configured
+(`Settings.github_app_client_id`) — tests and local dev boot clean,
+healthz-and-API-only, with no httpx client and no GitHub call ever made.
+When creds are present, the lifespan reads the App's private key file,
+builds one `httpx.AsyncClient`, one `AppAuth`, a manager-permission
+`RepoOps` factory (`MANAGER_PERMISSIONS`) for day-to-day polling, and an
+admin-permission `TransientAdminOps` factory for the one branch-protection
+call onboarding/the doctrine-#1 flip need (SPEC §6.3) — then starts
+`Orchestrator.run` as a background task. Shutdown sets the stop event and
+awaits that task before disposing the engine/http client — both run
+unconditionally even if awaiting the task itself raises (an
+`ExceptionGroup` from a crashed loop must still leave a clean teardown) —
+so a clean SIGTERM/lifespan-exit drains every in-flight unit of work
+first.
+
+The static bearer token guarding `/api/v1` (SPEC §9) is read once here,
+synchronously, from its file mount (SPEC §10: secrets are file mounts,
+never env) — before the app is even constructed, not inside the lifespan —
+because `include_router`'s `dependencies=` is fixed at router-mount time.
+
+The orchestrator's `merging_lock` is published on `app.state` in that same
+GitHub branch: the accept route's inline `advance_merging` kick runs on
+this one event loop, alongside the poller's own `_advance_all_merging`, and
+the two must serialize on the *same* lock instance or the same `merging`
+row reaches two concurrent `squash_merge` calls (`orchestrator/loop.py`
+documents that race in full). `create_app` seeds a placeholder lock for the
+paths where no orchestrator exists at all.
+
+`NtfyAlertSink` (SPEC §9.5) is wired independently of the GitHub branch —
+`app.state.alerts` is a consumer of both the orchestrator and the API
+layer's mutation routes (routes.py's accept endpoint), so its httpx client
+is built and torn down in the lifespan regardless of whether GitHub creds
+are configured, with `Settings.ntfy_url` empty meaning "keep the
+`NullAlertSink` default". Shutdown calls `drain()` before closing that
+client — the same bounded-teardown discipline as the GitHub httpx client.
 """
 
 import asyncio
@@ -25,19 +52,50 @@ from typing import Any
 from uuid import UUID
 
 import httpx
-from fastapi import FastAPI
+import structlog
+from fastapi import Depends, FastAPI
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from werft.api.routes import router
+from werft.api.auth import make_require_token
+from werft.api.routes import api_router, healthz_router
 from werft.config.settings import Settings
 from werft.db.engine import create_engine_from_url
 from werft.db.models import Project
 from werft.github.auth import ADMIN_PERMISSIONS, MANAGER_PERMISSIONS, AppAuth
 from werft.github.client import GitHubClient
 from werft.github.ops import RepoOps
-from werft.observe.alerts import NullAlertSink
+from werft.observe.alerts import NtfyAlertSink, NullAlertSink
 from werft.orchestrator.finalize import NullQuota
 from werft.orchestrator.loop import Orchestrator
+
+logger = structlog.get_logger(__name__)
+
+#: Cap on `NtfyAlertSink.drain()` at shutdown. `NtfyAlertSink.drain()`
+#: already never raises from an individual spawned task's own exception
+#: (alerts.py: `gather(..., return_exceptions=True)`) — this instead bounds
+#: the one failure mode that isn't a task exception at all: a slow or
+#: unreachable ntfy host simply taking too long. Comfortably inside the 5 s
+#: whole-lifespan-exit budget `test_app.py` pins, leaving headroom for the
+#: orchestrator task join, `http.aclose()`, and `engine.dispose()` that run
+#: after it in the same teardown.
+_NTFY_DRAIN_TIMEOUT = 2.0
+
+
+async def _drain_ntfy_bounded(alerts: NtfyAlertSink) -> None:
+    """`await alerts.drain()`, but never let it run past `_NTFY_DRAIN_TIMEOUT`
+    — the caller's `finally` (aclose/dispose) must run either way, so a
+    timeout here is logged and swallowed rather than left to propagate and
+    skip that cleanup. A genuine external cancellation of the *caller* (not
+    one this function's own timeout triggered) is not swallowed — it still
+    propagates after the caller's `finally` runs, exactly like the
+    orchestrator task join a few lines below in `lifespan` already treats
+    its own exceptions."""
+    try:
+        await asyncio.wait_for(alerts.drain(), timeout=_NTFY_DRAIN_TIMEOUT)
+    except TimeoutError:
+        logger.warning("ntfy.drain_timed_out", timeout=_NTFY_DRAIN_TIMEOUT)
 
 
 def _ops_factory(
@@ -169,20 +227,61 @@ def _admin_ops_factory(
     return build
 
 
+def _read_token_file(path: str) -> str | None:
+    """Read a secret token once, at startup, from its file mount (SPEC §10:
+    secrets are file mounts, never env). An empty path or a path that
+    doesn't resolve to a file both mean "not configured" (`None`) —
+    callers decide what that means: `make_require_token` fails closed on
+    `None` rather than treating a missing mount as "auth disabled";
+    `NtfyAlertSink` just omits the `Authorization` header."""
+    if not path:
+        return None
+    token_path = Path(path)
+    if not token_path.is_file():
+        return None
+    return token_path.read_text().strip()
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings or Settings()
+    require_token = make_require_token(_read_token_file(resolved.api_token_file))
+    ntfy_token = _read_token_file(resolved.ntfy_token_file)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        engine = create_engine_from_url(resolved.database_url)
+        app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+        # `NtfyAlertSink` is independent of GitHub config — the API layer's
+        # accept route (routes.py) fires `alerts.run_parked` even when no
+        # orchestrator is running — so its httpx client is owned here,
+        # before the GitHub branch, and closed in both branches below.
+        ntfy_http: httpx.AsyncClient | None = None
+        if resolved.ntfy_url:
+            ntfy_http = httpx.AsyncClient()
+            app.state.alerts = NtfyAlertSink(
+                ntfy_http, url=resolved.ntfy_url, topic=resolved.ntfy_topic, token=ntfy_token
+            )
+
         if not resolved.github_app_client_id:
-            # No GitHub App configured: tests/dev boot clean, healthz-only —
-            # no engine, no httpx client, no orchestrator, no GitHub call.
-            yield
+            # No GitHub App configured: the orchestrator never starts — no
+            # GitHub httpx client, no GitHub call — but the API layer still
+            # needs a session factory to serve /api/v1/runs. The engine
+            # above is a lazy connection pool, so building it here opens no
+            # connection until a route actually issues a query.
+            try:
+                yield
+            finally:
+                try:
+                    if ntfy_http is not None:
+                        await _drain_ntfy_bounded(app.state.alerts)
+                finally:
+                    if ntfy_http is not None:
+                        await ntfy_http.aclose()
+                    await engine.dispose()
             return
 
         private_key_pem = Path(resolved.github_app_private_key_file).read_text()
-        engine = create_engine_from_url(resolved.database_url)
-        session_factory = async_sessionmaker(engine, expire_on_commit=False)
         http = httpx.AsyncClient()
         auth = AppAuth(
             http,
@@ -190,14 +289,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             private_key_pem=private_key_pem,
             api_url=resolved.github_api_url,
         )
+        # The same two factories the orchestrator's poll loop uses are also
+        # what the operator API's mutation routes need (onboard, manual
+        # flip, accept's best-effort inline `advance_merging`) — one
+        # composition root, one set of factories, published on `app.state`
+        # rather than each route minting its own `GitHubClient`/`AppAuth`.
+        app.state.ops_for = _ops_factory(auth, http, resolved.github_api_url, MANAGER_PERMISSIONS)
+        app.state.admin_ops_for = _admin_ops_factory(auth, http, resolved.github_api_url)
         orchestrator = Orchestrator(
-            session_factory,
-            _ops_factory(auth, http, resolved.github_api_url, MANAGER_PERMISSIONS),
-            _admin_ops_factory(auth, http, resolved.github_api_url),
-            alerts=NullAlertSink(),
+            app.state.session_factory,
+            app.state.ops_for,
+            app.state.admin_ops_for,
+            alerts=app.state.alerts,
             quota=NullQuota(),
             settings=resolved,
         )
+        # The orchestrator's own merging lock, published for the accept
+        # route's inline `advance_merging` kick (api/routes.py). This branch
+        # is the only place an orchestrator exists at all — and it is
+        # exactly the branch that sets `ops_for`, the kick's own guard — so
+        # whenever the kick runs, the poller is running too and the two
+        # genuinely share this instance. The placeholder lock set in
+        # `create_app` below is only ever the one the kick takes when no
+        # orchestrator exists to contend with it.
+        app.state.merging_lock = orchestrator.merging_lock
 
         stop = asyncio.Event()
         task = asyncio.create_task(orchestrator.run(stop))
@@ -211,10 +326,77 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # Always run, even if awaiting the orchestrator's task itself
                 # raised (e.g. an ExceptionGroup surfacing out of a crashed
                 # loop) — a teardown that skips these on that path leaks the
-                # httpx client's connections and the engine's pool.
-                await http.aclose()
-                await engine.dispose()
+                # httpx client's connections and the engine's pool. Same
+                # discipline for the ntfy drain, nested one level further:
+                # `_drain_ntfy_bounded` is itself bounded (never blocks past
+                # `_NTFY_DRAIN_TIMEOUT`), and this `finally` guarantees
+                # aclose()/dispose() run even on the timeout it swallows.
+                try:
+                    if ntfy_http is not None:
+                        await _drain_ntfy_bounded(app.state.alerts)
+                finally:
+                    if ntfy_http is not None:
+                        await ntfy_http.aclose()
+                    await http.aclose()
+                    await engine.dispose()
 
-    app = FastAPI(title="werft-manager", lifespan=lifespan)
-    app.include_router(router)
+    # FastAPI's three default documentation routes are turned off, not
+    # merely left unlinked: they sit outside `/api/v1`, so the bearer
+    # dependency mounted on `api_router` never applies to them, and they
+    # would publish the whole operator surface — every mutation path and
+    # payload shape — to anything that can reach the port without a token.
+    # `/docs` and `/redoc` additionally pull Swagger UI/ReDoc bundles from a
+    # third-party CDN, an outbound fetch this Tailscale-only appliance has
+    # no business making. `app.openapi()` still builds the schema in-process
+    # for anyone who wants it (tests do); it is only the unauthenticated
+    # HTTP surface that is gone.
+    app = FastAPI(
+        title="werft-manager",
+        lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    # Set before the lifespan ever runs (like `require_token` above) so the
+    # operator API's mutation routes have a well-defined GitHub-unconfigured
+    # default (`None`/`None`/`NullAlertSink()`) even in tests that override
+    # `get_session` and never enter `lifespan_context` at all. When GitHub
+    # creds are configured, the lifespan overwrites `ops_for`/`admin_ops_for`
+    # with the real factories; `alerts` is deliberately the same instance the
+    # orchestrator itself uses — the lifespan swaps it for `NtfyAlertSink`,
+    # once, for both consumers, when `ntfy_url` is configured.
+    app.state.ops_for = None
+    app.state.admin_ops_for = None
+    app.state.alerts = NullAlertSink()
+    # Placeholder for the orchestrator's own lock (the lifespan's GitHub
+    # branch overwrites it with `orchestrator.merging_lock`), so the accept
+    # route's kick always has a lock to take — including in tests that never
+    # enter the lifespan, and on a GitHub-unconfigured boot where no
+    # orchestrator exists and the kick is skipped anyway. Constructing an
+    # `asyncio.Lock` outside a running loop is safe: it binds to a loop on
+    # first acquisition, and this process only ever has one.
+    app.state.merging_lock = asyncio.Lock()
+    # Read straight off `resolved` rather than deferred to the lifespan: the
+    # artifact-download route (api/routes.py) needs it on every request, and
+    # tests that override `get_session` and never enter `lifespan_context`
+    # (test_api_runs.py's style) still need a well-defined value.
+    app.state.artifacts_root = resolved.artifacts_root
+    app.include_router(healthz_router)
+    app.include_router(api_router, prefix="/api/v1", dependencies=[Depends(require_token)])
+
+    # B7: the built dashboard is served, conditionally, at `/ui` —
+    # `StaticFiles` requires its directory to exist at construction time
+    # (unlike everything else in this function, which is happy to be
+    # configured against a not-yet-real path), so the mount only happens
+    # when `dashboard_dist` names a directory that's actually there. A
+    # manager deployed before the dashboard is built, or with the setting
+    # left unset, still boots — API-only, `/` unmounted (404) — rather than
+    # crashing at startup.
+    if resolved.dashboard_dist and Path(resolved.dashboard_dist).is_dir():
+        app.mount("/ui", StaticFiles(directory=resolved.dashboard_dist, html=True), name="ui")
+
+        @app.get("/")
+        async def _redirect_root_to_ui() -> RedirectResponse:
+            return RedirectResponse(url="/ui/", status_code=307)
+
     return app
