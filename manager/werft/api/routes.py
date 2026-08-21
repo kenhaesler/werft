@@ -647,10 +647,13 @@ async def accept_review(
 
     Winning the lock second is the other half of that contract, and it is
     why the re-read is followed by a status guard rather than used as-is.
-    `advance_merging` has no status check of its own — the poller's guard is
-    its `WHERE status = 'merging'` discovery query, taken *inside* the lock,
-    and this is that query's equivalent. A sweep that held the lock first
-    may already have landed the merge (`merging -> merged`, with the real
+    `advance_merging` now guards its own entry on `status == 'merging'`
+    (`merge_flow.py`), so this re-read is defence in depth rather than the only
+    thing standing between a rival sweep and a clobbered `merge_commit_sha`.
+    It stays because it also saves the GitHub round trip the guard would
+    otherwise pay for, and because the re-read is what makes the CAS inside
+    `advance_merging` see this row's current version at all. A sweep that
+    held the lock first may already have landed the merge (`merging -> merged`, with the real
     `merge_commit_sha`): re-driving the decision table on that row reads a
     now-`merged` PR, takes the merged-out-of-band branch, and CASes
     `merged -> merged` with `merge_commit_sha=None` — which *wins*, because
