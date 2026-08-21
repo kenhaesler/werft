@@ -16,6 +16,7 @@ import os
 import re
 import stat
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from urllib.parse import quote
@@ -47,7 +48,6 @@ from werft.db.models import (
     BacklogItem,
     Project,
     ProviderAccount,
-    QuotaLedgerEntry,
     Run,
     RunAttempt,
     RunEvent,
@@ -64,6 +64,7 @@ from werft.orchestrator.onboard import (
     is_duplicate_project_violation,
     onboard_project,
 )
+from werft.quota.window import consumed_subq, reserved_subq
 
 logger = structlog.get_logger(__name__)
 
@@ -516,36 +517,18 @@ async def get_quota(
     "how much of my window am I about to spend" reading) is a possible
     refinement left to T7, which owns the reservation lifecycle end to
     end; this endpoint only reads what's already in the ledger.
+
+    The expressions themselves now live in `werft/quota/window.py`, shared
+    verbatim with admission (SPEC §7), so displayed headroom is enforced
+    headroom.
     """
-    # `make_interval`'s positional signature is (years, months, weeks, days,
-    # hours, mins, secs); zeros fill the leading params so the fifth
-    # position lands on `rolling_window_hours`, matching
-    # `test_api_runs.py`'s own `make_interval(secs => :offset)` seeding
-    # idiom one column over.
-    window_floor = func.now() - func.make_interval(0, 0, 0, 0, ProviderAccount.rolling_window_hours)
-
-    consumed_subq = (
-        select(func.coalesce(func.sum(QuotaLedgerEntry.actual_wallclock_s), 0))
-        .where(QuotaLedgerEntry.provider_account_id == ProviderAccount.id)
-        .where(QuotaLedgerEntry.actual_wallclock_s.is_not(None))
-        .where(QuotaLedgerEntry.consumed_at > window_floor)
-        .correlate(ProviderAccount)
-        .scalar_subquery()
-    )
-    reserved_subq = (
-        select(func.coalesce(func.sum(QuotaLedgerEntry.reserved_wallclock_s), 0))
-        .where(QuotaLedgerEntry.provider_account_id == ProviderAccount.id)
-        .where(QuotaLedgerEntry.actual_wallclock_s.is_(None))
-        .correlate(ProviderAccount)
-        .scalar_subquery()
-    )
-
+    now = datetime.now(UTC)
     stmt = select(
         ProviderAccount.provider,
         ProviderAccount.label,
         ProviderAccount.ceiling_seconds,
-        consumed_subq.label("consumed_seconds"),
-        reserved_subq.label("reserved_seconds"),
+        consumed_subq(now).label("consumed_seconds"),
+        reserved_subq().label("reserved_seconds"),
         ProviderAccount.exhausted_until,
         ProviderAccount.exhausted_source,
         ProviderAccount.last_reading_utilization,
