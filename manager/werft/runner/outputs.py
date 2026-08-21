@@ -64,3 +64,40 @@ def read_result(outputs_dir: str) -> OutputsRead:
         return OutputsRead(RunResult.model_validate(payload), None)
     except ValidationError:
         return OutputsRead(None, "schema")
+
+
+#: The transcript is agent-written and unbounded; the result envelope is its
+#: last line. An unbounded read here is a denial of service the manager would
+#: perform on itself.
+LOG_TAIL_MAX_BYTES = 4 * 1024 * 1024
+
+
+def read_log_tail(outputs_dir: str, *, max_bytes: int = LOG_TAIL_MAX_BYTES) -> list[str]:
+    """The last `max_bytes` of `log.jsonl`, whole lines only.
+
+    Same defensive discipline as `read_result`: `lstat` + `S_ISREG` +
+    `O_NOFOLLOW`, never an exception on hostile content. The first line of the
+    window is dropped when a seek actually happened — it is almost certainly a
+    fragment, and `parse_stream` would skip it anyway; dropping it here means
+    no caller ever has to reason about a half-line.
+    """
+    path = os.path.join(outputs_dir, LOG_FILENAME)
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return []
+    if not stat.S_ISREG(info.st_mode):
+        return []
+
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return []
+    with os.fdopen(fd, "rb") as handle:
+        if info.st_size > max_bytes:
+            handle.seek(info.st_size - max_bytes)
+            raw = handle.read()
+            raw = raw.split(b"\n", 1)[1] if b"\n" in raw else b""
+        else:
+            raw = handle.read()
+    return raw.decode("utf-8", errors="replace").splitlines()
