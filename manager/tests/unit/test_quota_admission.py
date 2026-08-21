@@ -115,6 +115,21 @@ def test_an_unconvertible_reading_below_95_percent_is_display_only():
     assert got.ok is True
 
 
+def test_a_fractional_derived_consumed_rounds_up_not_down():
+    """`int()` truncation would UNDER-estimate derived consumed and loosen
+    admission — the opposite of #24 acceptance 4. 90.01% of 18000 is 16201.8,
+    which must round up to 16202, never truncate down to 16201."""
+    got = call(
+        limits(
+            provider_window_capacity_seconds=18000,
+            last_reading_utilization=90.01,
+            last_reading_at=NOW - timedelta(minutes=1),
+        ),
+        WindowUsage(0, 0, 0, NOW),
+    )
+    assert got.effective_consumed_seconds == 16202
+
+
 def test_window_cap_runs_is_the_run_count_fallback():
     oldest = NOW - timedelta(hours=1)
     blocked = call(limits(window_cap_runs=3), WindowUsage(0, 0, 3, oldest), reservation=60)
@@ -123,9 +138,9 @@ def test_window_cap_runs_is_the_run_count_fallback():
     assert call(limits(window_cap_runs=3), WindowUsage(0, 0, 2, oldest), reservation=60).ok is True
 
 
-def test_the_refusal_order_is_exhaustion_then_reading_then_cap_then_ceiling():
-    """All four true at once: the answer must be the earliest rule, because
-    that is the one whose wake time is honest."""
+def test_exhausted_until_beats_every_other_violated_rule():
+    """All four rules violated at once: the answer must be the earliest one,
+    because that is the one whose wake time is honest."""
     got = call(
         limits(
             exhausted_until=NOW + timedelta(hours=1),
@@ -136,3 +151,27 @@ def test_the_refusal_order_is_exhaustion_then_reading_then_cap_then_ceiling():
         WindowUsage(18000, 0, 9, NOW - timedelta(hours=1)),
     )
     assert got.reason == "exhausted_until"
+
+
+def test_provider_reading_beats_window_cap_when_both_are_violated():
+    """No exhaustion in play: an outright-blocking reading must still win
+    over an also-violated run-count cap."""
+    got = call(
+        limits(
+            window_cap_runs=1,
+            last_reading_utilization=99.0,
+            last_reading_at=NOW - timedelta(minutes=1),
+        ),
+        WindowUsage(0, 0, 9, NOW - timedelta(hours=1)),
+    )
+    assert got.reason == "provider_reading"
+
+
+def test_window_cap_beats_ceiling_when_both_are_violated():
+    """No exhaustion, no reading: a violated run-count cap must still win
+    over an also-violated ceiling."""
+    got = call(
+        limits(window_cap_runs=1),
+        WindowUsage(18000, 0, 9, NOW - timedelta(hours=1)),
+    )
+    assert got.reason == "window_cap"

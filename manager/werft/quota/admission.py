@@ -15,6 +15,7 @@ time that *its own* rule implies, so `queued -> blocked_quota` never sleeps on
 a reason that is not the binding one.
 """
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -80,7 +81,10 @@ def decide(
         capacity = limits.provider_window_capacity_seconds
         utilization = float(limits.last_reading_utilization)
         if capacity is not None:
-            consumed = max(consumed, int(utilization / 100.0 * capacity))
+            # Round UP: truncating a fractional derived value would
+            # under-estimate consumed and loosen admission, violating the
+            # "provider reading never loosens" guarantee (#24 acceptance 4).
+            consumed = max(consumed, math.ceil(utilization / 100.0 * capacity))
         elif utilization >= PROVIDER_BLOCK_UTILIZATION:
             # Not convertible to window-seconds, but too close to the wall to
             # dispatch on. It stops binding when the reading goes stale.
