@@ -97,6 +97,17 @@ _EXIT_TIER_OUTCOMES: dict[str, tuple[AttemptOutcome, ResultStatus]] = {
 #: a second adapter naming its credential something else must still be scrubbed.
 _CREDENTIAL_ENV_MARKERS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
 
+#: `task.json` absent, unreadable, or not JSON. Bound to a name rather than
+#: written inline, because `ruff format` at this project's `target-version =
+#: "py314"` rewrites an inline `except (OSError, ValueError):` into PEP 758's
+#: unparenthesized `except OSError, ValueError:`. That form is valid on the
+#: manager's pinned 3.14 — but it reads to a human as Python 2, and it is a
+#: SyntaxError on every earlier interpreter, which is exactly the trap
+#: `tests/unit/test_adapter_runtime.py::test_adapter_compiles_for_the_runner_images_python`
+#: exists to catch on the 3.12 runner side. A named tuple is stable under the
+#: formatter and ambiguous to nobody.
+_UNREADABLE_TASK_JSON = (OSError, ValueError)
+
 
 def _credential_values(placement: RunPlacement) -> list[str]:
     """Every credential value `task.json`'s `env` block carries, read off the
@@ -116,7 +127,7 @@ def _credential_values(placement: RunPlacement) -> list[str]:
     """
     try:
         payload = json.loads(Path(placement.task_json_path).read_text(encoding="utf-8"))
-    except OSError, ValueError:
+    except _UNREADABLE_TASK_JSON:
         return []
     env = payload.get("env") if isinstance(payload, dict) else None
     if not isinstance(env, dict):
