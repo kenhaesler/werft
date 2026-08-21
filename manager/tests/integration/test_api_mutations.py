@@ -759,6 +759,59 @@ async def test_onboard_duplicate_slug_is_409(db_session, token_file, auth_header
     assert second.status_code == 409
 
 
+async def test_onboard_rejects_an_invalid_slug_as_422_not_409(
+    db_session, token_file, auth_headers
+) -> None:
+    """A CHECK violation (`projects_slug_check`) is a bad request, not a
+    duplicate. The old mapping answered 409 'already onboarded' for every
+    `IntegrityError` at all — telling the operator to go look for a project
+    that was never created, and telling a retry loop to give up."""
+    ops = FakeRepoOps()
+    admin_ops = FakeAdminOps()
+    app = make_client_app(
+        db_session,
+        token_file=token_file,
+        ops_for=ops_for_factory(ops),
+        admin_ops_for=admin_ops_for_factory(admin_ops),
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/projects/onboard",
+            json={"slug": "Not A Slug", "owner": "ken", "repo": "elastic"},
+            headers=auth_headers,
+        )
+
+    assert resp.status_code == 422
+    assert "already onboarded" not in resp.json()["detail"]
+
+
+async def test_onboard_duplicate_slug_is_409_without_message_sniffing(
+    db_session, token_file, auth_headers
+) -> None:
+    """And the 409-vs-422 split must not depend on the words in a message:
+    `duplicate_project_message`'s wording was load-bearing for HTTP
+    semantics, one copy-edit away from turning every duplicate into a 422."""
+    ops = FakeRepoOps()
+    admin_ops = FakeAdminOps()
+    app = make_client_app(
+        db_session,
+        token_file=token_file,
+        ops_for=ops_for_factory(ops),
+        admin_ops_for=admin_ops_for_factory(admin_ops),
+    )
+    tag = uuid.uuid4().hex[:8]
+    body = {"slug": f"elastic-{tag}", "owner": "ken", "repo": f"elastic-{tag}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        first = await client.post("/api/v1/projects/onboard", json=body, headers=auth_headers)
+        assert first.status_code == 201
+
+        second = await client.post("/api/v1/projects/onboard", json=body, headers=auth_headers)
+
+    assert second.status_code == 409
+
+
 async def test_onboard_concurrent_duplicate_is_409_not_500(
     db_session, migrated_db, token_file, auth_headers
 ) -> None:

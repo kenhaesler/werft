@@ -7,9 +7,11 @@ empty `projects` table by design — onboarding *is* the seed.
 """
 
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from werft.db.models import Project, ProjectEvent
 from werft.domain.errors import PermanentError
@@ -239,3 +241,32 @@ async def test_onboard_after_commit_a_repeat_call_with_identical_args_still_dupe
         await onboard_project(db_session, ops2, FakeAdminOps(), **kwargs)
 
     assert ops2.get_ref_sha_calls == []
+
+
+# -- DuplicateProjectError / is_duplicate_project_violation ------------------
+
+
+def _integrity(sqlstate: str, constraint: str) -> IntegrityError:
+    """Fakes what SQLAlchemy hands us — asyncpg's error, wrapped."""
+    orig = SimpleNamespace(sqlstate=sqlstate, constraint_name=constraint)
+    return IntegrityError("stmt", {}, orig)
+
+
+def test_duplicate_project_error_is_a_permanent_error_subtype():
+    from werft.orchestrator.onboard import DuplicateProjectError
+
+    assert issubclass(DuplicateProjectError, PermanentError)
+
+
+def test_only_the_two_projects_unique_constraints_read_as_duplicates():
+    """Postgres auto-names them from `0001_spine.py`'s `slug TEXT NOT NULL
+    UNIQUE` and `UNIQUE (github_owner, github_repo)`."""
+    from werft.orchestrator.onboard import is_duplicate_project_violation
+
+    assert is_duplicate_project_violation(_integrity("23505", "projects_slug_key")) is True
+    assert (
+        is_duplicate_project_violation(_integrity("23505", "projects_github_owner_github_repo_key"))
+        is True
+    )
+    assert is_duplicate_project_violation(_integrity("23514", "projects_slug_check")) is False
+    assert is_duplicate_project_violation(_integrity("23505", "runs_pkey")) is False

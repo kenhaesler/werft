@@ -58,7 +58,12 @@ from werft.domain.projects import ProjectLifecycle
 from werft.domain.runs import TERMINAL_STATUSES, ParkedReason, RunStatus
 from werft.orchestrator.ci_watch import flip_project
 from werft.orchestrator.merge_flow import advance_merging
-from werft.orchestrator.onboard import duplicate_project_message, onboard_project
+from werft.orchestrator.onboard import (
+    DuplicateProjectError,
+    duplicate_project_message,
+    is_duplicate_project_violation,
+    onboard_project,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -806,19 +811,22 @@ async def onboard(
     setup, driven through `orchestrator/onboard.py`'s `onboard_project`.
     Requires GitHub creds (controller ruling: unlike the run mutations,
     onboard cannot proceed without them) — 503 when `app.state.ops_for`/
-    `admin_ops_for` are unset. `onboard_project`'s `PermanentError` maps to
-    409 for a duplicate slug/repo, 422 for an unreachable installation
-    (main branch/repo not found).
+    `admin_ops_for` are unset. `onboard_project`'s `DuplicateProjectError`
+    maps to 409 for a duplicate slug/repo; any other `PermanentError` maps
+    to 422 for an unreachable installation (main branch/repo not found).
 
     A *concurrent* duplicate answers 409 too, by the other route: two
     onboards of the same slug/repo both pass `onboard_project`'s duplicate
     `SELECT` — taken before its GitHub round trips — and the loser's INSERT
     violates `projects`' unique constraints instead. That `IntegrityError`
-    is caught here and answered with the same 409 body as the sequential
-    duplicate, rather than escaping as an unhandled 500 (nothing in this app
-    registers an exception handler). The losing transaction rolls back, so
-    nothing partial survives, and every GitHub call it already made is
-    idempotent — the winner's project is unaffected.
+    is caught here and mapped by constraint name (`is_duplicate_project_violation`)
+    rather than by message substring: only the two `projects` unique
+    constraints answer 409 with the same body as the sequential duplicate;
+    every other `IntegrityError` (a CHECK violation, a NOT NULL) answers 422
+    instead of escaping as an unhandled 500 (nothing in this app registers
+    an exception handler). The losing transaction rolls back, so nothing
+    partial survives, and every GitHub call it already made is idempotent —
+    the winner's project is unaffected.
 
     No `Project` row exists yet for `app.state.ops_for`'s per-project cache
     key to key off of — a throwaway `SimpleNamespace` carrying just the
@@ -841,16 +849,20 @@ async def onboard(
             owner=body.owner,
             repo=body.repo,
         )
+    except DuplicateProjectError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except PermanentError as exc:
         await session.rollback()
-        message = str(exc)
-        status_code = 409 if "already onboarded" in message else 422
-        raise HTTPException(status_code=status_code, detail=message) from exc
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except IntegrityError as exc:
         await session.rollback()
-        raise HTTPException(
-            status_code=409, detail=duplicate_project_message(body.slug, body.owner, body.repo)
-        ) from exc
+        if is_duplicate_project_violation(exc):
+            raise HTTPException(
+                status_code=409,
+                detail=duplicate_project_message(body.slug, body.owner, body.repo),
+            ) from exc
+        raise HTTPException(status_code=422, detail="project rejected by the database") from exc
 
     await session.commit()
     return _project_out(project)
