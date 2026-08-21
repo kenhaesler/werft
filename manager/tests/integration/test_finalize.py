@@ -89,9 +89,15 @@ class SpyAlertSink:
 class SpyQuota:
     def __init__(self) -> None:
         self.calls: list[tuple[object, uuid.UUID, int | None]] = []
+        self.wake_calls: list[datetime | None] = []
+        self.wake_at: datetime | None = None
 
     async def release(self, session, run, observed_seconds) -> None:
         self.calls.append((session, run.id, observed_seconds))
+
+    async def next_wake_at(self, session, run, exhausted_until):
+        self.wake_calls.append(exhausted_until)
+        return self.wake_at or exhausted_until or (datetime.now(UTC) + timedelta(minutes=15))
 
 
 # -- seeding -----------------------------------------------------------------
