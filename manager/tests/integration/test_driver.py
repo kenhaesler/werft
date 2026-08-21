@@ -8,6 +8,7 @@ machine, and the quota ledger is the real one.
 """
 
 import asyncio
+import inspect
 import json
 import os
 import shutil
@@ -86,7 +87,12 @@ class FakeDocker:
         self._guard("start_container")
         on_started = getattr(self.fakes, "on_started", None)
         if on_started is not None:
-            on_started(self.placement)
+            # An awaitable hook is awaited *here*, before `launch` returns, so a
+            # test that has to mutate the row between `start` and the
+            # `claimed -> running` CAS is deterministic rather than a race.
+            outcome = on_started(self.placement)
+            if inspect.isawaitable(outcome):
+                await outcome
         if not self.hold_die:
             self._die.set()
         self.started.set()
@@ -483,6 +489,19 @@ async def set_running_with_container(fakes, run_id, container_id: str) -> None:
         )
 
 
+def write_stale_task_json(fakes, run_id, **env: str) -> Path:
+    """The `task.json` a driver that died with the manager left behind. The
+    re-adopting driver never writes one of its own, so this file is the only
+    place the previous attempt's credentials still live."""
+    path = run_dir_of(fakes, run_id) / "task.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"run_id": str(run_id), "argv": ["claude", "-p"], "env": env}, indent=2),
+        encoding="utf-8",
+    )
+    return path
+
+
 async def cancel_run_in_db(fakes, run_id, *, observed: int) -> None:
     """What the operator cancel route does (T6): close the attempt, true the
     reservation up, CAS to `canceled` — all before this driver notices."""
@@ -766,6 +785,56 @@ async def test_re_adopting_a_running_run_with_a_dead_container_finalizes_it(deps
 
     assert (await fetch(fakes, run_id)).status == "awaiting_review"
     assert fakes.git.clone_calls == []  # re-adoption never re-clones a running run
+
+
+async def test_a_lost_launch_cas_still_removes_the_container_it_just_started(deps_fixture):
+    """The `claimed -> running` CAS is the only place `runs.container_id` is
+    written, so a cancel that lands between `start` and that CAS leaves the row
+    with a NULL container id — nothing id-based will ever find the container
+    again. This driver is the last thing that knows it exists, so it removes it
+    on the way out, while finalizing nothing: the attempt row and the
+    reservation were closed by whoever cancelled."""
+    driver_deps, run_id, fakes = deps_fixture
+    fakes.on_started = lambda _placement: cancel_run_in_db(fakes, run_id, observed=5)
+
+    await attend_run(driver_deps, run_id)
+
+    assert f"remove_container:{fakes.docker.container_id}" in fakes.docker.calls
+    assert f"remove_network:{network_of(run_id)}" in fakes.docker.calls
+    row = await fetch(fakes, run_id)
+    assert (row.status, row.container_id, row.exit_code) == ("canceled", None, None)
+    assert (await ledger_entry(fakes, run_id)).actual_wallclock_s == 5  # not re-settled
+    assert (await latest_attempt(fakes, run_id)).outcome == "canceled"  # not overwritten
+    assert "container_died" not in await dispatch_phases(fakes, run_id)
+    assert fakes.auth.revoked  # teardown still ran
+
+
+async def test_a_re_adopted_run_scrubs_every_credential_the_stale_task_json_holds(deps_fixture):
+    """D7 on the crash-recovery path: the driver that wrote this `task.json`
+    died with the manager, so the scrub cannot depend on in-memory state — and
+    every marker-matching value goes, not just the first."""
+    driver_deps, run_id, fakes = deps_fixture
+    fakes.auth.tokens = [token("ghs_readopted", minutes=60)]
+    await set_running_with_container(fakes, run_id, fakes.docker.container_id)
+    path = write_stale_task_json(
+        fakes,
+        run_id,
+        CLAUDE_CODE_OAUTH_TOKEN=CREDENTIAL,
+        GIT_ASKPASS_TOKEN="ghs_stale_from_the_dead_manager",
+        CI="true",
+    )
+    write_outputs(placement_of(fakes, run_id), status="success")
+    fakes.ops.ref_shas[run_branch_name(run_id)] = "f" * 40
+    fakes.docker.release_die(0)
+
+    await attend_run(driver_deps, run_id)
+
+    retained = path.read_text(encoding="utf-8")
+    assert CREDENTIAL not in retained
+    assert "ghs_stale_from_the_dead_manager" not in retained
+    assert "ghs_readopted" not in retained  # this driver's own git token either
+    assert retained.count("<redacted>") == 2
+    assert json.loads(retained)["env"]["CI"] == "true"  # still readable evidence
 
 
 async def test_cancelling_the_driver_task_leaves_the_container_alive(deps_fixture):

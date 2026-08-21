@@ -23,10 +23,12 @@ take the agent's own word for whether its work exists.
 
 import asyncio
 import contextlib
+import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -53,6 +55,7 @@ from werft.orchestrator.finalize import advance_failed, finalize_attempt
 from werft.providers.base import Classification, ProviderSpec
 from werft.providers.claude import parse_stream
 from werft.quota.ledger import LedgerQuota
+from werft.runner.create_body import RunPlacement
 from werft.runner.docker_api import DockerClient
 from werft.runner.git import clone_env, clone_workspace, remote_url, write_askpass
 from werft.runner.lifecycle import Completion, RunnerLifecycle, meaning_of, now_epoch_seconds
@@ -95,11 +98,35 @@ _EXIT_TIER_OUTCOMES: dict[str, tuple[AttemptOutcome, ResultStatus]] = {
 _CREDENTIAL_ENV_MARKERS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
 
 
-def _credential_value(env: dict[str, str]) -> str:
-    for name, value in env.items():
-        if any(marker in name.upper() for marker in _CREDENTIAL_ENV_MARKERS):
-            return value
-    return ""
+def _credential_values(placement: RunPlacement) -> list[str]:
+    """Every credential value `task.json`'s `env` block carries, read off the
+    **file** rather than off this process's memory.
+
+    Teardown has to scrub the retained `task.json` on every path, including the
+    ones that never wrote it. A re-adopted `running` run (crash-window row 6)
+    prepares nothing: the driver that built that `env` died with the manager, so
+    an in-memory copy of the provider credential does not exist to scrub with,
+    and D7's "the retained run dir carries no live credential" would hold only
+    for runs this process happened to launch itself. The file is the one thing
+    both paths share, and it is the thing being scrubbed.
+
+    Every matching value is collected, not just the first: `env` is the
+    provider spec's to compose, and nothing stops a second adapter from
+    carrying two.
+    """
+    try:
+        payload = json.loads(Path(placement.task_json_path).read_text(encoding="utf-8"))
+    except OSError, ValueError:
+        return []
+    env = payload.get("env") if isinstance(payload, dict) else None
+    if not isinstance(env, dict):
+        return []
+    return [
+        value
+        for name, value in env.items()
+        if isinstance(value, str)
+        and any(marker in str(name).upper() for marker in _CREDENTIAL_ENV_MARKERS)
+    ]
 
 
 @dataclass(frozen=True)
@@ -199,11 +226,19 @@ class _Driver:
         self._deps = deps
         self._settings = deps.settings
         self._run_id = run_id
-        self._placement = None
+        self._placement: RunPlacement | None = None
         self._lifecycle: RunnerLifecycle | None = None
         self._credentials: RunCredentials | None = None
+        #: The *physical* container, kept for teardown on every path — including
+        #: the paths where this driver no longer owns the run. Losing ownership
+        #: is a fact about the row; the container it just started is a fact
+        #: about the host, and forgetting the id is how one leaks.
         self._container_id: str | None = None
-        self._provider_token = ""
+        #: Whether this driver is still the one accounting for this attempt.
+        #: Cleared when the `claimed -> running` CAS is lost (somebody cancelled
+        #: while the container was starting): teardown still runs, finalize does
+        #: not — the attempt row and the reservation are already somebody else's.
+        self._owns_run = True
         self._ticker: asyncio.Task[None] | None = None
 
     # -- entry point ---------------------------------------------------------
@@ -268,8 +303,12 @@ class _Driver:
             create_run_dirs(self._placement)
             await self._mint(loaded)
             since, base_sha = await self._prepare_and_launch(loaded, entry)
-            if self._container_id is None:
-                return  # lost the CAS: somebody cancelled. Tear down and go.
+            if not self._owns_run:
+                # Lost the CAS: somebody cancelled while the container was
+                # starting. Teardown still removes it — `_container_id` is
+                # deliberately still set — but nothing here finalizes an
+                # attempt somebody else has already accounted for.
+                return
         else:
             raise RuntimeError("run is `running` with no container_id")
 
@@ -373,11 +412,6 @@ class _Driver:
         )
         env = self._deps.spec.build_env(task, credential_path=self._settings.claude_credential_file)
         task = task.model_copy(update={"argv": argv, "env": env})
-        # Held for the teardown scrub: `task.json` carries the provider
-        # credential in `env` (SPEC §4.4's accepted shared-credential posture)
-        # and the run directory is retained and shipped offsite (SPEC §8).
-        self._provider_token = _credential_value(env)
-
         write_secret(placement, PROMPT_FILENAME, build_prompt(task))
         write_secret(placement, SYSTEM_PROMPT_FILENAME, build_system_prompt(task))
         write_task_json(placement, task)
@@ -411,9 +445,13 @@ class _Driver:
             )
             if not ok:
                 # Somebody moved this row while the container was starting —
-                # in practice an operator cancel. The caller tears down.
+                # in practice an operator cancel. The caller tears down, and
+                # `_container_id` stays set so that teardown actually removes
+                # the container this driver just started: the row's own
+                # `container_id` is still NULL, so nothing id-based would ever
+                # find it again.
                 logger.info("driver.launch_cas_lost", run_id=str(self._run_id))
-                self._container_id = None
+                self._owns_run = False
                 return since, base_sha
             session.add(
                 RunEvent(
@@ -690,11 +728,15 @@ class _Driver:
                 await self._lifecycle.teardown(self._placement, self._container_id)
             except Exception as exc:  # noqa: BLE001 - a daemon outage is the orphan sweep's job
                 logger.warning("driver.teardown_failed", run_id=str(self._run_id), error=str(exc))
+        # The git token comes from this driver's own credential object; the
+        # provider credential is read back out of `task.json` (see
+        # `_credential_values`), so the scrub is identical on the launch path
+        # and on the re-adoption path that never built that file.
         secrets = [
             value
             for value in (
                 self._credentials.token if self._credentials else None,
-                self._provider_token,
+                *_credential_values(self._placement),
             )
             if value
         ]
