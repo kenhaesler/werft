@@ -22,7 +22,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import structlog
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from werft.db.models import ProviderAccount, QuotaLedgerEntry, Run, RunAttempt
@@ -272,6 +272,15 @@ class LedgerQuota:
         The stored value is never shortened — a later report wins, an earlier
         one is ignored — and nothing ever clears it: admission just compares it
         to `now`, so it decays by the passage of time.
+
+        The never-shorten guard is a *conditional UPDATE*, not a Python
+        compare-then-write: two interleaved transactions can both read the
+        same `stored` value (or both read it `None`) before either writes, and
+        a Python-side `until > stored` check would let the second writer
+        overwrite unconditionally — exactly the shortening this method exists
+        to forbid. The `WHERE ... exhausted_until IS NULL OR exhausted_until <
+        :until` clause makes Postgres the referee: only a genuinely later
+        `until` can ever move the column, whichever transaction commits last.
         """
         now = datetime.now(UTC)
         account = await resolve_account(session, provider=self._provider, label=self._label)
@@ -288,16 +297,31 @@ class LedgerQuota:
             until = now + timedelta(minutes=EXHAUSTED_FALLBACK_MINUTES)
             source = "cli_no_reset"
 
-        stored = account.exhausted_until
-        if stored is None or until > stored:
+        written = (
             await session.execute(
                 update(ProviderAccount)
-                .where(ProviderAccount.id == account.id)
+                .where(
+                    ProviderAccount.id == account.id,
+                    or_(
+                        ProviderAccount.exhausted_until.is_(None),
+                        ProviderAccount.exhausted_until < until,
+                    ),
+                )
                 .values(exhausted_until=until, exhausted_source=source)
+                .returning(ProviderAccount.exhausted_until)
             )
-            durable = until
+        ).scalar_one_or_none()
+        if written is not None:
+            durable = written
         else:
-            durable = stored
+            # The guard didn't fire: a stored value already at or past `until`
+            # wins. Re-read rather than trust the pre-lock `account` object,
+            # which may itself be stale relative to whichever write did land.
+            durable = (
+                await session.execute(
+                    select(ProviderAccount.exhausted_until).where(ProviderAccount.id == account.id)
+                )
+            ).scalar_one()
 
         headroom = await self.earliest_headroom(
             session, account, reservation_seconds=self._typical, now=now

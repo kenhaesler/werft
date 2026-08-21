@@ -246,6 +246,37 @@ async def test_a_later_report_wins_and_an_earlier_one_never_shortens_it(db_sessi
     assert account.exhausted_until == late
 
 
+async def test_the_never_shorten_guard_lives_in_sql_not_python(db_session):
+    """The guard must be a conditional UPDATE the database enforces, not a
+    Python `until > stored` compare-then-write: two interleaved transactions
+    can both read the same `stored` value before either writes, and a
+    Python-side check evaluated against that pre-lock read would let a later
+    committer overwrite unconditionally — a `cli_no_reset` (now+15min)
+    replacing a live `cli` reset hours out, exactly the shortening D9
+    forbids. Bypassing `next_wake_at` entirely to seed the stored value (a
+    raw UPDATE) proves the column is defended by its own WHERE clause, not by
+    whatever the caller happened to read beforehand."""
+    label = uuid.uuid4().hex[:8]
+    account_id = await seed_labeled_account(db_session, label=label, ceiling=18000)
+    far_future = NOW + timedelta(days=1)
+    await db_session.execute(
+        text(
+            "UPDATE provider_accounts SET exhausted_until = :u, exhausted_source = 'cli'"
+            " WHERE id = :id"
+        ),
+        {"u": far_future, "id": account_id},
+    )
+    run = await get_run(db_session, await seed_run(db_session))
+    ledger = LedgerQuota(label=label)
+
+    got = await ledger.next_wake_at(db_session, run, NOW + timedelta(hours=1))
+
+    account = await db_session.get(ProviderAccount, account_id, populate_existing=True)
+    assert account.exhausted_until == far_future
+    assert account.exhausted_source == "cli"
+    assert got >= far_future
+
+
 async def test_next_wake_at_without_a_reset_blocks_for_fifteen_minutes_and_says_so(db_session):
     """D11: refusing to block at all would re-burn the account on the next
     tick; the source string is what keeps the invented number visible."""
