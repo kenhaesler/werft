@@ -208,6 +208,9 @@ async def _park(
         RunEvent(
             run_id=run.id,
             event_type="dispatch",
+            # invariant: `dispatch_for` is the only pre-attempt `PermanentError`
+            # source, so this literal is the reason. A second one routed through
+            # `_park` must carry the exception's own reason instead.
             payload={"phase": "parked", "reason": "no_dispatch_config", "detail": detail},
         )
     )

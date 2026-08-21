@@ -18,7 +18,7 @@ from werft.db.models import ProviderAccount, QuotaLedgerEntry, Run, RunAttempt, 
 from werft.domain.runs import run_branch_name
 from werft.observe.alerts import NullAlertSink
 from werft.orchestrator.dispatch import ClaimOutcome, claim_next
-from werft.quota.ledger import LedgerQuota
+from werft.quota.ledger import LedgerQuota, QuotaRefused
 
 __all__ = ["seed_entry"]
 
@@ -27,6 +27,8 @@ DIGEST = "werft-runner-elastic@sha256:" + "d" * 64
 #: The race fixture's account label. Fixed rather than random because the racer
 #: sessions are built from a `LedgerQuota` the test constructs itself.
 LABEL = "race"
+#: Ditto for the `SKIP LOCKED` test, which also runs on its own engine.
+SKIP_LABEL = "skip-locked"
 
 
 def entry(**over) -> ProjectDispatch:
@@ -124,7 +126,11 @@ async def seed_account(session, *, label: str | None = None, ceiling=18000, hour
         await session.execute(
             text(
                 "INSERT INTO provider_accounts (provider, label, rolling_window_hours,"
-                " ceiling_seconds) VALUES ('claude', :label, :hours, :ceiling) RETURNING id"
+                " ceiling_seconds) VALUES ('claude', :label, :hours, :ceiling)"
+                " ON CONFLICT (provider, label) DO UPDATE"
+                " SET ceiling_seconds = EXCLUDED.ceiling_seconds,"
+                " rolling_window_hours = EXCLUDED.rolling_window_hours,"
+                " is_active = true, exhausted_until = NULL RETURNING id"
             ),
             {"label": label, "hours": hours, "ceiling": ceiling},
         )
@@ -398,6 +404,28 @@ async def test_a_stale_exhausted_until_still_gets_the_sixty_second_floor(db_sess
     assert row.next_attempt_at >= NOW + timedelta(seconds=60)
 
 
+async def test_a_retry_at_of_now_is_pushed_out_to_exactly_the_floor(db_session, seeded):
+    """The floor in isolation, which neither test above pins: in both of those
+    the *ceiling* rule's own wake (NOW + 1 h / NOW + 5 h) dominates the
+    `max()`, so deleting the floor leaves them green. This is the case the
+    floor exists for — Task 6 established `QuotaRefused.retry_at` can equal
+    `now`, and without the clamp the tick would re-claim, re-refuse and
+    re-block the same run in a hot loop. `==`, not `>=`: the floor is an exact
+    number, not a lower bound."""
+    run, project, _, quota = seeded
+
+    async def refuse(*_args, **_kwargs):
+        raise QuotaRefused("ceiling", NOW)
+
+    quota.reserve = refuse  # the refusal is the fixture; admission is tested elsewhere
+
+    outcome = await claim(db_session, quota=quota, config=config_for(project.slug))
+
+    assert outcome.status == "blocked_quota"
+    row = await db_session.get(Run, run.id, populate_existing=True)
+    assert row.next_attempt_at == NOW + timedelta(seconds=60)
+
+
 async def test_attempt_no_comes_from_the_cross_table_max_not_attempt_count(db_session, seeded):
     """A budget-exempt attempt (`quota_exhausted`) leaves `attempt_count` at 0
     while both `run_attempts` and `quota_ledger` already hold attempt 1 —
@@ -461,10 +489,19 @@ async def test_an_empty_queue_is_idle(db_session, seeded_account_only):
 
 async def test_n_concurrent_racers_never_exceed_the_ceiling(migrated_db):
     """#24, verbatim: "N concurrent claim racers never exceed the ceiling."
-    Real sessions, real `FOR UPDATE SKIP LOCKED`, real advisory lock — a single
-    session cannot exercise any of that. `SKIP LOCKED` keeps two claimers off
-    the same *row*; the advisory lock keeps them off the same *account's
-    headroom*. Neither alone passes this test."""
+
+    What this test pins is the **advisory lock**: eight real sessions, eight
+    real transactions, one account with headroom for three. Without the lock
+    the racers read the same window before any of them writes a reservation
+    and all eight admit; with it they queue and the fourth one sees the first
+    three's rows. A single session cannot exercise that at all.
+
+    It does *not* pin `SKIP LOCKED`, and it cannot: the advisory lock
+    serialises every racer, so no two of them ever hold a row lock at the same
+    time and plain `FOR UPDATE` would pass identically. The `SKIP LOCKED` half
+    of the claim query is pinned by
+    `test_a_row_another_transaction_holds_is_skipped_not_waited_on`, where the
+    competing row lock comes from outside the claim path."""
     engine = create_async_engine(migrated_db)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
@@ -507,4 +544,61 @@ async def test_n_concurrent_racers_never_exceed_the_ceiling(migrated_db):
         assert statuses.count("claimed") == 3
         assert statuses.count("claimed") + statuses.count("blocked_quota") == 8
     finally:
+        await engine.dispose()
+
+
+async def test_a_row_another_transaction_holds_is_skipped_not_waited_on(migrated_db):
+    """SPEC §3.3 item 2's `SKIP LOCKED`, on its own.
+
+    The competing lock deliberately comes from *outside* the claim path — a
+    cancel-shaped `SELECT ... FOR UPDATE` in its own transaction — because the
+    advisory lock makes two claimers unable to contend on a row by
+    construction. Plain `FOR UPDATE` would block here until the holder
+    commits; `FOR UPDATE ... SKIP LOCKED` steps over the locked row and takes
+    the next candidate in `priority DESC, created_at` order. `asyncio.wait_for`
+    is the assertion for "never blocks": without the skip this test times out
+    rather than failing on a value.
+    """
+    engine = create_async_engine(migrated_db)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    project = account = None
+    try:
+        async with factory() as setup, setup.begin():
+            project = await seed_project(setup)
+            locked = await seed_queued_run(
+                setup, project.id, await seed_item(setup, project.id, number=1), priority=200
+            )
+            runner_up = await seed_queued_run(
+                setup, project.id, await seed_item(setup, project.id, number=2), priority=100
+            )
+            account = await seed_account(setup, label=SKIP_LABEL)
+        quota = LedgerQuota(label=SKIP_LABEL, typical_reservation_seconds=1800)
+
+        async with factory() as holder, holder.begin():
+            await holder.execute(
+                text("SELECT id FROM runs WHERE id = :r FOR UPDATE"), {"r": locked}
+            )
+            async with factory() as claimer, claimer.begin():
+                outcome = await asyncio.wait_for(
+                    claim(claimer, quota=quota, config=config_for(project.slug)), timeout=15
+                )
+
+        assert (outcome.status, outcome.run_id) == ("claimed", runner_up)
+        async with factory() as check:
+            assert (await check.get(Run, locked)).status == "queued"  # untouched, still first
+    finally:
+        if project is not None:
+            async with factory() as cleanup, cleanup.begin():
+                await cleanup.execute(
+                    text(
+                        "DELETE FROM quota_ledger WHERE run_id IN"
+                        " (SELECT id FROM runs WHERE project_id = :p)"
+                    ),
+                    {"p": project.id},
+                )
+                await cleanup.execute(text("DELETE FROM projects WHERE id = :p"), {"p": project.id})
+                if account is not None:
+                    await cleanup.execute(
+                        text("DELETE FROM provider_accounts WHERE id = :a"), {"a": account.id}
+                    )
         await engine.dispose()
