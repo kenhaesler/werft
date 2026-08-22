@@ -24,7 +24,7 @@ from uuid import UUID, uuid4
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,6 +53,7 @@ from werft.db.models import (
     RunEvent,
 )
 from werft.db.transitions import transition_run
+from werft.domain.attempts import AttemptOutcome
 from werft.domain.errors import PermanentError
 from werft.domain.projects import ProjectLifecycle
 from werft.domain.runs import TERMINAL_STATUSES, ParkedReason, RunStatus
@@ -722,6 +723,7 @@ async def reject_review(
 @api_router.post("/runs/{run_id}/cancel", response_model=RunSummary)
 async def cancel_run(
     run_id: UUID,
+    request: Request,
     session: AsyncSession = Depends(get_session),  # noqa: B008 - FastAPI's DI pattern
 ) -> RunSummary:
     """`POST /api/v1/runs/{id}/cancel` — CAS `<non-terminal> -> canceled`
@@ -729,10 +731,62 @@ async def cancel_run(
     if the run is already terminal. Cleanup (closing any open PR, deleting
     the run branch) happens out-of-band via the tick sweep's
     `cleanup_terminal` — this endpoint only flips the status.
+
+    D10's division of labour: this route closes the open attempt row and
+    trues up the reservation (SPEC §7's release, in the same transaction as
+    the CAS) but never touches Docker. The container, if any, is killed by
+    the tick's `sweep_canceled_containers` — always, even while a driver is
+    still live in `await_completion`, because only the container's own die
+    event unblocks that driver. A route that reached for the socket here
+    would be a second owner of the same container.
     """
     run = await _get_run_for_mutation(session, run_id)
     if run.status in TERMINAL_STATUSES:
         raise HTTPException(status_code=409, detail=f"run is already {run.status}")
+
+    # SPEC §7: "A reservation is also released — trued-up to zero or to observed
+    # container seconds — in the same transaction as any transition out of
+    # `claimed`/`running` that does not pass through CLI exit (lease expiry,
+    # hard-deadline sweep, cancel): no path leaks headroom." `claimed` never
+    # started a CLI, so its observed time is zero; `running` gets what the
+    # manager itself watched elapse.
+    #
+    # The container is *not* killed here (plan decision D10): the tick's
+    # canceled-container sweep owns that — always, even while a driver is live,
+    # because that driver is blocked in `await_completion` and only the die
+    # event will free it. An API route that reached for the Docker socket would
+    # be a second owner of containers.
+    if run.status in (RunStatus.CLAIMED.value, RunStatus.RUNNING.value):
+        attempt = (
+            (
+                await session.execute(
+                    select(RunAttempt)
+                    .where(RunAttempt.run_id == run_id, RunAttempt.ended_at.is_(None))
+                    .order_by(RunAttempt.attempt_no.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .one_or_none()
+        )
+        observed = 0
+        if attempt is not None:
+            ended_at = datetime.now(UTC)
+            observed = (
+                0
+                if run.container_id is None
+                else max(0, int((ended_at - attempt.started_at).total_seconds()))
+            )
+            await session.execute(
+                update(RunAttempt)
+                .where(RunAttempt.id == attempt.id)
+                .values(
+                    outcome=AttemptOutcome.CANCELED.value,
+                    ended_at=ended_at,
+                    duration_seconds=observed,
+                )
+            )
+        await request.app.state.quota.release(session, run, observed)
 
     ok = await transition_run(
         session, run_id=run_id, expected_version=run.version, new_status=RunStatus.CANCELED

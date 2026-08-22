@@ -26,16 +26,17 @@ from collections.abc import AsyncIterator
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from werft.api.routes import get_session
 from werft.app import create_app
 from werft.config.settings import Settings
-from werft.db.models import BacklogItem, Project, Run
+from werft.db.models import BacklogItem, Project, QuotaLedgerEntry, Run, RunAttempt
 from werft.github.ops import READY_LABEL, PullRequest
 from werft.observe.alerts import NullAlertSink
 from werft.orchestrator.onboard import duplicate_project_message
+from werft.quota.ledger import LedgerQuota
 
 # -- seeding ------------------------------------------------------------
 
@@ -228,6 +229,13 @@ def make_client_app(
         app.state.admin_ops_for = admin_ops_for
     if alerts is not None:
         app.state.alerts = alerts
+    # These tests never enter `create_app`'s lifespan (same rationale as
+    # `ops_for`/`admin_ops_for`/`alerts` above), so `app.state.quota` stays
+    # the synchronous default `create_app` sets before the lifespan ever
+    # runs. `cancel_run`'s true-up (Task 17) needs a real port here — the
+    # account/label are irrelevant to `LedgerQuota.release`, which resolves
+    # the run's own newest open ledger row rather than reading the account.
+    app.state.quota = LedgerQuota()
     return app
 
 
@@ -621,6 +629,223 @@ async def test_cancel_on_merged_run_is_409(db_session, token_file, auth_headers)
     assert resp.status_code == 409
     fresh = await db_session.get(Run, run.id, populate_existing=True)
     assert fresh.status == "merged"
+
+
+# -- cancel: quota true-up (Task 17) ---------------------------------------
+#
+# SPEC §7: "A reservation is also released ... in the same transaction as
+# any transition out of `claimed`/`running` that does not pass through CLI
+# exit (lease expiry, hard-deadline sweep, cancel): no path leaks headroom."
+# Cancel is the path an operator drives by hand, and it was the one leaking.
+
+
+async def seed_provider_account(session: AsyncSession, *, label: str) -> uuid.UUID:
+    account_id = (
+        await session.execute(
+            text(
+                "INSERT INTO provider_accounts (provider, label, rolling_window_hours,"
+                " ceiling_seconds) VALUES ('claude', :l, 5, 18000) RETURNING id"
+            ),
+            {"l": label},
+        )
+    ).scalar_one()
+    await session.commit()
+    return account_id
+
+
+async def seed_open_reservation(
+    session: AsyncSession, run: Run, *, account_id: uuid.UUID, attempt_no: int, reserved: int
+) -> int:
+    ledger_id = (
+        await session.execute(
+            text(
+                "INSERT INTO quota_ledger (provider_account_id, run_id, attempt_no,"
+                " reserved_wallclock_s) VALUES (:a, :r, :n, :res) RETURNING id"
+            ),
+            {"a": account_id, "r": run.id, "n": attempt_no, "res": reserved},
+        )
+    ).scalar_one()
+    await session.commit()
+    return ledger_id
+
+
+async def seed_closed_reservation(
+    session: AsyncSession, run: Run, *, account_id: uuid.UUID, attempt_no: int, actual: int
+) -> int:
+    ledger_id = (
+        await session.execute(
+            text(
+                "INSERT INTO quota_ledger (provider_account_id, run_id, attempt_no,"
+                " reserved_wallclock_s, actual_wallclock_s) VALUES (:a, :r, :n, :res, :act)"
+                " RETURNING id"
+            ),
+            {"a": account_id, "r": run.id, "n": attempt_no, "res": actual or 1, "act": actual},
+        )
+    ).scalar_one()
+    await session.commit()
+    return ledger_id
+
+
+async def seed_open_attempt(
+    session: AsyncSession,
+    run: Run,
+    *,
+    attempt_no: int,
+    started_minutes_ago: float = 0,
+    provider: str = "claude",
+) -> None:
+    await session.execute(
+        text(
+            "INSERT INTO run_attempts (run_id, attempt_no, provider, started_at)"
+            " VALUES (:r, :n, :p, now() - make_interval(secs => CAST(:s AS double precision)))"
+        ),
+        {"r": run.id, "n": attempt_no, "p": provider, "s": started_minutes_ago * 60},
+    )
+    await session.commit()
+
+
+async def set_container_id(session: AsyncSession, run: Run, container_id: str | None) -> None:
+    await session.execute(
+        text("UPDATE runs SET container_id = :c WHERE id = :r"), {"c": container_id, "r": run.id}
+    )
+    await session.commit()
+    # The raw `UPDATE` above bypasses the ORM, so `run` (and any other
+    # identity-mapped `Run` instance for this id in this session, including
+    # the one `cancel_run`'s own `session.get(Run, run_id)` would otherwise
+    # hand back from cache) still carries the pre-update `container_id`
+    # unless refreshed from the database.
+    await session.refresh(run)
+
+
+async def test_cancelling_a_running_run_returns_its_reserved_headroom(
+    db_session, token_file, auth_headers
+) -> None:
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item, status="running")
+    await set_container_id(db_session, run, "c1")
+    account_id = await seed_provider_account(db_session, label=f"acct-{run.id.hex}")
+    ledger_id = await seed_open_reservation(
+        db_session, run, account_id=account_id, attempt_no=1, reserved=5400
+    )
+    await seed_open_attempt(db_session, run, attempt_no=1, started_minutes_ago=5)
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(f"/api/v1/runs/{run.id}/cancel", headers=auth_headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "canceled"
+
+    entry = await db_session.get(QuotaLedgerEntry, ledger_id, populate_existing=True)
+    assert entry.actual_wallclock_s is not None
+    assert 0 < entry.actual_wallclock_s <= 5400
+
+    attempt = (
+        await db_session.execute(
+            select(RunAttempt).where(RunAttempt.run_id == run.id, RunAttempt.attempt_no == 1)
+        )
+    ).scalar_one()
+    assert attempt.outcome == "canceled"
+    assert attempt.ended_at is not None
+
+
+async def test_cancelling_a_claimed_run_releases_the_whole_reservation(
+    db_session, token_file, auth_headers
+) -> None:
+    """Nothing ever started; the window owes nothing."""
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item, status="claimed")
+    account_id = await seed_provider_account(db_session, label=f"acct-{run.id.hex}")
+    ledger_id = await seed_open_reservation(
+        db_session, run, account_id=account_id, attempt_no=1, reserved=5400
+    )
+    await seed_open_attempt(db_session, run, attempt_no=1)
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(f"/api/v1/runs/{run.id}/cancel", headers=auth_headers)
+
+    assert resp.status_code == 200
+    entry = await db_session.get(QuotaLedgerEntry, ledger_id, populate_existing=True)
+    assert entry.actual_wallclock_s == 0
+
+
+async def test_cancelling_a_queued_run_touches_no_ledger_and_no_attempt(
+    db_session, token_file, auth_headers
+) -> None:
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item, status="queued")
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(f"/api/v1/runs/{run.id}/cancel", headers=auth_headers)
+
+    assert resp.status_code == 200
+    ledger_rows = (
+        await db_session.execute(select(QuotaLedgerEntry).where(QuotaLedgerEntry.run_id == run.id))
+    ).all()
+    assert ledger_rows == []
+    attempt_rows = (
+        await db_session.execute(select(RunAttempt).where(RunAttempt.run_id == run.id))
+    ).all()
+    assert attempt_rows == []
+
+
+async def test_cancel_after_finalize_does_not_re_close_the_reservation(
+    db_session, token_file, auth_headers
+) -> None:
+    """Decision 17, the other direction: the driver already released, and the
+    first-writer-wins guard must leave its number alone."""
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item, status="awaiting_review")
+    account_id = await seed_provider_account(db_session, label=f"acct-{run.id.hex}")
+    ledger_id = await seed_closed_reservation(
+        db_session, run, account_id=account_id, attempt_no=1, actual=300
+    )
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(f"/api/v1/runs/{run.id}/cancel", headers=auth_headers)
+
+    assert resp.status_code == 200
+    entry = await db_session.get(QuotaLedgerEntry, ledger_id, populate_existing=True)
+    assert entry.actual_wallclock_s == 300
+
+
+async def test_cancel_never_calls_docker(db_session, token_file, auth_headers, monkeypatch) -> None:
+    """D10: teardown ownership is unambiguous. An API handler that reached for
+    the socket would be a second owner of containers. `cancel_run` never
+    imports `DockerClient` at all; constructing one here is the load-bearing
+    proof that the route's true-up path never does either."""
+    from werft.runner.docker_api import DockerClient
+
+    def _unexpected_construction(*args, **kwargs):
+        raise AssertionError("cancel_run must never construct a DockerClient")
+
+    monkeypatch.setattr(DockerClient, "__init__", _unexpected_construction)
+
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item, status="running")
+    await set_container_id(db_session, run, "c1")
+    account_id = await seed_provider_account(db_session, label=f"acct-{run.id.hex}")
+    await seed_open_reservation(db_session, run, account_id=account_id, attempt_no=1, reserved=5400)
+    await seed_open_attempt(db_session, run, attempt_no=1)
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(f"/api/v1/runs/{run.id}/cancel", headers=auth_headers)
+
+    assert resp.status_code == 200
 
 
 # -- requeue --------------------------------------------------------------
