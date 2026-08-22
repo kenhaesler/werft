@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 from werft.quota.admission import AccountLimits, decide
-from werft.quota.window import WindowUsage
+from werft.quota.window import ClosedEntry, WindowUsage
 
 NOW = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
 
@@ -136,6 +136,40 @@ def test_window_cap_runs_is_the_run_count_fallback():
     assert blocked.reason == "window_cap"
     assert blocked.retry_at == oldest + timedelta(hours=5)
     assert call(limits(window_cap_runs=3), WindowUsage(0, 0, 2, oldest), reservation=60).ok is True
+
+
+def test_a_tightened_reading_pushes_the_ceiling_wake_time_out():
+    """The refusal and its `retry_at` must be reasoned from the same number.
+    Ageing rows out of the ledger's (understated) load would wake the run
+    before the headroom the reading says it needs actually exists."""
+    closed = (
+        ClosedEntry(NOW - timedelta(hours=4), 6000),
+        ClosedEntry(NOW - timedelta(hours=3), 6000),
+    )
+    tightened = call(
+        limits(
+            provider_window_capacity_seconds=18000,
+            last_reading_utilization=100.0,
+            last_reading_at=NOW - timedelta(minutes=1),
+        ),
+        WindowUsage(12000, 0, 2, NOW - timedelta(hours=4)),
+        reservation=7000,
+        closed=closed,
+    )
+    raw = call(
+        limits(),
+        WindowUsage(12000, 0, 2, NOW - timedelta(hours=4)),
+        reservation=7000,
+        closed=closed,
+    )
+
+    assert tightened.reason == raw.reason == "ceiling"
+    assert tightened.effective_consumed_seconds == 18000
+    # One entry ageing out is enough for the ledger's load; the tightened one
+    # needs both.
+    assert raw.retry_at == NOW + timedelta(hours=1, seconds=1)
+    assert tightened.retry_at == NOW + timedelta(hours=2, seconds=1)
+    assert tightened.retry_at > raw.retry_at
 
 
 def test_exhausted_until_beats_every_other_violated_rule():

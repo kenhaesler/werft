@@ -80,6 +80,11 @@ def placement_for(run_id: UUID | str, *, runs_root: str, dns_ip: str) -> RunPlac
 
 
 def create_run_dirs(placement: RunPlacement) -> None:
+    # The run dir first, and hardened like its children: `task.json` and
+    # `secrets/` are only as private as the directory they are reached
+    # through, and the umask default would leave that one traversable.
+    os.makedirs(placement.run_dir, exist_ok=True)
+    _harden(placement.run_dir, DIR_MODE)
     for path in (placement.workspace_dir, placement.outputs_dir):
         shutil.rmtree(path, ignore_errors=True)
     for path in (placement.workspace_dir, placement.outputs_dir, placement.secrets_dir):

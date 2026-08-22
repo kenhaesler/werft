@@ -159,6 +159,9 @@ def test_secrets_and_task_json_are_not_group_or_world_readable(tmp_path):
     assert os.stat(placement.task_json_path).st_mode & 0o077 == 0
     assert os.stat(os.path.join(placement.secrets_dir, GIT_TOKEN_FILENAME)).st_mode & 0o077 == 0
     assert os.stat(placement.secrets_dir).st_mode & 0o077 == 0
+    # The run dir itself: everything above is only as private as the directory
+    # it is reached through.
+    assert os.stat(placement.run_dir).st_mode & 0o077 == 0
 
 
 def test_prompts_go_to_the_read_only_mount_not_the_git_tree(tmp_path):

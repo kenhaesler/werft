@@ -17,7 +17,7 @@ a reason that is not the binding one.
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 from werft.quota.window import ClosedEntry, WindowUsage, earliest_headroom_at
@@ -106,9 +106,13 @@ def decide(
 
     # 4. The ceiling itself.
     if consumed + usage.reserved_seconds + reservation_seconds > limits.ceiling_seconds:
+        # The tightened `consumed`, not the ledger's: ageing rows out of a load
+        # we know to be understated computes a wake time that arrives before
+        # the headroom does. The refusal and its retry time must be reasoned
+        # from the same number.
         retry_at = earliest_headroom_at(
             closed_in_window,
-            usage=usage,
+            usage=replace(usage, consumed_seconds=consumed),
             now=now,
             window_hours=limits.rolling_window_hours,
             ceiling_seconds=limits.ceiling_seconds,
