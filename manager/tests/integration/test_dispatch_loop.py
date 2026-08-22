@@ -346,6 +346,29 @@ async def test_the_concurrency_cap_counts_live_drivers_not_just_this_tick(loop_f
     await orchestrator.drain_drivers()
 
 
+async def test_the_concurrency_cap_counts_a_restarts_leftovers_before_it_adopts_them(loop_fixture):
+    """The first tick after a restart: the registry is empty, but N in-flight
+    rows with valid leases are still this VM's work — nothing requeues them,
+    and D13 runs dispatch *before* the attend sweep re-adopts them. A
+    registry-only budget would admit a full fresh batch here and then adopt the
+    leftovers on top of it, in the same tick."""
+    orchestrator, seeded, fakes = await loop_fixture(queued=3, ceiling_slots=10, max_concurrent=2)
+    fakes.driver.block = asyncio.Event()
+    leftover = await seed_run(
+        seeded, status="running", container_id="c1", lease_in=timedelta(minutes=5)
+    )
+
+    await orchestrator.tick_once()
+
+    in_flight = await count_status(seeded, "claimed") + await count_status(seeded, "running")
+    assert in_flight == 2  # the leftover plus exactly one new claim, never 2 + 1
+    assert orchestrator.live_driver_count == 2
+    assert leftover in orchestrator.live_driver_runs
+    assert await count_status(seeded, "queued") == 2
+    fakes.driver.block.set()
+    await orchestrator.drain_drivers()
+
+
 # --- the attend sweep is the only spawn path ------------------------------------
 
 

@@ -461,6 +461,14 @@ class Orchestrator:
         read has no business on the transaction path, and once per sweep is
         already enough for an image rebuild to take effect without a manager
         restart (D3).
+
+        The concurrency bound is measured by `_live_run_count`, never by the
+        registry alone: on the first tick after a restart the registry is empty
+        while N in-flight rows are still `claimed`/`running` with valid leases,
+        and D13 runs this sweep *before* `_sweep_attend` adopts them — so a
+        registry-only budget would admit a fresh batch and then re-adopt the
+        old one in the same tick, putting `max_concurrent_runs + N` containers
+        on a VM sized for `max_concurrent_runs`.
         """
         if self._dispatch is None:
             return
@@ -468,14 +476,20 @@ class Orchestrator:
         config = dispatch.config.current()  # last-good on a bad edit (D3)
         budget = min(
             self._settings.dispatch_max_claims_per_tick,
-            max(0, self._settings.max_concurrent_runs - len(self._drivers)),
+            max(0, self._settings.max_concurrent_runs - await self._live_run_count()),
         )
         for _ in range(budget):
             if stop is not None and stop.is_set():
                 return
             sink: list[ClaimOutcome] = []
+            # Re-read per candidate: each committed claim adds a `claimed` row,
+            # and this is the number `claim_next` re-checks under the advisory
+            # lock, where being wrong over-admits.
+            live = await self._live_run_count()
 
-            async def unit(session: AsyncSession, out: list[ClaimOutcome] = sink) -> None:
+            async def unit(
+                session: AsyncSession, out: list[ClaimOutcome] = sink, live: int = live
+            ) -> None:
                 out.append(
                     await claim_next(
                         session,
@@ -484,13 +498,37 @@ class Orchestrator:
                         settings=self._settings,
                         alerts=self._alerts,
                         now=datetime.now(UTC),
-                        live_driver_count=len(self._drivers),
+                        live_driver_count=live,
                     )
                 )
 
             committed = await self._run_unit("dispatch", "claim", unit)
             if not committed or not sink or sink[0].status != "claimed":
                 return
+
+    async def _live_run_count(self) -> int:
+        """How many runs this VM is really carrying, for the concurrency cap.
+
+        `max(registry, in-flight rows)` rather than either alone. The rows are
+        the durable half — after a restart the registry is empty and the
+        `claimed`/`running` rows with valid leases are exactly the work this
+        process is about to re-adopt, which nothing requeues (the lease sweep
+        only acts past `lease_expires_at`). The registry is the in-process
+        half — a driver exists for one await before its CAS lands, and for the
+        length of its teardown after the row has left `running`.
+
+        `max()` can only over-count, and only transiently, while a finalizing
+        row drains: conservative in the direction the cap exists to protect.
+        """
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(Run)
+                    .where(Run.status.in_(_ATTENDABLE_STATUSES))
+                )
+            ).scalar_one()
+        return max(len(self._drivers), rows)
 
     async def _sweep_attend(self, stop: asyncio.Event | None = None) -> None:
         """Every in-flight run that has no live driver gets one — the same code
