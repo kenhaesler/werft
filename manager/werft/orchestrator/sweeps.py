@@ -16,6 +16,22 @@ inside this same process must not be raced. A driver that cannot renew its
 lease *and* has left the registry is exactly the driver that should lose the
 row.
 
+**`sweep_deadlines` is the one deliberate exception: it is gated on the
+registry only, never on the lease.** The hard deadline is a ceiling on the
+*run*, not on the driver's liveness — a crashed manager can leave a row whose
+lease is still valid for up to `lease_seconds` while its deadline has already
+blown, and waiting the lease out there just burns the ceiling the deadline
+exists to enforce. The `live` check is all the arbitration it needs, because a
+driver still in the registry enforces the same ceiling from inside
+`RunnerLifecycle`. The two sweeps do not overlap: `sweep_leases` excludes a row
+whose deadline has also expired (D12(c), expressed in its query), so a
+doubly-expired row is handled exactly once, as a `timeout`.
+
+The container sweeps (`sweep_canceled_containers`, `sweep_orphan_containers`)
+are outside the rule entirely by construction: they act on containers belonging
+to runs that are no longer in flight at all, and D10 puts the canceled case
+deliberately beyond the registry.
+
 Every path here trues quota up in the **same transaction** as its transition
 (SPEC §7): `0` when the container never started, observed seconds when it did.
 Split them and a crash between the two leaves either a released reservation on
@@ -43,7 +59,7 @@ from werft.orchestrator.driver import _credential_values
 from werft.orchestrator.finalize import advance_failed
 from werft.quota.ledger import LedgerQuota
 from werft.runner.docker_api import DockerClient
-from werft.runner.workspace import placement_for, scrub_task_json
+from werft.runner.workspace import placement_for, remove_secrets, scrub_task_json
 
 logger = structlog.get_logger(__name__)
 
@@ -55,9 +71,12 @@ _IN_FLIGHT = (RunStatus.CLAIMED.value, RunStatus.RUNNING.value)
 #: durable link from a live container back to a row.
 RUN_ID_LABEL = "werft.run_id"
 
-#: The `dispatch` phase that marks a run's containers as already cleaned up.
-#: Both container sweeps are guarded by its absence, the same `~exists()` shape
-#: `loop._sweep_terminal_cleanup` uses, so a second tick is a no-op.
+#: The `dispatch` phase that records a *successful* cleanup of one container.
+#: `sweep_canceled_containers` is guarded by its absence for the container id on
+#: the row (the same `~exists()` shape `loop._sweep_terminal_cleanup` uses), so
+#: a second tick is a no-op. `sweep_orphan_containers` needs no such guard: its
+#: candidate set is the daemon's own container list, and a container that was
+#: really removed stops appearing in it.
 _REAPED_PHASE = "reaped"
 
 
@@ -77,21 +96,30 @@ class SweepDeps:
 # -- the container half --------------------------------------------------------
 
 
-async def _container_ids_for(deps: SweepDeps, run_id: UUID, container_id: str | None) -> list[str]:
-    """Every container id that belongs to this run.
+async def _container_ids_for(
+    deps: SweepDeps, run_id: UUID, container_id: str | None
+) -> tuple[list[str], bool]:
+    """Every container id that belongs to this run, and whether the scan itself
+    succeeded.
 
     The label is authoritative — a run whose `container_id` never made it to the
     row (crash between `start` and the `claimed -> running` CAS) is still
     findable by it. The row's own id is added anyway: when the daemon cannot be
     listed at all, it is the only handle left, and a `remove` of something
     already gone is a 404 the client swallows.
+
+    A failed scan is reported as a failure rather than as "no containers": the
+    caller turns success into a permanent `reaped` marker, and a daemon that
+    could not even be listed has proven nothing about what is still running.
     """
     ids: list[str] = []
+    scanned = True
     try:
         containers = await deps.docker.list_containers(all_=True)
     except Exception as exc:  # noqa: BLE001 - a daemon outage never blocks a row
         logger.warning("sweep.container_scan_failed", run_id=str(run_id), error=str(exc))
         containers = []
+        scanned = False
     for container in containers:
         labels = container.get("Labels") or {}
         found = container.get("Id")
@@ -99,37 +127,66 @@ async def _container_ids_for(deps: SweepDeps, run_id: UUID, container_id: str | 
             ids.append(found)
     if container_id and container_id not in ids:
         ids.append(container_id)
-    return ids
+    return ids, scanned
 
 
-async def reap_run_containers(deps: SweepDeps, run_id: UUID, container_id: str | None) -> None:
+async def reap_run_containers(deps: SweepDeps, run_id: UUID, container_id: str | None) -> bool:
     """Force-remove every container labelled `werft.run_id=<id>`, remove the
-    run's network, and scrub the retained `task.json`.
+    run's network, scrub the retained `task.json` and delete the mounted secret
+    files. Returns **True only when every piece of daemon work succeeded**.
 
     Best effort, and it **never raises**: a daemon outage must never stop a row
     from being recovered (crash-window row 5). The container is found again on
     the next tick by the orphan sweep; the row cannot wait that patiently,
-    because its reservation is open the whole time.
+    because its reservation is open the whole time. But "never raises" is not
+    "always worked": the return value is what keeps a transient 500 from being
+    recorded as a completed cleanup, which would strand the container and its
+    network forever.
+
+    Each container is attempted independently — one unremovable container must
+    not skip its siblings — and the network is attempted whatever happened to
+    them. `docker_api` already swallows 404/409, so anything that reaches the
+    handlers here is a genuine outage.
     """
     placement = placement_for(
         run_id,
         runs_root=deps.settings.runs_root,
         dns_ip=deps.settings.runner_dns_ip,
     )
-    try:
-        for found in await _container_ids_for(deps, run_id, container_id):
+    found_ids, ok = await _container_ids_for(deps, run_id, container_id)
+    for found in found_ids:
+        try:
             await deps.docker.kill_container(found)
             await deps.docker.remove_container(found, force=True)
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            logger.warning(
+                "sweep.cleanup_failed", run_id=str(run_id), container_id=found, error=str(exc)
+            )
+            ok = False
+    try:
         await deps.docker.remove_network(placement.network_name)
     except Exception as exc:  # noqa: BLE001 - see the docstring
-        logger.warning("sweep.cleanup_failed", run_id=str(run_id), error=str(exc))
+        logger.warning(
+            "sweep.cleanup_failed",
+            run_id=str(run_id),
+            network=placement.network_name,
+            error=str(exc),
+        )
+        ok = False
     # Unconditionally, and *after* the daemon work either way: D7's "the
     # retained run dir carries no live credential" is a property of the tree,
-    # not of the daemon being reachable. The secret values are read back off
+    # not of the daemon being reachable, so neither the scrub nor the secret
+    # removal is allowed to depend on `ok`. The secret values are read back off
     # `task.json` itself (`driver._credential_values`) — the driver that built
     # that `env` died with the manager, so no in-memory copy exists to scrub
-    # with, and the file is the one thing every path shares.
+    # with, and the file is the one thing every path shares. `remove_secrets`
+    # is the other half the driver's own teardown does and this path owes:
+    # `secrets_dir` lives *inside* the tree SPEC §8 retains and ships offsite.
+    # `revoke()` is the one piece impossible here — it needs the in-memory
+    # credential object that died with the driver.
     scrub_task_json(placement, secrets=_credential_values(placement))
+    remove_secrets(placement)
+    return ok
 
 
 # -- shared row helpers --------------------------------------------------------
@@ -208,7 +265,15 @@ async def _unit(
         return False
 
 
-async def _has_reaped_marker(session: AsyncSession, run_id: UUID) -> bool:
+async def _has_reaped_marker(session: AsyncSession, run_id: UUID, container_id: str | None) -> bool:
+    """Has *this container* already been reaped successfully?
+
+    Scoped to the container, not to the run: a run is a sequence of attempts and
+    each attempt gets its own container, so a run-wide marker would make the
+    second attempt's container unreapable forever. The marker is only ever
+    written after `reap_run_containers` reported success, so its presence means
+    "the daemon work is done", never "we once tried".
+    """
     return (
         await session.execute(
             select(RunEvent.id)
@@ -216,6 +281,7 @@ async def _has_reaped_marker(session: AsyncSession, run_id: UUID) -> bool:
                 RunEvent.run_id == run_id,
                 RunEvent.event_type == "dispatch",
                 RunEvent.payload["phase"].astext == _REAPED_PHASE,
+                RunEvent.payload["container_id"].astext == container_id,
             )
             .limit(1)
         )
@@ -436,7 +502,11 @@ async def sweep_canceled_containers(deps: SweepDeps, *, stop: asyncio.Event | No
 
     The driver that owns it is blocked in `await_completion`, and only the die
     event frees it — so exactly one component owns Docker for a cancel, and it
-    is this sweep. The `reaped` marker keeps it idempotent.
+    is this sweep. The row keeps its `container_id` after the cancel, so the
+    candidate set never empties by itself: the per-container `reaped` marker is
+    what keeps this idempotent, and it is written **only** when the reap
+    actually succeeded. A daemon outage therefore leaves the run a candidate for
+    the next tick instead of retiring it forever.
     """
     async with deps.session_factory() as session:
         rows = (
@@ -453,9 +523,10 @@ async def sweep_canceled_containers(deps: SweepDeps, *, stop: asyncio.Event | No
         if _stopped(stop):
             break
         async with deps.session_factory() as session:
-            if await _has_reaped_marker(session, run_id):
+            if await _has_reaped_marker(session, run_id, container_id):
                 continue
-        await reap_run_containers(deps, run_id, container_id)
+        if not await reap_run_containers(deps, run_id, container_id):
+            continue
         if await _unit(
             deps,
             "canceled_container",
@@ -475,6 +546,15 @@ async def sweep_orphan_containers(
     ran" (crash-window row 7) and "cancelled with no live driver". A run still
     in `claimed`/`running`, or one a live driver owns, is left alone — its
     container is not an orphan, it is somebody's work in progress.
+
+    Deliberately **unguarded by the `reaped` marker**. Its candidate set is the
+    daemon's own container list, so it is naturally idempotent: a container that
+    was really removed stops being listed, and one that is still listed still
+    needs removing. A marker here would be actively wrong twice over — it would
+    retire a container a transient 500 failed to remove, and it would make the
+    *next* attempt's container of a requeued run (`queued`, `failed` and
+    `blocked_quota` are all in this sweep's candidate set and all retryable)
+    unreapable forever.
     """
     try:
         containers = await deps.docker.list_containers(all_=True)
@@ -503,9 +583,8 @@ async def sweep_orphan_containers(
             run = await session.get(Run, run_id)
             if run is None or run.status in _IN_FLIGHT:
                 continue
-            if await _has_reaped_marker(session, run_id):
-                continue
-        await reap_run_containers(deps, run_id, container_id)
+        if not await reap_run_containers(deps, run_id, container_id):
+            continue
         if await _unit(
             deps,
             "orphan_container",
@@ -517,5 +596,8 @@ async def sweep_orphan_containers(
 
 
 async def _mark_reaped(session: AsyncSession, run_id: UUID, container_id: str | None) -> bool:
+    """Record that this container was cleaned up. Only ever called after
+    `reap_run_containers` returned True: the marker records success, not intent,
+    because `sweep_canceled_containers` treats it as final."""
     await _event(session, run_id, _REAPED_PHASE, {"container_id": container_id})
     return True

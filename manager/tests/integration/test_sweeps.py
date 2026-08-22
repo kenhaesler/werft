@@ -1,5 +1,7 @@
 """D12: the sweeps are the crash-recovery path. They act only on a row whose
-lease has already expired *and* which no live driver owns.
+lease has already expired *and* which no live driver owns — with one deliberate
+exception, pinned below: `sweep_deadlines` is gated on the live registry only,
+because the hard deadline is a ceiling on the run rather than on the driver.
 
 Postgres is real (triggers, CHECK constraints, the quota ledger), Docker is
 faked — the daemon is the one surface this milestone cannot exercise in CI.
@@ -52,33 +54,44 @@ _STATUS_PATHS: dict[str, tuple[str, ...]] = {
 
 
 class FakeDocker:
-    """The `DockerClient` surface the sweeps actually use."""
+    """The `DockerClient` surface the sweeps actually use.
+
+    `error` fails every operation; `failing_ops` narrows it to the named ones,
+    which is how the mid-reap daemon outage (a scan that works, a remove that
+    500s) is reachable. A successful `remove_container` **drops the container
+    from the list**, exactly as a real daemon does — that is what makes the
+    orphan sweep naturally idempotent with no marker to lean on.
+    """
 
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.containers: list[dict] = []
         self.error: Exception | None = None
+        self.failing_ops: set[str] | None = None
+
+    def _maybe_fail(self, op: str) -> None:
+        if self.error is None:
+            return
+        if self.failing_ops is None or op in self.failing_ops:
+            raise self.error
 
     async def list_containers(self, *, all_: bool = True) -> list[dict]:
         self.calls.append("list_containers")
-        if self.error is not None:
-            raise self.error
+        self._maybe_fail("list_containers")
         return list(self.containers)
 
     async def kill_container(self, container_id: str, signal: str = "SIGKILL") -> None:
         self.calls.append(f"kill:{container_id}")
-        if self.error is not None:
-            raise self.error
+        self._maybe_fail("kill_container")
 
     async def remove_container(self, container_id: str, *, force: bool = True) -> None:
         self.calls.append(f"remove_container:{container_id}")
-        if self.error is not None:
-            raise self.error
+        self._maybe_fail("remove_container")
+        self.containers = [c for c in self.containers if c.get("Id") != container_id]
 
     async def remove_network(self, name_or_id: str) -> None:
         self.calls.append(f"remove_network:{name_or_id}")
-        if self.error is not None:
-            raise self.error
+        self._maybe_fail("remove_network")
 
 
 class SpyAlerts(NullAlertSink):
@@ -229,6 +242,11 @@ async def sweeps_fixture(migrated_db, db_session, tmp_path):
 
         run_dir = tmp_path / "runs" / str(run_id)
         run_dir.mkdir(parents=True, exist_ok=True)
+        # Every claimed run has had its secrets mounted; `secrets/` lives inside
+        # the tree SPEC §8 retains, so the sweep owes it the same removal the
+        # driver's own teardown does (D7).
+        (run_dir / "secrets").mkdir(exist_ok=True)
+        (run_dir / "secrets" / "git_token").write_text("ghs-test", encoding="utf-8")
         if task_json_with_secret is not None:
             (run_dir / "task.json").write_text(
                 json.dumps(
@@ -462,6 +480,102 @@ async def test_an_unreachable_daemon_is_not_a_sweep_failure(sweeps_fixture):
     assert await sweep_leases(deps, now=NOW, live=set()) == 1  # the row still moves
     assert (await fetch(fakes, run_id)).status == "queued"
     assert await sweep_orphan_containers(deps, live=set()) == 0  # and this just logs
+
+
+async def test_a_daemon_error_mid_reap_never_retires_the_canceled_container(sweeps_fixture):
+    """`reap_run_containers` never raises, so the *only* thing separating "the
+    container is gone" from "a 500 ate the request" is its return value. Record
+    intent instead of success and one transient outage disables this sweep for
+    the run forever — the container and its network leak permanently, in exactly
+    the genuine-outage case the sweep exists for (`docker_api` already swallows
+    404/409)."""
+    deps, run_id, fakes = await sweeps_fixture(status="canceled", container_id="c1")
+    fakes.docker.error = DockerApiError(500, "connection refused")
+
+    assert await sweep_canceled_containers(deps) == 0
+    assert "reaped" not in await dispatch_phases(fakes, run_id)
+
+    fakes.docker.error = None
+    assert await sweep_canceled_containers(deps) == 1  # still a candidate
+    assert (await dispatch_phases(fakes, run_id))[-1] == "reaped"
+
+
+async def test_a_daemon_error_mid_reap_never_retires_the_orphan_container(sweeps_fixture):
+    """Same half for the orphan sweep: the scan succeeds, the remove 500s. The
+    container is still listed, so the next tick must still see it."""
+    deps, run_id, fakes = await sweeps_fixture(status="awaiting_review", container_id="c1")
+    fakes.docker.containers = [{"Id": "c1", "Labels": {"werft.run_id": str(run_id)}, "Names": []}]
+    fakes.docker.error = DockerApiError(500, "connection refused")
+    fakes.docker.failing_ops = {"kill_container", "remove_container", "remove_network"}
+
+    assert await sweep_orphan_containers(deps, live=set()) == 0
+    assert "reaped" not in await dispatch_phases(fakes, run_id)
+
+    fakes.docker.error = None
+    assert await sweep_orphan_containers(deps, live=set()) == 1
+    assert (await dispatch_phases(fakes, run_id))[-1] == "reaped"
+
+
+async def test_a_later_attempts_orphan_container_is_still_reaped(sweeps_fixture):
+    """The other half of the same finding: `queued` is in the orphan sweep's
+    candidate set and is retryable, so a run reaped once must not become
+    unreapable. Keying cleanup on the *run* would strand every subsequent
+    attempt's container."""
+    deps, run_id, fakes = await sweeps_fixture(
+        status="claimed", lease_in=timedelta(minutes=-1), container_id="c1"
+    )
+    fakes.docker.containers = [{"Id": "c1", "Labels": {"werft.run_id": str(run_id)}, "Names": []}]
+
+    assert await sweep_leases(deps, now=NOW, live=set()) == 1  # -> queued, c1 removed
+    assert await sweep_orphan_containers(deps, live=set()) == 0  # nothing left to reap
+
+    # The next attempt crashes the same way and leaves its own container behind.
+    fakes.docker.containers = [{"Id": "c2", "Labels": {"werft.run_id": str(run_id)}, "Names": []}]
+
+    assert await sweep_orphan_containers(deps, live=set()) == 1
+    assert "remove_container:c2" in fakes.docker.calls
+
+
+async def test_the_sweep_removes_the_mounted_secret_files_too(sweeps_fixture):
+    """D7 / SPEC §10: `secrets_dir` is `run_dir/secrets`, inside the tree SPEC §8
+    retains and ships offsite. Scrubbing `task.json` and leaving the mounted
+    token file behind upholds nothing. `revoke()` is the one piece this path
+    genuinely cannot do — it needs the credential object that died with the
+    driver — but `remove_secrets` has no such dependency."""
+    deps, run_id, fakes = await sweeps_fixture(status="canceled", container_id="c1")
+    token = run_dir_of(fakes, run_id) / "secrets" / "git_token"
+    assert token.exists()
+
+    assert await sweep_canceled_containers(deps) == 1
+
+    assert not token.exists()
+    assert (run_dir_of(fakes, run_id) / "secrets").is_dir()  # the tree itself is retained
+
+
+async def test_a_blown_deadline_is_acted_on_even_while_the_lease_is_still_valid(sweeps_fixture):
+    """The module docstring's arbitration rule has exactly one exception, and
+    this pins it: the deadline sweep is gated on the live registry only. A
+    crashed manager leaves a row whose lease is valid for up to `lease_seconds`
+    while its ceiling has already blown; waiting the lease out there just burns
+    the ceiling the deadline exists to enforce."""
+    deps, run_id, fakes = await sweeps_fixture(
+        status="running",
+        lease_in=timedelta(minutes=5),
+        deadline_in=timedelta(minutes=-1),
+        started_minutes_ago=7,
+        container_id="c1",
+    )
+
+    assert await sweep_leases(deps, now=NOW, live=set()) == 0
+    assert await sweep_deadlines(deps, now=NOW, live=set()) == 1
+
+    assert (await latest_attempt(fakes, run_id)).outcome == "timeout"
+    assert (await dispatch_phases(fakes, run_id))[-1] == "deadline_killed"
+    # ...and the registry is still honoured: a live driver keeps its own row.
+    deps2, run2, _ = await sweeps_fixture(
+        status="running", lease_in=timedelta(minutes=5), deadline_in=timedelta(minutes=-1)
+    )
+    assert await sweep_deadlines(deps2, now=NOW, live={run2}) == 0
 
 
 async def test_every_sweep_settles_the_reservation_in_the_transitions_own_transaction(
