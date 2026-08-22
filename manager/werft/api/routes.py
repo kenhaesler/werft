@@ -16,6 +16,7 @@ import os
 import re
 import stat
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from urllib.parse import quote
@@ -23,7 +24,7 @@ from uuid import UUID, uuid4
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,18 +48,24 @@ from werft.db.models import (
     BacklogItem,
     Project,
     ProviderAccount,
-    QuotaLedgerEntry,
     Run,
     RunAttempt,
     RunEvent,
 )
 from werft.db.transitions import transition_run
+from werft.domain.attempts import AttemptOutcome
 from werft.domain.errors import PermanentError
 from werft.domain.projects import ProjectLifecycle
 from werft.domain.runs import TERMINAL_STATUSES, ParkedReason, RunStatus
 from werft.orchestrator.ci_watch import flip_project
 from werft.orchestrator.merge_flow import advance_merging
-from werft.orchestrator.onboard import duplicate_project_message, onboard_project
+from werft.orchestrator.onboard import (
+    DuplicateProjectError,
+    duplicate_project_message,
+    is_duplicate_project_violation,
+    onboard_project,
+)
+from werft.quota.window import consumed_subq, reserved_subq
 
 logger = structlog.get_logger(__name__)
 
@@ -511,36 +518,18 @@ async def get_quota(
     "how much of my window am I about to spend" reading) is a possible
     refinement left to T7, which owns the reservation lifecycle end to
     end; this endpoint only reads what's already in the ledger.
+
+    The expressions themselves now live in `werft/quota/window.py`, shared
+    verbatim with admission (SPEC §7), so displayed headroom is enforced
+    headroom.
     """
-    # `make_interval`'s positional signature is (years, months, weeks, days,
-    # hours, mins, secs); zeros fill the leading params so the fifth
-    # position lands on `rolling_window_hours`, matching
-    # `test_api_runs.py`'s own `make_interval(secs => :offset)` seeding
-    # idiom one column over.
-    window_floor = func.now() - func.make_interval(0, 0, 0, 0, ProviderAccount.rolling_window_hours)
-
-    consumed_subq = (
-        select(func.coalesce(func.sum(QuotaLedgerEntry.actual_wallclock_s), 0))
-        .where(QuotaLedgerEntry.provider_account_id == ProviderAccount.id)
-        .where(QuotaLedgerEntry.actual_wallclock_s.is_not(None))
-        .where(QuotaLedgerEntry.consumed_at > window_floor)
-        .correlate(ProviderAccount)
-        .scalar_subquery()
-    )
-    reserved_subq = (
-        select(func.coalesce(func.sum(QuotaLedgerEntry.reserved_wallclock_s), 0))
-        .where(QuotaLedgerEntry.provider_account_id == ProviderAccount.id)
-        .where(QuotaLedgerEntry.actual_wallclock_s.is_(None))
-        .correlate(ProviderAccount)
-        .scalar_subquery()
-    )
-
+    now = datetime.now(UTC)
     stmt = select(
         ProviderAccount.provider,
         ProviderAccount.label,
         ProviderAccount.ceiling_seconds,
-        consumed_subq.label("consumed_seconds"),
-        reserved_subq.label("reserved_seconds"),
+        consumed_subq(now).label("consumed_seconds"),
+        reserved_subq().label("reserved_seconds"),
         ProviderAccount.exhausted_until,
         ProviderAccount.exhausted_source,
         ProviderAccount.last_reading_utilization,
@@ -647,10 +636,13 @@ async def accept_review(
 
     Winning the lock second is the other half of that contract, and it is
     why the re-read is followed by a status guard rather than used as-is.
-    `advance_merging` has no status check of its own — the poller's guard is
-    its `WHERE status = 'merging'` discovery query, taken *inside* the lock,
-    and this is that query's equivalent. A sweep that held the lock first
-    may already have landed the merge (`merging -> merged`, with the real
+    `advance_merging` now guards its own entry on `status == 'merging'`
+    (`merge_flow.py`), so this re-read is defence in depth rather than the only
+    thing standing between a rival sweep and a clobbered `merge_commit_sha`.
+    It stays because it also saves the GitHub round trip the guard would
+    otherwise pay for, and because the re-read is what makes the CAS inside
+    `advance_merging` see this row's current version at all. A sweep that
+    held the lock first may already have landed the merge (`merging -> merged`, with the real
     `merge_commit_sha`): re-driving the decision table on that row reads a
     now-`merged` PR, takes the merged-out-of-band branch, and CASes
     `merged -> merged` with `merge_commit_sha=None` — which *wins*, because
@@ -731,6 +723,7 @@ async def reject_review(
 @api_router.post("/runs/{run_id}/cancel", response_model=RunSummary)
 async def cancel_run(
     run_id: UUID,
+    request: Request,
     session: AsyncSession = Depends(get_session),  # noqa: B008 - FastAPI's DI pattern
 ) -> RunSummary:
     """`POST /api/v1/runs/{id}/cancel` — CAS `<non-terminal> -> canceled`
@@ -738,10 +731,62 @@ async def cancel_run(
     if the run is already terminal. Cleanup (closing any open PR, deleting
     the run branch) happens out-of-band via the tick sweep's
     `cleanup_terminal` — this endpoint only flips the status.
+
+    D10's division of labour: this route closes the open attempt row and
+    trues up the reservation (SPEC §7's release, in the same transaction as
+    the CAS) but never touches Docker. The container, if any, is killed by
+    the tick's `sweep_canceled_containers` — always, even while a driver is
+    still live in `await_completion`, because only the container's own die
+    event unblocks that driver. A route that reached for the socket here
+    would be a second owner of the same container.
     """
     run = await _get_run_for_mutation(session, run_id)
     if run.status in TERMINAL_STATUSES:
         raise HTTPException(status_code=409, detail=f"run is already {run.status}")
+
+    # SPEC §7: "A reservation is also released — trued-up to zero or to observed
+    # container seconds — in the same transaction as any transition out of
+    # `claimed`/`running` that does not pass through CLI exit (lease expiry,
+    # hard-deadline sweep, cancel): no path leaks headroom." `claimed` never
+    # started a CLI, so its observed time is zero; `running` gets what the
+    # manager itself watched elapse.
+    #
+    # The container is *not* killed here (plan decision D10): the tick's
+    # canceled-container sweep owns that — always, even while a driver is live,
+    # because that driver is blocked in `await_completion` and only the die
+    # event will free it. An API route that reached for the Docker socket would
+    # be a second owner of containers.
+    if run.status in (RunStatus.CLAIMED.value, RunStatus.RUNNING.value):
+        attempt = (
+            (
+                await session.execute(
+                    select(RunAttempt)
+                    .where(RunAttempt.run_id == run_id, RunAttempt.ended_at.is_(None))
+                    .order_by(RunAttempt.attempt_no.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .one_or_none()
+        )
+        observed = 0
+        if attempt is not None:
+            ended_at = datetime.now(UTC)
+            observed = (
+                0
+                if run.container_id is None
+                else max(0, int((ended_at - attempt.started_at).total_seconds()))
+            )
+            await session.execute(
+                update(RunAttempt)
+                .where(RunAttempt.id == attempt.id)
+                .values(
+                    outcome=AttemptOutcome.CANCELED.value,
+                    ended_at=ended_at,
+                    duration_seconds=observed,
+                )
+            )
+        await request.app.state.quota.release(session, run, observed)
 
     ok = await transition_run(
         session, run_id=run_id, expected_version=run.version, new_status=RunStatus.CANCELED
@@ -803,19 +848,22 @@ async def onboard(
     setup, driven through `orchestrator/onboard.py`'s `onboard_project`.
     Requires GitHub creds (controller ruling: unlike the run mutations,
     onboard cannot proceed without them) — 503 when `app.state.ops_for`/
-    `admin_ops_for` are unset. `onboard_project`'s `PermanentError` maps to
-    409 for a duplicate slug/repo, 422 for an unreachable installation
-    (main branch/repo not found).
+    `admin_ops_for` are unset. `onboard_project`'s `DuplicateProjectError`
+    maps to 409 for a duplicate slug/repo; any other `PermanentError` maps
+    to 422 for an unreachable installation (main branch/repo not found).
 
     A *concurrent* duplicate answers 409 too, by the other route: two
     onboards of the same slug/repo both pass `onboard_project`'s duplicate
     `SELECT` — taken before its GitHub round trips — and the loser's INSERT
     violates `projects`' unique constraints instead. That `IntegrityError`
-    is caught here and answered with the same 409 body as the sequential
-    duplicate, rather than escaping as an unhandled 500 (nothing in this app
-    registers an exception handler). The losing transaction rolls back, so
-    nothing partial survives, and every GitHub call it already made is
-    idempotent — the winner's project is unaffected.
+    is caught here and mapped by constraint name (`is_duplicate_project_violation`)
+    rather than by message substring: only the two `projects` unique
+    constraints answer 409 with the same body as the sequential duplicate;
+    every other `IntegrityError` (a CHECK violation, a NOT NULL) answers 422
+    instead of escaping as an unhandled 500 (nothing in this app registers
+    an exception handler). The losing transaction rolls back, so nothing
+    partial survives, and every GitHub call it already made is idempotent —
+    the winner's project is unaffected.
 
     No `Project` row exists yet for `app.state.ops_for`'s per-project cache
     key to key off of — a throwaway `SimpleNamespace` carrying just the
@@ -838,16 +886,20 @@ async def onboard(
             owner=body.owner,
             repo=body.repo,
         )
+    except DuplicateProjectError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except PermanentError as exc:
         await session.rollback()
-        message = str(exc)
-        status_code = 409 if "already onboarded" in message else 422
-        raise HTTPException(status_code=status_code, detail=message) from exc
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except IntegrityError as exc:
         await session.rollback()
-        raise HTTPException(
-            status_code=409, detail=duplicate_project_message(body.slug, body.owner, body.repo)
-        ) from exc
+        if is_duplicate_project_violation(exc):
+            raise HTTPException(
+                status_code=409,
+                detail=duplicate_project_message(body.slug, body.owner, body.repo),
+            ) from exc
+        raise HTTPException(status_code=422, detail="project rejected by the database") from exc
 
     await session.commit()
     return _project_out(project)

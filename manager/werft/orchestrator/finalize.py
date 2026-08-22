@@ -38,7 +38,7 @@ quota is a property of the attempt being over, not of how it ended.
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 from uuid import UUID
 
 from sqlalchemy import select, update
@@ -56,23 +56,34 @@ from werft.providers.base import Classification
 
 #: Attempt outcomes that have a dedicated `parked_reason` CHECK slot of
 #: their own. Everything absent here parks as the generic `agent_failure`
-#: (`auth_failure`/`policy_block`/`timeout`/`canceled` — no slot yet; only
-#: the alert distinguishes them). Operator-facing: T6's review queue reads
+#: (`auth_failure`/`policy_block`/`canceled` — no slot yet; only the alert
+#: distinguishes them). Operator-facing: T6's review queue reads
 #: `parked_reason` directly.
 _PARKED_REASON_BY_OUTCOME: dict[AttemptOutcome, ParkedReason] = {
     AttemptOutcome.INFRA_FAILURE: ParkedReason.INFRA_FAILURE,
+    # T7: the deadline sweep is the only producer of TIMEOUT, and
+    # `parked_reason` has a `deadline` slot. Parking a wall-clock overrun as
+    # `agent_failure` points the operator at the prompt.
+    AttemptOutcome.TIMEOUT: ParkedReason.DEADLINE,
 }
 
 
+@runtime_checkable
 class QuotaPort(Protocol):
-    """The quota-release seam `finalize_attempt` calls inside its own
-    transaction. T7 replaces `NullQuota` with the real ledger true-up
-    (`quota_ledger.actual_wallclock_s`); the seam exists now so
-    `finalize_attempt` never has to change shape to grow it."""
+    """The quota seam `finalize_attempt` and `advance_failed` call inside their
+    own transaction. `werft/quota/ledger.py::LedgerQuota` is the real
+    implementation; it may not import this module (import-linter: `quota` sits
+    below `orchestrator`), so it satisfies this **structurally** and a test
+    asserts the match. `NullQuota` keeps the pre-T7 behaviour for tests and for
+    a manager booted with no provider account."""
 
     async def release(
         self, session: AsyncSession, run: Run, observed_seconds: int | None
     ) -> None: ...
+
+    async def next_wake_at(
+        self, session: AsyncSession, run: Run, exhausted_until: datetime | None
+    ) -> datetime: ...
 
 
 class NullQuota:
@@ -81,6 +92,13 @@ class NullQuota:
 
     async def release(self, session: AsyncSession, run: Run, observed_seconds: int | None) -> None:
         return None
+
+    async def next_wake_at(
+        self, session: AsyncSession, run: Run, exhausted_until: datetime | None
+    ) -> datetime:
+        # The pre-T7 rule, verbatim: the provider's own reset time when it gave
+        # one, else this system's own 15-minute retry heuristic.
+        return exhausted_until or (datetime.now(UTC) + timedelta(minutes=15))
 
 
 async def _current_attempt(session: AsyncSession, run_id: UUID) -> RunAttempt:
@@ -275,9 +293,10 @@ async def advance_failed(
 ) -> None:
     """Behavioral decision 8, verbatim (thin plan): route a `failed` run on.
 
-    `quota` is accepted but unused today — a deliberately reserved seam so
-    T7's window-headroom refinement of the `blocked_quota` wake time can
-    extend this function without changing its signature or its callers.
+    `quota.next_wake_at` computes the `blocked_quota` wake time on the
+    budget-exempt branch (SPEC §3.2: "wake at `exhausted_until` / window
+    headroom") — the seam has been reserved since T5 for exactly this
+    (carried note 3), so this function's signature does not move.
 
     Takes `outcome` and `exhausted_until` directly rather than the whole
     `Classification` `finalize_attempt` holds: those are the two values this
@@ -299,10 +318,12 @@ async def advance_failed(
     `infra_failure` has one (`ParkedReason.INFRA_FAILURE`), and recording a
     disk-full or container-start failure as `agent_failure` would point an
     operator at the prompt when the infrastructure never let the agent run.
-    `auth_failure`/`policy_block`/`timeout`/`canceled` genuinely have no
-    dedicated slot yet and do fall through to the generic
-    `agent_failure` — post-milestone fallthrough, and only the alert
-    distinguishes them today.
+    `timeout` also has one (`ParkedReason.DEADLINE`) as of T7: the deadline
+    sweep is its only producer, and parking a wall-clock overrun as
+    `agent_failure` would likewise mislead. `auth_failure`/`policy_block`/
+    `canceled` genuinely have no dedicated slot yet and do fall through to
+    the generic `agent_failure` — post-milestone fallthrough, and only the
+    alert distinguishes them today.
 
     `alerts` is used for exactly one thing here: `quota_exhausted_until`, on
     the `failed -> blocked_quota` edge, and only when the provider actually
@@ -313,7 +334,12 @@ async def advance_failed(
     project slug this function has no reason to load.
     """
     if outcome in BUDGET_EXEMPT_OUTCOMES:
-        next_attempt_at = exhausted_until or (datetime.now(UTC) + timedelta(minutes=15))
+        # SPEC §3.2: "wake at `exhausted_until` / window headroom". The `quota`
+        # parameter has been a reserved seam since T5 for exactly this (carried
+        # note 3): the ledger knows both the provider's durable reset time and
+        # the moment enough in-window seconds age out for the next reservation
+        # to fit, and this function never did. The signature does not move.
+        next_attempt_at = await quota.next_wake_at(session, run, exhausted_until)
         ok = await transition_run(
             session,
             run_id=run.id,

@@ -60,6 +60,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from werft.api.auth import make_require_token
 from werft.api.routes import api_router, healthz_router
+from werft.config.dispatch import DispatchConfigCache, load_dispatch_config
 from werft.config.settings import Settings
 from werft.db.engine import create_engine_from_url
 from werft.db.models import Project
@@ -67,8 +68,12 @@ from werft.github.auth import ADMIN_PERMISSIONS, MANAGER_PERMISSIONS, AppAuth
 from werft.github.client import GitHubClient
 from werft.github.ops import RepoOps
 from werft.observe.alerts import NtfyAlertSink, NullAlertSink
-from werft.orchestrator.finalize import NullQuota
-from werft.orchestrator.loop import Orchestrator
+from werft.orchestrator.finalize import NullQuota, QuotaPort
+from werft.orchestrator.loop import DispatchServices, Orchestrator
+from werft.providers.claude import ClaudeSpec
+from werft.quota.accounts import ensure_provider_account
+from werft.quota.ledger import LedgerQuota
+from werft.runner.docker_api import DockerClient
 
 logger = structlog.get_logger(__name__)
 
@@ -244,6 +249,19 @@ def _read_token_file(path: str) -> str | None:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings or Settings()
+
+    # Fail boot loudly on a broken dispatch config (plan decision D3): the
+    # operator is watching at startup, and a manager that boots on a broken
+    # file parks every run at 03:00. Mid-flight the rule is the opposite —
+    # `DispatchConfigCache` keeps the last good value.
+    load_dispatch_config(resolved.dispatch_config_file)
+    if resolved.runs_root != resolved.artifacts_root:
+        logger.warning(
+            "app.runs_root_diverges_from_artifacts_root",
+            runs_root=resolved.runs_root,
+            artifacts_root=resolved.artifacts_root,
+        )
+
     require_token = make_require_token(_read_token_file(resolved.api_token_file))
     ntfy_token = _read_token_file(resolved.ntfy_token_file)
 
@@ -269,6 +287,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # needs a session factory to serve /api/v1/runs. The engine
             # above is a lazy connection pool, so building it here opens no
             # connection until a route actually issues a query.
+            #
+            # `app.state.quota` is `NullQuota()` on this path regardless of
+            # `quota_ceiling_seconds`: dispatch never runs without an
+            # orchestrator, and no orchestrator exists here — but the cancel
+            # route still needs a port to call `release` on.
+            app.state.quota = NullQuota()
             try:
                 yield
             finally:
@@ -281,38 +305,137 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     await engine.dispose()
             return
 
-        private_key_pem = Path(resolved.github_app_private_key_file).read_text()
-        http = httpx.AsyncClient()
-        auth = AppAuth(
-            http,
-            client_id=resolved.github_app_client_id,
-            private_key_pem=private_key_pem,
-            api_url=resolved.github_api_url,
-        )
-        # The same two factories the orchestrator's poll loop uses are also
-        # what the operator API's mutation routes need (onboard, manual
-        # flip, accept's best-effort inline `advance_merging`) — one
-        # composition root, one set of factories, published on `app.state`
-        # rather than each route minting its own `GitHubClient`/`AppAuth`.
-        app.state.ops_for = _ops_factory(auth, http, resolved.github_api_url, MANAGER_PERMISSIONS)
-        app.state.admin_ops_for = _admin_ops_factory(auth, http, resolved.github_api_url)
-        orchestrator = Orchestrator(
-            app.state.session_factory,
-            app.state.ops_for,
-            app.state.admin_ops_for,
-            alerts=app.state.alerts,
-            quota=NullQuota(),
-            settings=resolved,
-        )
-        # The orchestrator's own merging lock, published for the accept
-        # route's inline `advance_merging` kick (api/routes.py). This branch
-        # is the only place an orchestrator exists at all — and it is
-        # exactly the branch that sets `ops_for`, the kick's own guard — so
-        # whenever the kick runs, the poller is running too and the two
-        # genuinely share this instance. The placeholder lock set in
-        # `create_app` below is only ever the one the kick takes when no
-        # orchestrator exists to contend with it.
-        app.state.merging_lock = orchestrator.merging_lock
+        # Everything from here down can raise before the `try: yield` below
+        # is ever reached (a missing key file, a DB error out of
+        # `ensure_provider_account`, a `docker.negotiate()` that can't reach
+        # the socket) — and by that point `engine`, and possibly `ntfy_http`,
+        # are already open. Without this `try`, that failure would propagate
+        # straight out of `lifespan` and leak both: the `finally` chain that
+        # closes them lives inside the `try: yield` block below, which a
+        # startup failure never enters. `http`/`docker` are declared here,
+        # ahead of assignment, purely so the `except` can tell "never
+        # opened" apart from "opened, now must be closed" for each.
+        http: httpx.AsyncClient | None = None
+        docker: DockerClient | None = None
+        try:
+            private_key_pem = Path(resolved.github_app_private_key_file).read_text()
+            http = httpx.AsyncClient()
+            auth = AppAuth(
+                http,
+                client_id=resolved.github_app_client_id,
+                private_key_pem=private_key_pem,
+                api_url=resolved.github_api_url,
+            )
+            # The same two factories the orchestrator's poll loop uses are
+            # also what the operator API's mutation routes need (onboard,
+            # manual flip, accept's best-effort inline `advance_merging`) —
+            # one composition root, one set of factories, published on
+            # `app.state` rather than each route minting its own
+            # `GitHubClient`/`AppAuth`.
+            app.state.ops_for = _ops_factory(
+                auth, http, resolved.github_api_url, MANAGER_PERMISSIONS
+            )
+            app.state.admin_ops_for = _admin_ops_factory(auth, http, resolved.github_api_url)
+
+            # SPEC §7's one knob, reconciled at boot (plan decision D4). `DO
+            # UPDATE` so config + restart is the whole operator surface —
+            # there is no seed script, no migration and no endpoint, because
+            # SPEC §9 closes the write set and a migration would bake a
+            # fabricated ceiling into every deploy. With the ceiling unset,
+            # no row exists and nothing dispatches: no invented ceilings,
+            # and no run is parked for it.
+            quota: QuotaPort = NullQuota()
+            if resolved.quota_ceiling_seconds > 0:
+                quota = LedgerQuota(
+                    provider=resolved.quota_provider,
+                    label=resolved.quota_account_label,
+                    fallback_seconds=resolved.quota_block_fallback_seconds,
+                    typical_reservation_seconds=resolved.typical_reservation_seconds,
+                )
+                async with app.state.session_factory() as session, session.begin():
+                    await ensure_provider_account(
+                        session,
+                        provider=resolved.quota_provider,
+                        label=resolved.quota_account_label,
+                        ceiling_seconds=resolved.quota_ceiling_seconds,
+                        rolling_window_hours=resolved.quota_rolling_window_hours,
+                        window_cap_runs=resolved.quota_window_cap_runs,
+                        provider_window_capacity_seconds=resolved.quota_window_capacity_seconds,
+                    )
+            app.state.quota = quota  # the cancel route's true-up (D10)
+
+            # Review finding 1 (Task 17 fix round 1): the brief's literal
+            # three-way gate — dispatch config + credential file + GitHub
+            # creds — omitted the quota ceiling. SPEC §7 ("no reservation,
+            # no claim") makes quota load-bearing for dispatch: with the
+            # ceiling at its 0 default, `quota` above is `NullQuota()`, and
+            # `claim_next` calls `lock_and_resolve`/`next_attempt_no`/
+            # `reserve` — none of which `NullQuota` implements — so the
+            # first `_sweep_dispatch` tick would die with `AttributeError`.
+            # A ceiling of 0 therefore leaves the dispatch plane dark
+            # (`dispatch=None`) rather than failing boot: the operator may
+            # be staging the other three settings ahead of the ceiling, and
+            # a boot failure here would be a worse surprise than a quiet,
+            # loudly-logged no-op.
+            dispatch_services = None
+            if resolved.dispatch_config_file and resolved.claude_credential_file:
+                if resolved.quota_ceiling_seconds > 0:
+                    docker = DockerClient(resolved.docker_url)
+                    await docker.negotiate()
+                    dispatch_services = DispatchServices(
+                        docker=docker,
+                        auth=auth,
+                        spec=ClaudeSpec(),
+                        config=DispatchConfigCache(resolved.dispatch_config_file),
+                        quota=quota,
+                    )
+                else:
+                    logger.warning(
+                        "app.dispatch_disabled_no_quota_ceiling",
+                        dispatch_config_file=resolved.dispatch_config_file,
+                        claude_credential_file=resolved.claude_credential_file,
+                        reason="quota_ceiling_seconds is 0: SPEC §7 requires a "
+                        "configured ceiling before the dispatch plane may claim "
+                        "runs (no reservation, no claim). Set "
+                        "WERFT_QUOTA_CEILING_SECONDS to enable dispatch.",
+                    )
+            orchestrator = Orchestrator(
+                app.state.session_factory,
+                app.state.ops_for,
+                app.state.admin_ops_for,
+                alerts=app.state.alerts,
+                quota=quota,
+                settings=resolved,
+                dispatch=dispatch_services,
+            )
+            # The orchestrator's own merging lock, published for the accept
+            # route's inline `advance_merging` kick (api/routes.py). This
+            # branch is the only place an orchestrator exists at all — and
+            # it is exactly the branch that sets `ops_for`, the kick's own
+            # guard — so whenever the kick runs, the poller is running too
+            # and the two genuinely share this instance. The placeholder
+            # lock set in `create_app` below is only ever the one the kick
+            # takes when no orchestrator exists to contend with it.
+            app.state.merging_lock = orchestrator.merging_lock
+        except Exception:
+            # Same close order the normal teardown below uses
+            # (ntfy -> http -> docker -> engine), just without the bounded
+            # drain: nothing has been queued on `ntfy_http` yet at this
+            # point in startup, so there is nothing to drain, only to close.
+            try:
+                if ntfy_http is not None:
+                    await ntfy_http.aclose()
+            finally:
+                try:
+                    if http is not None:
+                        await http.aclose()
+                finally:
+                    try:
+                        if docker is not None:
+                            await docker.aclose()
+                    finally:
+                        await engine.dispose()
+            raise
 
         stop = asyncio.Event()
         task = asyncio.create_task(orchestrator.run(stop))
@@ -338,6 +461,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     if ntfy_http is not None:
                         await ntfy_http.aclose()
                     await http.aclose()
+                    if docker is not None:
+                        await docker.aclose()
                     await engine.dispose()
 
     # FastAPI's three default documentation routes are turned off, not
@@ -368,6 +493,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.ops_for = None
     app.state.admin_ops_for = None
     app.state.alerts = NullAlertSink()
+    # Same reasoning as `alerts` above: the cancel route (api/routes.py)
+    # reads `request.app.state.quota` unconditionally, including in tests
+    # that never enter `lifespan_context`. Both lifespan branches overwrite
+    # this — the no-GitHub branch with a fresh `NullQuota()`, the
+    # GitHub-configured branch with the reconciled `LedgerQuota`/`NullQuota`
+    # pair described above.
+    app.state.quota = NullQuota()
     # Placeholder for the orchestrator's own lock (the lifespan's GitHub
     # branch overwrites it with `orchestrator.merging_lock`), so the accept
     # route's kick always has a lock to take — including in tests that never
