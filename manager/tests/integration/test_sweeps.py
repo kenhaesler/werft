@@ -18,6 +18,7 @@ import pytest
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from tests.fakes import FakeDocker, SpyAlerts
 from werft.config.settings import Settings
 from werft.db.models import QuotaLedgerEntry, Run, RunAttempt, RunEvent
 from werft.observe.alerts import NullAlertSink
@@ -48,58 +49,6 @@ _STATUS_PATHS: dict[str, tuple[str, ...]] = {
     "canceled": ("canceled",),
     "awaiting_review": ("running", "awaiting_review"),
 }
-
-
-# --- fakes -------------------------------------------------------------------
-
-
-class FakeDocker:
-    """The `DockerClient` surface the sweeps actually use.
-
-    `error` fails every operation; `failing_ops` narrows it to the named ones,
-    which is how the mid-reap daemon outage (a scan that works, a remove that
-    500s) is reachable. A successful `remove_container` **drops the container
-    from the list**, exactly as a real daemon does — that is what makes the
-    orphan sweep naturally idempotent with no marker to lean on.
-    """
-
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-        self.containers: list[dict] = []
-        self.error: Exception | None = None
-        self.failing_ops: set[str] | None = None
-
-    def _maybe_fail(self, op: str) -> None:
-        if self.error is None:
-            return
-        if self.failing_ops is None or op in self.failing_ops:
-            raise self.error
-
-    async def list_containers(self, *, all_: bool = True) -> list[dict]:
-        self.calls.append("list_containers")
-        self._maybe_fail("list_containers")
-        return list(self.containers)
-
-    async def kill_container(self, container_id: str, signal: str = "SIGKILL") -> None:
-        self.calls.append(f"kill:{container_id}")
-        self._maybe_fail("kill_container")
-
-    async def remove_container(self, container_id: str, *, force: bool = True) -> None:
-        self.calls.append(f"remove_container:{container_id}")
-        self._maybe_fail("remove_container")
-        self.containers = [c for c in self.containers if c.get("Id") != container_id]
-
-    async def remove_network(self, name_or_id: str) -> None:
-        self.calls.append(f"remove_network:{name_or_id}")
-        self._maybe_fail("remove_network")
-
-
-class SpyAlerts(NullAlertSink):
-    def __init__(self) -> None:
-        self.run_parked_calls: list[tuple[str, uuid.UUID, str]] = []
-
-    async def run_parked(self, project_slug, run_id, reason):
-        self.run_parked_calls.append((project_slug, run_id, reason))
 
 
 # --- fixture -----------------------------------------------------------------

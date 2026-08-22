@@ -23,8 +23,8 @@ import pytest
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from tests.fakes import FakeDocker
 from tests.integration.test_loop import FakeRepoOps
-from tests.integration.test_sweeps import FakeDocker
 from werft.config.dispatch import DispatchConfigCache
 from werft.config.settings import Settings
 from werft.db.models import Run, RunEvent
