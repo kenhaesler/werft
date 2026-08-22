@@ -68,6 +68,28 @@ with. `_loop` adds one more layer of the same belt-and-braces: even a whole
 transient DB error) is caught there too, so a single bad tick never kills
 the loop that would have retried it 15/30/60 s later anyway.
 
+The dispatch plane (T7, SPEC §3.2/§4) is folded into that same tick rather
+than given a loop of its own (plan decision D13) — a fourth loop would be a
+second scheduler in all but name, and a run that starts 15 s later finishes
+15 s later out of ninety minutes. It is optional as a whole: without
+`DispatchServices` every one of its sweeps returns immediately, which is
+exactly the pre-T7 manager. Its order inside `tick_once` is load-bearing:
+the two wakes, then lease/deadline/orphan/canceled recovery, then dispatch,
+then attend. Wakes before dispatch so a run that just became eligible is
+claimable in the same tick; the sweeps before dispatch so headroom a dead
+manager was holding is visible to this tick's admission; dispatch before
+attend so a run claimed here starts attending immediately.
+
+`_drivers` is the process-local other half of the lease column (`sweeps.py`:
+the column is durable, the registry is in-process), and `_sweep_attend` is
+the only place an entry is ever created — the same code path adopts a run
+claimed 15 s ago and a run this manager inherited from its own crashed
+predecessor, so crash recovery is the normal path rather than a second one
+that can rot. Driver tasks are deliberately outside `run`'s `TaskGroup`:
+they outlive the sweep that spawned them by up to ninety minutes, and at
+shutdown they get `drain_drivers`' own bounded budget instead — a cancelled
+driver leaves its container running on purpose (D1).
+
 Every sweep also accepts an optional `stop: asyncio.Event`, threaded down
 from `run()`'s own stop event, and checks `stop.is_set()` between units
 (never mid-unit) before starting the next one — a shutdown mid-sweep stops
@@ -78,30 +100,71 @@ large) candidate list first.
 import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
 import structlog
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from werft.config.dispatch import DispatchConfigCache
 from werft.config.settings import Settings
 from werft.db.models import Project, Run, RunAttempt, RunEvent
 from werft.db.transitions import transition_run
 from werft.domain.attempts import AttemptOutcome
 from werft.domain.projects import ProjectLifecycle
 from werft.domain.runs import RunStatus
+from werft.github.auth import AppAuth
 from werft.github.ops import RepoOps
 from werft.observe.alerts import AlertSink
 from werft.orchestrator.backlog import intake, sync_backlog
 from werft.orchestrator.ci_watch import advance_awaiting_ci, check_flip
+from werft.orchestrator.dispatch import ClaimOutcome, claim_next
+from werft.orchestrator.driver import DriverDeps, attend_run
 from werft.orchestrator.finalize import QuotaPort, advance_failed
 from werft.orchestrator.merge_flow import advance_merging, cleanup_terminal
+from werft.orchestrator.sweeps import (
+    SweepDeps,
+    sweep_canceled_containers,
+    sweep_deadlines,
+    sweep_leases,
+    sweep_orphan_containers,
+)
+from werft.providers.base import ProviderSpec
+from werft.quota.ledger import LedgerQuota
+from werft.runner.docker_api import DockerClient
 
 logger = structlog.get_logger(__name__)
 
 #: `_sweep_terminal_cleanup`'s candidate statuses (decision 1, mirrored from
 #: `merge_flow._CLEANUP_STATUSES`): `parked` is deliberately excluded.
 _CLEANUP_CANDIDATE_STATUSES = (RunStatus.CANCELED.value, RunStatus.MERGED.value)
+
+#: `_sweep_attend`'s candidate statuses: the two that mean "an attempt is in
+#: flight and somebody has to be attending it" (mirrored from `sweeps._IN_FLIGHT`).
+_ATTENDABLE_STATUSES = (RunStatus.CLAIMED.value, RunStatus.RUNNING.value)
+
+
+@dataclass(frozen=True)
+class DispatchServices:
+    """The collaborators the dispatch plane needs and the pre-T7 tick does not
+    (SPEC §4). Optional as a whole, by construction: a manager with no dispatch
+    config, no provider credential or no Docker socket still serves `/api/v1`
+    and runs its GitHub pollers, and every dispatch sweep is a no-op.
+
+    Deliberately *only* the new pieces: the session factory, `ops_for`, the
+    alert sink and the settings the driver and the sweeps also need are already
+    the orchestrator's own, and duplicating them here would let a composition
+    root hand the dispatch plane a different database than the tick's.
+    """
+
+    docker: DockerClient
+    auth: AppAuth
+    spec: ProviderSpec
+    config: DispatchConfigCache
+    quota: LedgerQuota
 
 
 class Orchestrator:
@@ -121,6 +184,7 @@ class Orchestrator:
         alerts: AlertSink,
         quota: QuotaPort,
         settings: Settings,
+        dispatch: DispatchServices | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._ops_for = ops_for
@@ -137,6 +201,31 @@ class Orchestrator:
         #: `advance_merging` kick runs on this same event loop and must take
         #: this same instance, or it re-opens the race from the other side.
         self.merging_lock = asyncio.Lock()
+        self._dispatch = dispatch
+        #: Live attempt drivers, keyed by run id. With one process and one
+        #: event loop this dict *is* the in-process fact "somebody is attending
+        #: this run", and the sweeps use it alongside the lease column: the
+        #: column is the durable half (after a crash this dict is empty and
+        #: stale leases are exactly the dead manager's rows), this dict is the
+        #: half that protects a live driver whose heartbeat stalled here.
+        #: `_sweep_attend` is the ONLY place an entry is ever created
+        #: (plan decision D1), which is what makes crash recovery the normal
+        #: path rather than a second code path that can rot.
+        self._drivers: dict[UUID, asyncio.Task[None]] = {}
+        #: Built once, not per sweep and not per driver: both are frozen
+        #: bundles of collaborators this orchestrator already owns, and
+        #: `driver.py`/`sweeps.py` both say the same thing — one instance,
+        #: handed to every task.
+        self._sweep_bundle = None if dispatch is None else self._build_sweep_deps(dispatch)
+        self._driver_bundle = None if dispatch is None else self._build_driver_deps(dispatch)
+
+    @property
+    def live_driver_runs(self) -> set[UUID]:
+        return set(self._drivers)
+
+    @property
+    def live_driver_count(self) -> int:
+        return len(self._drivers)
 
     # -- the per-unit session/transaction wrapper ----------------------------
 
@@ -279,10 +368,197 @@ class Orchestrator:
     # -- tick_once: the 15 s DB-correctness backstop -------------------------
 
     async def tick_once(self, stop: asyncio.Event | None = None) -> None:
+        """The 15 s reconciliation tick (SPEC §3.3 item 5: the tick is
+        correctness, NOTIFY would only be latency).
+
+        Order is load-bearing (plan decision D13). The wakes run first, so a
+        run that just became eligible is claimable in the *same* tick rather
+        than the next one. The sweeps run before dispatch, so headroom a dead
+        manager was holding is visible to this tick's admission. Dispatch runs
+        before attend, so a run claimed here starts attending immediately.
+        """
         await self._sweep_failed_wake(stop)
         await self._sweep_blocked_quota_wake(stop)
+        await self._sweep_lease(stop)
+        await self._sweep_deadline(stop)
+        await self._sweep_orphans(stop)
+        await self._sweep_canceled_containers(stop)
+        await self._sweep_dispatch(stop)
+        await self._sweep_attend(stop)
         await self._sweep_terminal_cleanup(stop)
         await self._advance_all_merging("tick_merging_advance", stop)
+
+    # -- the dispatch plane's sweeps (no-ops without `DispatchServices`) ------
+
+    def _build_sweep_deps(self, dispatch: DispatchServices) -> SweepDeps:
+        return SweepDeps(
+            session_factory=self._session_factory,
+            docker=dispatch.docker,
+            quota=dispatch.quota,
+            alerts=self._alerts,
+            settings=self._settings,
+        )
+
+    def _build_driver_deps(self, dispatch: DispatchServices) -> DriverDeps:
+        return DriverDeps(
+            session_factory=self._session_factory,
+            docker=dispatch.docker,
+            auth=dispatch.auth,
+            ops_for=self._ops_for,
+            alerts=self._alerts,
+            quota=dispatch.quota,
+            spec=dispatch.spec,
+            settings=self._settings,
+            config=dispatch.config,
+        )
+
+    async def _sweep_lease(self, stop: asyncio.Event | None = None) -> None:
+        if self._dispatch is None:
+            return
+        await sweep_leases(
+            self._sweep_bundle,
+            now=datetime.now(UTC),
+            live=self.live_driver_runs,
+            stop=stop,
+        )
+
+    async def _sweep_deadline(self, stop: asyncio.Event | None = None) -> None:
+        if self._dispatch is None:
+            return
+        await sweep_deadlines(
+            self._sweep_bundle,
+            now=datetime.now(UTC),
+            live=self.live_driver_runs,
+            stop=stop,
+        )
+
+    async def _sweep_orphans(self, stop: asyncio.Event | None = None) -> None:
+        if self._dispatch is None:
+            return
+        await sweep_orphan_containers(self._sweep_bundle, live=self.live_driver_runs, stop=stop)
+
+    async def _sweep_canceled_containers(self, stop: asyncio.Event | None = None) -> None:
+        # D10 puts this one deliberately beyond the registry: the driver that
+        # owns a canceled run's container is blocked in `await_completion` and
+        # only the die event frees it, so exactly one component owns Docker for
+        # a cancel — this sweep. Hence no `live=`.
+        if self._dispatch is None:
+            return
+        await sweep_canceled_containers(self._sweep_bundle, stop=stop)
+
+    async def _sweep_dispatch(self, stop: asyncio.Event | None = None) -> None:
+        """SPEC §3.2's `queued -> claimed`, folded into the 15 s tick rather
+        than given a loop of its own (plan decision D13): a run that starts
+        15 s later finishes 15 s later out of ninety minutes, and a fourth loop
+        would be a second scheduler in all but name.
+
+        The sweep stops at the first non-`claimed` outcome. The ceiling is
+        global, so a claim that does not fit means the next one does not
+        either — and continuing would only convert the rest of the queue into
+        `blocked_quota` rows the wake sweep has to walk back.
+
+        The config is re-read **once per sweep**, never per candidate: a file
+        read has no business on the transaction path, and once per sweep is
+        already enough for an image rebuild to take effect without a manager
+        restart (D3).
+        """
+        if self._dispatch is None:
+            return
+        dispatch = self._dispatch
+        config = dispatch.config.current()  # last-good on a bad edit (D3)
+        budget = min(
+            self._settings.dispatch_max_claims_per_tick,
+            max(0, self._settings.max_concurrent_runs - len(self._drivers)),
+        )
+        for _ in range(budget):
+            if stop is not None and stop.is_set():
+                return
+            sink: list[ClaimOutcome] = []
+
+            async def unit(session: AsyncSession, out: list[ClaimOutcome] = sink) -> None:
+                out.append(
+                    await claim_next(
+                        session,
+                        quota=dispatch.quota,
+                        config=config,
+                        settings=self._settings,
+                        alerts=self._alerts,
+                        now=datetime.now(UTC),
+                        live_driver_count=len(self._drivers),
+                    )
+                )
+
+            committed = await self._run_unit("dispatch", "claim", unit)
+            if not committed or not sink or sink[0].status != "claimed":
+                return
+
+    async def _sweep_attend(self, stop: asyncio.Event | None = None) -> None:
+        """Every in-flight run that has no live driver gets one — the same code
+        on the first tick after a claim and on the first tick after a restart
+        (plan decision D1). The discovery query is the row's own status, so a
+        manager that has forgotten everything re-adopts exactly what Postgres
+        says is in flight.
+        """
+        if self._dispatch is None:
+            return
+        async with self._session_factory() as session:
+            run_ids = (
+                (await session.execute(select(Run.id).where(Run.status.in_(_ATTENDABLE_STATUSES))))
+                .scalars()
+                .all()
+            )
+
+        for run_id in run_ids:
+            if stop is not None and stop.is_set():
+                return
+            if run_id in self._drivers:
+                continue
+            self._spawn_driver(run_id)
+
+    def _spawn_driver(self, run_id: UUID) -> None:
+        """**The only place a driver is ever created.**
+
+        Registration happens in the same synchronous step as the task's
+        creation, before anything can suspend: a driver's first phase is a
+        clone that no ticker covers, and a driver invisible to
+        `live_driver_runs` for even one await is a driver the lease and
+        deadline sweeps — and the concurrency cap — can act against.
+        """
+        task = asyncio.create_task(attend_run(self._driver_bundle, run_id))
+        self._drivers[run_id] = task
+
+        def _done(finished: asyncio.Task[None], rid: UUID = run_id) -> None:
+            self._drivers.pop(rid, None)
+            if finished.cancelled():
+                return
+            exc = finished.exception()
+            if exc is not None:
+                # `attend_run` is written never to propagate; if it did, the
+                # run is still recoverable from its columns by the sweeps.
+                logger.error("orchestrator.driver_failed", run_id=str(rid), error=str(exc))
+
+        task.add_done_callback(_done)
+
+    async def drain_drivers(self) -> None:
+        """Wait for live drivers, then cancel the stragglers (plan decision D1).
+
+        Bounded on purpose: a 90-minute run must not hold a SIGTERM open. And a
+        cancelled driver does **not** kill its container — the run stays
+        `running` in the DB and the next boot's attend sweep re-adopts it.
+        Killing a 60-minute agent because the manager restarted is the opposite
+        of "state lives in the database". Same discipline as the ntfy drain.
+        """
+        pending = set(self._drivers.values())
+        if not pending:
+            return
+        _done, still_running = await asyncio.wait(
+            pending, timeout=self._settings.driver_drain_seconds
+        )
+        for task in still_running:
+            task.cancel()
+        if still_running:
+            logger.warning("orchestrator.drivers_cancelled", count=len(still_running))
+            await asyncio.gather(*still_running, return_exceptions=True)
 
     async def _sweep_failed_wake(self, stop: asyncio.Event | None = None) -> None:
         async with self._session_factory() as session:
@@ -462,7 +738,13 @@ class Orchestrator:
     async def run(self, stop: asyncio.Event) -> None:
         """Run `tick_once`/`poll_issues_once`/`poll_checks_once` on their
         configured cadences until `stop` is set, then return once all three
-        loops have drained (SPEC §3.3: one process, one scheduler)."""
+        loops have drained (SPEC §3.3: one process, one scheduler).
+
+        The per-run drivers are deliberately **not** in the `TaskGroup`: a
+        driver outlives the sweep that spawned it by up to ninety minutes, and
+        a group that waited for them would turn shutdown into "wait for the
+        agent". They are drained on their own bounded budget instead, after the
+        three loops have stopped starting new work (plan decision D1)."""
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self._loop(stop, self.tick_once, self._settings.tick_seconds))
             tg.create_task(
@@ -471,6 +753,7 @@ class Orchestrator:
             tg.create_task(
                 self._loop(stop, self.poll_checks_once, self._settings.check_poll_seconds)
             )
+        await self.drain_drivers()
 
     async def _loop(
         self,
