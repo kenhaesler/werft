@@ -47,9 +47,12 @@ from werft.runner.workspace import create_run_dirs, placement_for
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git binary not on PATH")
 
-#: One fixed instant for the whole module. Taken from the wall clock rather than
-#: written as a literal only because the fixture's own rows are seeded with the
-#: database's `now()`; every *predicate* under test still takes `now` explicitly.
+#: One fixed instant for the whole module, and the *only* clock the seeded rows
+#: know: `insert_run` dates every run against this rather than against the
+#: database's `now()`, so a claim at `now=NOW` sees the same queue however long
+#: the suite took to reach this module. Taken from the wall clock rather than
+#: written as a literal only so that the tick-driven tests, which pass their own
+#: `datetime.now(UTC)`, still find these rows eligible.
 NOW = datetime.now(UTC).replace(microsecond=0)
 
 DIGEST = "werft-runner-elastic@sha256:" + "d" * 64
@@ -279,7 +282,16 @@ async def insert_run(
 ) -> uuid.UUID:
     """Raw-SQL seeding at whatever status a scenario needs — the `BEFORE UPDATE`
     transition trigger never fires on insert, so this is also how a crash-shaped
-    row (a `running` one nobody is attending) is built."""
+    row (a `running` one nobody is attending) is built.
+
+    `next_attempt_at` defaults to a minute before **this module's** `NOW`, never
+    to the database's own `now()`. `claim_next` filters `next_attempt_at <= now`
+    and the synthetic-clock clause claims at `now=NOW`, which is fixed at import
+    time: a DB-clock default would drift past `NOW` as soon as the suite spent a
+    minute getting here, and the claim would come back `idle` instead of
+    `blocked_quota` — a wall-clock fuse under a test that is supposed to have no
+    wall clock in it at all (D8).
+    """
     async with env.factory() as session, session.begin():
         item_id = (
             await session.execute(
@@ -296,8 +308,8 @@ async def insert_run(
                 text(
                     "INSERT INTO runs (project_id, backlog_item_id, status, priority, provider,"
                     " container_id, base_sha, lease_expires_at, hard_deadline_at, next_attempt_at)"
-                    " VALUES (:p, :i, :s, :prio, 'claude', :cid, :sha, :lease, :deadline,"
-                    " COALESCE(:nat, now() - interval '1 minute')) RETURNING id"
+                    " VALUES (:p, :i, :s, :prio, 'claude', :cid, :sha, :lease, :deadline, :nat)"
+                    " RETURNING id"
                 ),
                 {
                     "p": env.project_id,
@@ -308,7 +320,7 @@ async def insert_run(
                     "sha": base_sha,
                     "lease": None if lease_in is None else datetime.now(UTC) + lease_in,
                     "deadline": None if deadline_in is None else datetime.now(UTC) + deadline_in,
-                    "nat": next_attempt_at,
+                    "nat": next_attempt_at or (NOW - timedelta(minutes=1)),
                 },
             )
         ).scalar_one()
@@ -541,6 +553,9 @@ async def test_acceptance_n_concurrent_claim_racers_never_exceed_the_ceiling(mig
     env = await e2e(queued=8, ceiling_slots=3, max_concurrent=100, max_claims_per_tick=1)
     ceiling = (await fetch_account(env)).ceiling_seconds
 
+    # `_sweep_dispatch` only *claims*: `_sweep_attend` is the one and only place
+    # a driver task is ever created (D1), which is what lets these eight passes
+    # race each other deterministically with no container work in flight.
     await asyncio.gather(*(env.orchestrator._sweep_dispatch() for _ in range(8)))
 
     sum_of_open_reservations = await open_reservation_seconds(env)
@@ -573,9 +588,10 @@ async def test_acceptance_a_parsed_limit_blocks_dispatch_then_auto_resumes(migra
     assert classification.outcome is AttemptOutcome.QUOTA_EXHAUSTED
     assert classification.exhausted_until == reset  # the real parser, not a stub
 
-    # One claim per tick, so the second run is never even offered to admission
-    # while the first is in flight: what keeps it `queued` below is the account,
-    # not a budget that happened to run out.
+    # One claim per tick, so the second run is not offered to admission while
+    # the first is in flight — which is what makes it still `queued` when the
+    # limit lands. That assertion is therefore about sequencing; the dispatch
+    # pass after it is the one that executes the refusal itself.
     env = await e2e(queued=2, max_concurrent=1)
     run_id = await insert_run(env, number=50, status="queued", priority=500)
     other_run_id = env.run_ids[0]
@@ -591,6 +607,16 @@ async def test_acceptance_a_parsed_limit_blocks_dispatch_then_auto_resumes(migra
     assert (account.exhausted_until, account.exhausted_source) == (reset, "cli")
     assert env.alerts.quota_exhausted_until_calls == [("claude", reset)]
     assert (await fetch(env, other_run_id)).status == "queued"  # nothing dispatches
+
+    # ...and now offer it to admission, so "refuses every claim while it stands"
+    # is executed rather than sequenced around. `_sweep_dispatch` only claims
+    # (drivers come from `_sweep_attend` alone, D1), so this pass is a pure
+    # admission decision: `exhausted_until` is still in the future, so
+    # `admission.decide`'s first rule refuses and `dispatch._block` lands the
+    # run on `blocked_quota` — never on `claimed`.
+    await env.orchestrator._sweep_dispatch()
+    assert await count_status(env, "claimed") == 0
+    assert (await fetch(env, other_run_id)).status == "blocked_quota"
 
     await move_reported_reset_into_the_past(env, reset)
     env.docker.hold_die = True  # keep the woken run in flight to observe it
@@ -650,6 +676,8 @@ async def test_acceptance_a_provider_reading_below_the_ledger_never_increases_he
 
     # The reading really landed — a no-op `record_reading` would satisfy the two
     # assertions above for the wrong reason — and the tick still admits nothing.
+    # `_sweep_dispatch` only claims (drivers come from `_sweep_attend` alone,
+    # D1), so nothing here can start a container and race the assertions.
     assert (await fetch_account(env)).last_reading_utilization == 1.0
     await env.orchestrator._sweep_dispatch()
     assert await count_status(env, "claimed") == 0
