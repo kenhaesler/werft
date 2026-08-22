@@ -23,12 +23,10 @@ take the agent's own word for whether its work exists.
 
 import asyncio
 import contextlib
-import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -66,6 +64,7 @@ from werft.runner.workspace import (
     build_prompt,
     build_system_prompt,
     create_run_dirs,
+    credential_values,
     in_box,
     placement_for,
     remove_secrets,
@@ -90,54 +89,6 @@ _EXIT_TIER_OUTCOMES: dict[str, tuple[AttemptOutcome, ResultStatus]] = {
     "workspace_git_failure": (AttemptOutcome.INFRA_FAILURE, ResultStatus.ERROR),
     "result_serialization_failure": (AttemptOutcome.AGENT_FAILURE, ResultStatus.FAILURE),
 }
-
-
-#: Env names whose *values* are credentials, for the teardown scrub. Matched
-#: rather than hard-coded to one provider's variable: the spec builds `env`, and
-#: a second adapter naming its credential something else must still be scrubbed.
-_CREDENTIAL_ENV_MARKERS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
-
-#: `task.json` absent, unreadable, or not JSON. Bound to a name rather than
-#: written inline, because `ruff format` at this project's `target-version =
-#: "py314"` rewrites an inline `except (OSError, ValueError):` into PEP 758's
-#: unparenthesized `except OSError, ValueError:`. That form is valid on the
-#: manager's pinned 3.14 — but it reads to a human as Python 2, and it is a
-#: SyntaxError on every earlier interpreter, which is exactly the trap
-#: `tests/unit/test_adapter_runtime.py::test_adapter_compiles_for_the_runner_images_python`
-#: exists to catch on the 3.12 runner side. A named tuple is stable under the
-#: formatter and ambiguous to nobody.
-_UNREADABLE_TASK_JSON = (OSError, ValueError)
-
-
-def _credential_values(placement: RunPlacement) -> list[str]:
-    """Every credential value `task.json`'s `env` block carries, read off the
-    **file** rather than off this process's memory.
-
-    Teardown has to scrub the retained `task.json` on every path, including the
-    ones that never wrote it. A re-adopted `running` run (crash-window row 6)
-    prepares nothing: the driver that built that `env` died with the manager, so
-    an in-memory copy of the provider credential does not exist to scrub with,
-    and D7's "the retained run dir carries no live credential" would hold only
-    for runs this process happened to launch itself. The file is the one thing
-    both paths share, and it is the thing being scrubbed.
-
-    Every matching value is collected, not just the first: `env` is the
-    provider spec's to compose, and nothing stops a second adapter from
-    carrying two.
-    """
-    try:
-        payload = json.loads(Path(placement.task_json_path).read_text(encoding="utf-8"))
-    except _UNREADABLE_TASK_JSON:
-        return []
-    env = payload.get("env") if isinstance(payload, dict) else None
-    if not isinstance(env, dict):
-        return []
-    return [
-        value
-        for name, value in env.items()
-        if isinstance(value, str)
-        and any(marker in str(name).upper() for marker in _CREDENTIAL_ENV_MARKERS)
-    ]
 
 
 @dataclass(frozen=True)
@@ -252,11 +203,13 @@ class _Driver:
         #: not — the attempt row and the reservation are already somebody else's.
         self._owns_run = True
         #: Set only on decision 15's defer path (`_finalize` could not reach
-        #: GitHub). The run stays `running` with its container intact so the
-        #: next attend sweep re-drives it; tearing the box down here would leave
-        #: that re-drive with nothing but a die event that may have aged out of
-        #: the daemon's buffer. Cleanup is the orphan sweep's once the run
-        #: really leaves `running`.
+        #: GitHub) *and* only when the lease renewal there proved the row is
+        #: still `claimed`/`running`. The run stays `running` with its container
+        #: intact so the next attend sweep re-drives it; tearing the box down
+        #: here would leave that re-drive with nothing but a die event that may
+        #: have aged out of the daemon's buffer. Cleanup is the orphan sweep's
+        #: once the run really leaves `running`. If the row has *already* left
+        #: it, there is no re-drive to protect and teardown runs normally.
         self._skip_teardown = False
         self._ticker: asyncio.Task[None] | None = None
 
@@ -631,8 +584,15 @@ class _Driver:
             # death, which is when the sweep *should* claim it. The re-adoption
             # path needs no separate renewal: a re-drive that cannot reach
             # GitHub either lands right back here.
-            self._skip_teardown = True
+            # The renewal is also the test of whether there is anything left to
+            # defer *for*. Its guard is `status IN (claimed, running)`, so a
+            # `False` means the row has definitively left those statuses — a
+            # sweep or an operator cancel already settled this attempt — and
+            # nothing will ever re-drive it. Deferring then would only hand the
+            # container, network and token to the orphan sweep minutes later;
+            # falling through to the normal teardown cleans them up now.
             renewed = await self._renew_lease(now=datetime.now(UTC))
+            self._skip_teardown = renewed
             logger.warning(
                 "driver.push_check_unavailable",
                 run_id=str(self._run_id),
@@ -818,13 +778,13 @@ class _Driver:
                 logger.warning("driver.teardown_failed", run_id=str(self._run_id), error=str(exc))
         # The git token comes from this driver's own credential object; the
         # provider credential is read back out of `task.json` (see
-        # `_credential_values`), so the scrub is identical on the launch path
-        # and on the re-adoption path that never built that file.
+        # `workspace.credential_values`), so the scrub is identical on the
+        # launch path and on the re-adoption path that never built that file.
         secrets = [
             value
             for value in (
                 self._credentials.token if self._credentials else None,
-                *_credential_values(self._placement),
+                *credential_values(self._placement),
             )
             if value
         ]

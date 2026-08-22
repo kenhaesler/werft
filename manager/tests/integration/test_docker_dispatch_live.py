@@ -15,6 +15,13 @@ plumbing to satisfy this task's "prove it against a real daemon on this
 machine" requirement; it changes nothing in `werft/runner/docker_api.py`,
 and on Linux CI it is never constructed at all -- the default unix-socket
 transport is used there, unmodified.
+
+As in `test_docker_live.py`, the SELinux relabelling this smoke asks for
+(`:z` / `:Z` on the bind mounts) is NOT falsifiable off a SELinux-enforcing
+host: what is proven here is that the mount wiring is what the manager builds
+and that the container reads and writes through it, not that the labels are
+enforced. Enforcement needs the Rocky Linux 10 host, and is asserted by
+install.sh at T9.
 """
 
 import asyncio

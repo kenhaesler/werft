@@ -105,6 +105,12 @@ async def e2e(migrated_db, tmp_path, monkeypatch):
     engine and outlive `db_session`'s truncation — would be a real candidate
     here. Truncating rather than filtering keeps the sweeps under test at the
     unfiltered reach they have in production.
+
+    That truncation is also, deliberately, what makes this module incompatible
+    with `pytest-xdist` parallelism: it wipes every table any other worker's
+    fixtures are using, so this module must stay serial (and on its own worker
+    if the suite is ever distributed) — a change that parallelises it has to
+    replace the truncation first, not merely add `-n auto`.
     """
     from werft.orchestrator import driver as driver_module
 

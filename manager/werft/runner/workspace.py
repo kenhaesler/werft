@@ -47,6 +47,22 @@ DIR_MODE = 0o700
 FILE_MODE = 0o600
 EXEC_MODE = 0o700
 
+#: Env names whose *values* are credentials, for the teardown scrub. Matched
+#: rather than hard-coded to one provider's variable: the spec builds `env`, and
+#: a second adapter naming its credential something else must still be scrubbed.
+_CREDENTIAL_ENV_MARKERS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
+
+#: `task.json` absent, unreadable, or not JSON. Bound to a name rather than
+#: written inline, because `ruff format` at this project's `target-version =
+#: "py314"` rewrites an inline `except (OSError, ValueError):` into PEP 758's
+#: unparenthesized `except OSError, ValueError:`. That form is valid on the
+#: manager's pinned 3.14 — but it reads to a human as Python 2, and it is a
+#: SyntaxError on every earlier interpreter, which is exactly the trap
+#: `tests/unit/test_adapter_runtime.py::test_adapter_compiles_for_the_runner_images_python`
+#: exists to catch on the 3.12 runner side. A named tuple is stable under the
+#: formatter and ambiguous to nobody.
+_UNREADABLE_TASK_JSON = (OSError, ValueError)
+
 
 def placement_for(run_id: UUID | str, *, runs_root: str, dns_ip: str) -> RunPlacement:
     run_dir = os.path.join(runs_root, str(run_id))
@@ -94,6 +110,38 @@ def scrub_task_json(placement: RunPlacement, *, secrets: Sequence[str]) -> None:
             raw = raw.replace(json.dumps(secret)[1:-1], REDACTED)
     with contextlib.suppress(OSError):
         _atomic_write(path, raw)
+
+
+def credential_values(placement: RunPlacement) -> list[str]:
+    """Every credential value `task.json`'s `env` block carries, read off the
+    **file** rather than off any process's memory — the secret list
+    `scrub_task_json` above is meant to be handed.
+
+    Teardown has to scrub the retained `task.json` on every path, including the
+    ones that never wrote it. A re-adopted `running` run (crash-window row 6)
+    prepares nothing: the driver that built that `env` died with the manager, so
+    an in-memory copy of the provider credential does not exist to scrub with,
+    and D7's "the retained run dir carries no live credential" would hold only
+    for runs that process happened to launch itself. The file is the one thing
+    both paths share, and it is the thing being scrubbed.
+
+    Every matching value is collected, not just the first: `env` is the
+    provider spec's to compose, and nothing stops a second adapter from
+    carrying two.
+    """
+    try:
+        payload = json.loads(Path(placement.task_json_path).read_text(encoding="utf-8"))
+    except _UNREADABLE_TASK_JSON:
+        return []
+    env = payload.get("env") if isinstance(payload, dict) else None
+    if not isinstance(env, dict):
+        return []
+    return [
+        value
+        for name, value in env.items()
+        if isinstance(value, str)
+        and any(marker in str(name).upper() for marker in _CREDENTIAL_ENV_MARKERS)
+    ]
 
 
 def write_secret(placement: RunPlacement, filename: str, value: str) -> None:

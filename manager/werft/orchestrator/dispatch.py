@@ -86,9 +86,16 @@ async def claim_next(
         logger.info("dispatch.no_active_account", provider=settings.quota_provider)
         return ClaimOutcome("no_account")
 
-    # The VM-shaped bound, checked under the same lock as admission so two
-    # racers cannot both pass it (plan decision D13). Being at capacity is not
-    # a verdict on any run: nothing is parked, blocked or reserved.
+    # The VM-shaped bound (plan decision D13). Being at capacity is not a
+    # verdict on any run: nothing is parked, blocked or reserved.
+    #
+    # What actually keeps two racers from both passing it is the *dispatcher*,
+    # not this lock: `live_driver_count` is counted by `_sweep_dispatch` before
+    # this claim transaction opens, and that sweep is sequential and the sole
+    # caller — one claim at a time, each recounting from a registry the previous
+    # claim has already been added to. A second concurrent caller would need
+    # this count moved inside the transaction (or the bound re-asserted under
+    # the account lock) to be safe.
     if live_driver_count >= settings.max_concurrent_runs:
         return ClaimOutcome("at_capacity")
 

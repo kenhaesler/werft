@@ -55,11 +55,15 @@ from werft.db.transitions import transition_run
 from werft.domain.attempts import AttemptOutcome
 from werft.domain.runs import RunStatus
 from werft.observe.alerts import AlertSink
-from werft.orchestrator.driver import _credential_values
 from werft.orchestrator.finalize import advance_failed
 from werft.quota.ledger import LedgerQuota
 from werft.runner.docker_api import DockerClient
-from werft.runner.workspace import placement_for, remove_secrets, scrub_task_json
+from werft.runner.workspace import (
+    credential_values,
+    placement_for,
+    remove_secrets,
+    scrub_task_json,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -177,14 +181,14 @@ async def reap_run_containers(deps: SweepDeps, run_id: UUID, container_id: str |
     # retained run dir carries no live credential" is a property of the tree,
     # not of the daemon being reachable, so neither the scrub nor the secret
     # removal is allowed to depend on `ok`. The secret values are read back off
-    # `task.json` itself (`driver._credential_values`) — the driver that built
+    # `task.json` itself (`workspace.credential_values`) — the driver that built
     # that `env` died with the manager, so no in-memory copy exists to scrub
     # with, and the file is the one thing every path shares. `remove_secrets`
     # is the other half the driver's own teardown does and this path owes:
     # `secrets_dir` lives *inside* the tree SPEC §8 retains and ships offsite.
     # `revoke()` is the one piece impossible here — it needs the in-memory
     # credential object that died with the driver.
-    scrub_task_json(placement, secrets=_credential_values(placement))
+    scrub_task_json(placement, secrets=credential_values(placement))
     remove_secrets(placement)
     return ok
 

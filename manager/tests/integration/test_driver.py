@@ -559,6 +559,37 @@ async def test_a_re_drive_after_a_deferred_finalize_keeps_the_lease_honest(deps_
     assert (await ledger_entry(fakes, run_id)).actual_wallclock_s is None  # nothing settled
 
 
+async def test_a_defer_on_a_row_somebody_else_settled_tears_down_now(deps_fixture):
+    """The defer exists to protect a re-drive. When there is no re-drive left to
+    protect, it protects nothing and costs a box.
+
+    `_renew_lease`'s guard is `status IN (claimed, running)`, so a `False`
+    return is proof the row has already left both — a sweep or an operator
+    cancel settled this attempt while GitHub was unreachable. Skipping teardown
+    there would leave the container, the network and a live git token to the
+    orphan sweep minutes later; the driver falls through to its normal teardown
+    instead.
+    """
+    driver_deps, run_id, fakes = deps_fixture
+    fakes.on_started = lambda placement: write_outputs(placement, status="success")
+
+    async def settled_by_somebody_else_then_unavailable(_branch):
+        # The concurrent actor lands *between* the die event and the defer, so
+        # the renewal inside `_finalize` is the first thing to see it.
+        await cancel_run_in_db(fakes, run_id, observed=12)
+        raise GitHubUnavailable(503, "down")
+
+    fakes.ops.get_ref_sha = settled_by_somebody_else_then_unavailable
+
+    await attend_run(driver_deps, run_id)
+
+    assert (await fetch(fakes, run_id)).status == "canceled"  # not re-drivable
+    assert f"remove_container:{fakes.docker.container_id}" in fakes.docker.calls
+    assert f"remove_network:{network_of(run_id)}" in fakes.docker.calls
+    assert fakes.auth.revoked
+    assert not (secrets_of(fakes, run_id) / "git_token").exists()
+
+
 async def test_a_re_adopted_run_inherits_its_deadline_rather_than_a_fresh_ceiling(deps_fixture):
     """The ceiling `RunnerLifecycle` enforces runs from the moment *this* driver
     starts attending, so a manager that restarts at minute 89 of a 90-minute run
