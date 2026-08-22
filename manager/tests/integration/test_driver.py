@@ -37,6 +37,7 @@ from werft.github.client import GitHubUnavailable
 from werft.observe.alerts import NullAlertSink
 from werft.orchestrator.dispatch import claim_next
 from werft.orchestrator.driver import DriverDeps, attend_run
+from werft.orchestrator.sweeps import SweepDeps, sweep_leases
 from werft.providers.claude import ClaudeSpec
 from werft.quota.ledger import LedgerQuota
 from werft.runner.git import GitError
@@ -290,6 +291,19 @@ def secrets_of(fakes, run_id) -> Path:
     return Path(placement_of(fakes, run_id).secrets_dir)
 
 
+def sweep_deps_of(driver_deps, fakes) -> SweepDeps:
+    """The crash-recovery half of the same process, wired to the same database
+    and the same fake daemon — so a test can ask what `tick_once`'s lease sweep
+    would do to a row a driver has just left behind."""
+    return SweepDeps(
+        session_factory=fakes.factory,
+        docker=fakes.docker,
+        quota=driver_deps.quota,
+        alerts=fakes.alerts,
+        settings=fakes.settings,
+    )
+
+
 def network_of(run_id) -> str:
     return f"werft-net-{run_id}"
 
@@ -481,6 +495,68 @@ async def test_github_unavailable_at_finalize_leaves_the_whole_attempt_standing(
     assert len(fakes.git.clone_calls) == 1  # re-adopted, not re-prepared
     assert f"remove_container:{fakes.docker.container_id}" in fakes.docker.calls
     assert fakes.auth.revoked
+
+
+async def test_a_deferred_finalize_leaves_a_lease_that_can_still_expire(deps_fixture):
+    """The other half of the invariant, pinned so the renewal below cannot be
+    mistaken for "the deferred row is immortal".
+
+    A defer renews the lease once and then this driver is gone: the ticker was
+    cancelled when `_attend` returned and `run()` completing pops the run out of
+    `Orchestrator._drivers`. If no re-drive ever comes — the manager died — the
+    lease runs out and the sweep is right to claim the row.
+    """
+    driver_deps, run_id, fakes = deps_fixture
+    fakes.ops.ref_error = GitHubUnavailable(503, "down")
+    fakes.on_started = lambda placement: write_outputs(placement, status="success")
+
+    await attend_run(driver_deps, run_id)
+
+    deferred = await fetch(fakes, run_id)
+    assert deferred.status == "running"
+
+    # No live driver (this one has returned), and the synthetic clock is past
+    # the lease the defer wrote.
+    after = deferred.lease_expires_at + timedelta(seconds=1)
+    assert await sweep_leases(sweep_deps_of(driver_deps, fakes), now=after, live=set()) == 1
+
+
+async def test_a_re_drive_after_a_deferred_finalize_keeps_the_lease_honest(deps_fixture):
+    """The finding: `_finalize`'s GitHub-unavailable defer used to return with
+    the lease frozen at container death, while the heartbeat ticker was already
+    cancelled and `run()` completing dropped the run from the live-driver
+    registry. `sweep_leases` — which runs *before* the attend sweep in
+    `tick_once` — would then see an expired lease and no registry entry roughly
+    a lease later, close the attempt as an `infra_failure` and let the retry
+    `force_reset_ref` the branch, discarding work the attempt may already have
+    pushed.
+
+    The invariant is "a row is swept only when it has neither a live driver NOR
+    a valid lease". Each re-drive that lands back on the defer renews the lease,
+    so the row becomes sweepable exactly when the re-drives stop.
+    """
+    driver_deps, run_id, fakes = deps_fixture
+    fakes.ops.ref_error = GitHubUnavailable(503, "down")
+    fakes.on_started = lambda placement: write_outputs(placement, status="success")
+
+    await attend_run(driver_deps, run_id)
+    first = (await fetch(fakes, run_id)).lease_expires_at
+
+    # The next attend sweep re-drives it, GitHub is still down, it defers again.
+    await asyncio.sleep(0.5)
+    await attend_run(driver_deps, run_id)
+
+    row = await fetch(fakes, run_id)
+    assert row.status == "running"
+    assert row.lease_expires_at > first  # the re-drive bought another lease
+
+    # An instant that is past the *first* lease — so the row would have been
+    # swept without the re-drive — but inside the one the re-drive wrote.
+    between = first + (row.lease_expires_at - first) / 2
+    assert between > first
+    assert await sweep_leases(sweep_deps_of(driver_deps, fakes), now=between, live=set()) == 0
+    assert (await fetch(fakes, run_id)).status == "running"
+    assert (await ledger_entry(fakes, run_id)).actual_wallclock_s is None  # nothing settled
 
 
 async def test_a_re_adopted_run_inherits_its_deadline_rather_than_a_fresh_ceiling(deps_fixture):

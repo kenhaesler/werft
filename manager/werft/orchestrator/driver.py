@@ -553,6 +553,23 @@ class _Driver:
         attempt somebody else already accounted for.
         """
         now = datetime.now(UTC)
+        if not await self._renew_lease(now=now):
+            return False
+        if self._credentials is not None and await self._credentials.refresh_if_due(now=now):
+            await self._event("token_reminted", {})
+        return True
+
+    async def _renew_lease(self, *, now: datetime) -> bool:
+        """Push `lease_expires_at` out by one full lease. Returns whether the row
+        was still ours to renew.
+
+        An ordinary guarded UPDATE, never a CAS: a lease renewal asserts nothing
+        about the run's status and must not bump `version` out from under a
+        transition somebody else is composing. The `status IN (claimed,
+        running)` guard is the whole arbitration — a row an operator cancel or a
+        sweep already moved matches zero rows, and the caller learns it no
+        longer owns the run.
+        """
         async with self._deps.session_factory() as session, session.begin():
             result = await session.execute(
                 update(Run)
@@ -565,11 +582,7 @@ class _Driver:
                     lease_expires_at=now + timedelta(seconds=self._settings.lease_seconds),
                 )
             )
-        if not result.rowcount:
-            return False
-        if self._credentials is not None and await self._credentials.refresh_if_due(now=now):
-            await self._event("token_reminted", {})
-        return True
+        return bool(result.rowcount)
 
     async def _finalize(
         self, loaded: _Loaded, completion: Completion, base_sha: str | None
@@ -602,9 +615,29 @@ class _Driver:
             # says `running`, so the re-drive would inherit a run it can only
             # reconstruct from a die event that may have aged out. "Re-drive"
             # has to mean the whole attempt is still there to re-drive.
+            #
+            # And renew the lease on the way out, because this is the last
+            # write this attempt makes: the heartbeat ticker was cancelled when
+            # `_attend` returned, and `run()` is about to complete, which drops
+            # this run from `Orchestrator._drivers`. Without this the row would
+            # sit `running` with a lease frozen at container death and no
+            # registry entry — and `sweep_leases` would close the attempt as an
+            # `infra_failure` roughly a lease later, whose retry
+            # `force_reset_ref`s the branch and discards whatever the agent had
+            # already pushed. The arbitration invariant is "sweep a row only
+            # when it has neither a live driver NOR a valid lease": each
+            # re-drive tick buys another `lease_seconds`, so the row becomes
+            # sweepable exactly when the re-drives themselves stop — a manager
+            # death, which is when the sweep *should* claim it. The re-adoption
+            # path needs no separate renewal: a re-drive that cannot reach
+            # GitHub either lands right back here.
             self._skip_teardown = True
+            renewed = await self._renew_lease(now=datetime.now(UTC))
             logger.warning(
-                "driver.push_check_unavailable", run_id=str(self._run_id), error=str(exc)
+                "driver.push_check_unavailable",
+                run_id=str(self._run_id),
+                error=str(exc),
+                lease_renewed=renewed,
             )
             return
         pushed = head is not None and head != base_sha
