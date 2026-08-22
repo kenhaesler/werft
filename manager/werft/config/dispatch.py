@@ -70,11 +70,21 @@ def load_dispatch_config(path: str) -> DispatchConfig:
     manager must still serve `/api/v1` and its pollers with nothing to
     dispatch. A path that *is* set but unreadable or invalid raises — and
     `create_app` calls this directly, so a broken file fails boot loudly rather
-    than parking every run at 03:00."""
+    than parking every run at 03:00.
+
+    A path that is set but names no file is the third case, and it is the one
+    that used to boot silently: every candidate then parks with
+    `permanent_error`, one per tick, each needing a manual requeue — which is
+    exactly what D3's "never park runs on a typo" exists to prevent. It stays
+    non-fatal (unset must remain a clean boot, and the file is edited by hand
+    between image rebuilds) but it is now loud, so a mistyped
+    `WERFT_DISPATCH_CONFIG_FILE` is legible at boot instead of at 03:00.
+    """
     if not path:
         return DispatchConfig()
     file = Path(path)
     if not file.is_file():
+        logger.warning("app.dispatch_config_file_missing", path=path, setting=SETTING_NAME)
         return DispatchConfig()
     try:
         payload = json.loads(file.read_text(encoding="utf-8"))

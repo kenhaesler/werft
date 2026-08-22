@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from structlog.testing import capture_logs
 
 from werft.config.dispatch import (
     DispatchConfig,
@@ -30,6 +31,31 @@ def test_an_unset_path_is_an_empty_config_not_a_boot_failure():
 
 def test_a_missing_file_is_an_empty_config(tmp_path):
     assert load_dispatch_config(str(tmp_path / "nope.json")) == DispatchConfig()
+
+
+def test_a_set_path_that_names_no_file_is_loud_about_it(tmp_path):
+    """D3: "never park runs on a typo". A mistyped `WERFT_DISPATCH_CONFIG_FILE`
+    still boots (the *unset* case has to stay a clean boot) but it must not boot
+    *silently*: without a line naming the path, the only symptom is every
+    candidate parking with `permanent_error`, one per tick, each needing a
+    manual requeue."""
+    missing = tmp_path / "typo.json"
+    with capture_logs() as logs:
+        assert load_dispatch_config(str(missing)) == DispatchConfig()
+
+    warnings = [entry for entry in logs if entry["event"] == "app.dispatch_config_file_missing"]
+    assert len(warnings) == 1
+    assert warnings[0]["log_level"] == "warning"
+    assert warnings[0]["path"] == str(missing)
+    assert warnings[0]["setting"] == "WERFT_DISPATCH_CONFIG_FILE"
+
+
+def test_an_unset_path_says_nothing_at_all(tmp_path):
+    """The counterpart: "no dispatch config" is a legitimate deployment, not an
+    operator error, so it must not cry wolf once per sweep."""
+    with capture_logs() as logs:
+        load_dispatch_config("")
+    assert logs == []
 
 
 def test_a_project_entry_round_trips_with_defaults(tmp_path):

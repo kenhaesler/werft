@@ -294,7 +294,11 @@ def network_of(run_id) -> str:
     return f"werft-net-{run_id}"
 
 
-async def set_running_with_container(fakes, run_id, container_id: str) -> None:
+async def set_running_with_container(
+    fakes, run_id, container_id: str, *, hard_deadline_at: datetime | None = None
+) -> None:
+    """The row a manager that died mid-attempt leaves behind. `hard_deadline_at`
+    is left as the claim wrote it unless a test wants to move it."""
     create_run_dirs(placement_of(fakes, run_id))
     async with fakes.factory() as session, session.begin():
         await session.execute(
@@ -305,6 +309,11 @@ async def set_running_with_container(fakes, run_id, container_id: str) -> None:
             ),
             {"c": container_id, "s": fakes.origin_sha, "r": run_id},
         )
+        if hard_deadline_at is not None:
+            await session.execute(
+                text("UPDATE runs SET hard_deadline_at = :d WHERE id = :r"),
+                {"d": hard_deadline_at, "r": run_id},
+            )
 
 
 def write_stale_task_json(fakes, run_id, **env: str) -> Path:
@@ -441,6 +450,62 @@ async def test_github_unavailable_during_push_detection_defers_instead_of_failin
 
     assert (await fetch(fakes, run_id)).status == "running"
     assert (await ledger_entry(fakes, run_id)).actual_wallclock_s is None  # nothing settled
+
+
+async def test_github_unavailable_at_finalize_leaves_the_whole_attempt_standing(deps_fixture):
+    """Decision 15 says "not a verdict, re-drive" — so the thing to re-drive has
+    to still exist. Returning early from `_finalize` used to fall through to
+    `run()`'s teardown, which removed the container and network and revoked the
+    git token while the row still said `running`: the re-adopting driver then
+    had nothing but a die event that may have aged out of the daemon's buffer.
+    """
+    driver_deps, run_id, fakes = deps_fixture
+    fakes.ops.ref_error = GitHubUnavailable(503, "down")
+    fakes.on_started = lambda placement: write_outputs(placement, status="success")
+
+    await attend_run(driver_deps, run_id)
+
+    assert (await fetch(fakes, run_id)).status == "running"
+    assert not any(c.startswith("remove_container") for c in fakes.docker.calls)
+    assert f"remove_network:{network_of(run_id)}" not in fakes.docker.calls
+    assert not fakes.auth.revoked  # the git token the box still reads on every push
+    assert (secrets_of(fakes, run_id) / "git_token").exists()
+
+    # And the re-drive lands it, off the container this driver refused to remove.
+    fakes.ops.ref_error = None
+    fakes.ops.ref_shas[run_branch_name(run_id)] = "f" * 40
+
+    await attend_run(driver_deps, run_id)
+
+    assert (await fetch(fakes, run_id)).status == "awaiting_review"
+    assert len(fakes.git.clone_calls) == 1  # re-adopted, not re-prepared
+    assert f"remove_container:{fakes.docker.container_id}" in fakes.docker.calls
+    assert fakes.auth.revoked
+
+
+async def test_a_re_adopted_run_inherits_its_deadline_rather_than_a_fresh_ceiling(deps_fixture):
+    """The ceiling `RunnerLifecycle` enforces runs from the moment *this* driver
+    starts attending, so a manager that restarts at minute 89 of a 90-minute run
+    would hand the container a second full timeout — and `sweep_deadlines` skips
+    runs a live driver holds, so nothing else would cut it short. The driver
+    clamps to `hard_deadline_at` instead.
+
+    `asyncio.wait_for` is the assertion: unclamped, this waits the config's full
+    1800 seconds and times out here rather than failing on a value.
+    """
+    driver_deps, run_id, fakes = deps_fixture
+    fakes.docker.hold_die = True  # nothing inside the box ever ends the run
+    await set_running_with_container(
+        fakes,
+        run_id,
+        fakes.docker.container_id,
+        hard_deadline_at=datetime.now(UTC) - timedelta(seconds=5),
+    )
+
+    await asyncio.wait_for(attend_run(driver_deps, run_id), timeout=60)
+
+    assert f"kill:{fakes.docker.container_id}" in fakes.docker.calls
+    assert (await latest_attempt(fakes, run_id)).outcome == "timeout"
 
 
 async def test_a_quota_exhausted_classification_blocks_the_account_durably(deps_fixture):

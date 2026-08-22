@@ -185,7 +185,13 @@ async def seed_another_queued_run(session, project) -> uuid.UUID:
 
 async def seed_race_fixture(session, *, runs: int, slots: int, reservation: int):
     """One project, `runs` claimable rows, and an account whose ceiling admits
-    exactly `slots` of them. Committed before the racers start."""
+    exactly `slots` of them. Committed before the racers start.
+
+    Returns the project id as well as its slug so the caller can delete
+    everything it seeded: these rows live on their own engine, outside the
+    per-test transaction rollback, and claimed runs with long-expired leases
+    left behind here are visible to every other module's sweep assertions.
+    """
     project = await seed_project(session)
     account_id = (
         await session.execute(
@@ -206,7 +212,7 @@ async def seed_race_fixture(session, *, runs: int, slots: int, reservation: int)
         await seed_queued_run(session, project.id, await seed_item(session, project.id, number=n))
         for n in range(1, runs + 1)
     ]
-    return project.slug, account_id, run_ids
+    return project.id, project.slug, account_id, run_ids
 
 
 @pytest.fixture
@@ -504,9 +510,10 @@ async def test_n_concurrent_racers_never_exceed_the_ceiling(migrated_db):
     competing row lock comes from outside the claim path."""
     engine = create_async_engine(migrated_db)
     factory = async_sessionmaker(engine, expire_on_commit=False)
+    project_id = account_id = None
     try:
         async with factory() as setup, setup.begin():
-            slug, account_id, run_ids = await seed_race_fixture(
+            project_id, slug, account_id, run_ids = await seed_race_fixture(
                 setup, runs=8, slots=3, reservation=1800
             )
         quota = LedgerQuota(label=LABEL, typical_reservation_seconds=1800)
@@ -544,6 +551,26 @@ async def test_n_concurrent_racers_never_exceed_the_ceiling(migrated_db):
         assert statuses.count("claimed") == 3
         assert statuses.count("claimed") + statuses.count("blocked_quota") == 8
     finally:
+        # This engine is outside the per-test transaction, so nothing rolls
+        # these rows back. Three of them are `claimed` with a lease that expires
+        # in the past, which is precisely what `test_sweeps.py`'s "a live lease
+        # is never touched" counts globally — leaving them makes that assertion
+        # a function of module ordering. Same shape as the `SKIP LOCKED`
+        # sibling's cleanup below.
+        if project_id is not None:
+            async with factory() as cleanup, cleanup.begin():
+                await cleanup.execute(
+                    text(
+                        "DELETE FROM quota_ledger WHERE run_id IN"
+                        " (SELECT id FROM runs WHERE project_id = :p)"
+                    ),
+                    {"p": project_id},
+                )
+                await cleanup.execute(text("DELETE FROM projects WHERE id = :p"), {"p": project_id})
+                if account_id is not None:
+                    await cleanup.execute(
+                        text("DELETE FROM provider_accounts WHERE id = :a"), {"a": account_id}
+                    )
         await engine.dispose()
 
 

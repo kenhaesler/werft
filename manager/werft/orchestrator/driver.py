@@ -224,6 +224,7 @@ class _Loaded:
     container_id: str | None
     base_sha: str | None
     updated_at: datetime
+    hard_deadline_at: datetime | None
     provider: str
     project: Project
     issue_number: int
@@ -250,6 +251,13 @@ class _Driver:
         #: while the container was starting): teardown still runs, finalize does
         #: not — the attempt row and the reservation are already somebody else's.
         self._owns_run = True
+        #: Set only on decision 15's defer path (`_finalize` could not reach
+        #: GitHub). The run stays `running` with its container intact so the
+        #: next attend sweep re-drives it; tearing the box down here would leave
+        #: that re-drive with nothing but a die event that may have aged out of
+        #: the daemon's buffer. Cleanup is the orphan sweep's once the run
+        #: really leaves `running`.
+        self._skip_teardown = False
         self._ticker: asyncio.Task[None] | None = None
 
     # -- entry point ---------------------------------------------------------
@@ -285,6 +293,9 @@ class _Driver:
             )
             await self._teardown()
         else:
+            if self._skip_teardown:
+                logger.info("driver.teardown_deferred", run_id=str(self._run_id))
+                return
             await self._teardown()
 
     async def _drive(self) -> None:
@@ -299,7 +310,10 @@ class _Driver:
             runs_root=self._settings.runs_root,
             dns_ip=self._settings.runner_dns_ip,
         )
-        self._lifecycle = RunnerLifecycle(self._deps.docker, ceiling_seconds=entry.timeout_seconds)
+        self._lifecycle = RunnerLifecycle(
+            self._deps.docker,
+            ceiling_seconds=self._ceiling_seconds(loaded, entry, now=datetime.now(UTC)),
+        )
 
         if loaded.container_id:
             # Re-adoption. `since` reaches back past the row's last write so a
@@ -326,6 +340,28 @@ class _Driver:
         completion = await self._attend(since)
         await self._finalize(loaded, completion, base_sha)
 
+    @staticmethod
+    def _ceiling_seconds(loaded: _Loaded, entry: ProjectDispatch, *, now: datetime) -> float:
+        """The container ceiling this driver will enforce, clamped by the run's
+        **absolute** `hard_deadline_at`.
+
+        `RunnerLifecycle` measures its ceiling from the moment *this* driver
+        starts attending. On a fresh dispatch that is the same clock the
+        deadline was written from (`hard_deadline_at = claim + timeout +
+        margin`), so the plain timeout is already inside it. On the re-adoption
+        path it is not: a manager restart at minute 89 of a 90-minute run would
+        otherwise hand the container a fresh 90 minutes — roughly twice the
+        ceiling — and `sweeps.sweep_deadlines` deliberately skips runs a live
+        driver holds, so nothing else would cut it short.
+
+        Never below one second: a deadline that is already past still wants an
+        attended kill-and-finalize, not a zero-timeout race.
+        """
+        ceiling = float(entry.timeout_seconds)
+        if loaded.hard_deadline_at is None:
+            return ceiling
+        return max(1.0, min(ceiling, (loaded.hard_deadline_at - now).total_seconds()))
+
     # -- phases --------------------------------------------------------------
 
     async def _load(self) -> _Loaded | None:
@@ -350,6 +386,7 @@ class _Driver:
                 container_id=run.container_id,
                 base_sha=run.base_sha,
                 updated_at=run.updated_at,
+                hard_deadline_at=run.hard_deadline_at,
                 provider=run.provider or self._deps.spec.code,
                 project=Project(
                     id=project.id,
@@ -559,6 +596,13 @@ class _Driver:
             # Decision 15: not a verdict. Leave the run `running`; the lease and
             # the next attend sweep re-drive it. Declaring "not pushed" here
             # would throw away work that may well be on GitHub already.
+            #
+            # And leave the *box* alone with it: teardown would remove the
+            # container and network and revoke the git token while the row still
+            # says `running`, so the re-drive would inherit a run it can only
+            # reconstruct from a die event that may have aged out. "Re-drive"
+            # has to mean the whole attempt is still there to re-drive.
+            self._skip_teardown = True
             logger.warning(
                 "driver.push_check_unavailable", run_id=str(self._run_id), error=str(exc)
             )

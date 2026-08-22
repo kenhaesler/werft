@@ -303,7 +303,9 @@ async def sweep_deadlines(
     `infra_failure`. Deliberately **not** gated on lease expiry: the deadline is
     a ceiling on the run, not on the driver's liveness. The live-registry skip
     is the only arbitration it needs, because a driver still in the registry
-    enforces its own ceiling from inside `RunnerLifecycle`.
+    enforces this same deadline from inside `RunnerLifecycle`: `_Driver` clamps
+    its ceiling to `hard_deadline_at - now`, so a re-adopted run cannot buy
+    itself a fresh timeout by outliving the manager that started it.
     """
     async with deps.session_factory() as session:
         rows = (
