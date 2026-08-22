@@ -250,6 +250,110 @@ async def test_lifespan_publishes_the_orchestrators_own_merging_lock_on_app_stat
         await asyncio.wait_for(lifespan_cm.__aexit__(None, None, None), timeout=5)
 
 
+# -- Task 17 fix round 1 -------------------------------------------------
+
+
+async def test_dispatch_stays_dark_with_no_quota_ceiling_even_with_creds_and_config(
+    tmp_path: Path, pg_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding 1: the brief's literal three-way dispatch gate (GitHub
+    creds + `dispatch_config_file` + `claude_credential_file`) omits the
+    quota ceiling. With `quota_ceiling_seconds` at its 0 default, `quota` is
+    `NullQuota()` — and `NullQuota` implements none of
+    `lock_and_resolve`/`next_attempt_no`/`reserve`, so a dispatch plane
+    built anyway would die with `AttributeError` on its first
+    `_sweep_dispatch` tick (SPEC §7: no reservation, no claim). The ceiling
+    being unset must instead leave `dispatch=None` and log loudly — boot
+    must not fail, since an operator may simply be staging the other three
+    settings ahead of the ceiling."""
+    key_file = tmp_path / "app-key.pem"
+    key_file.write_text(_generate_private_key_pem())
+    config_file = tmp_path / "dispatch.json"
+    config_file.write_text(
+        '{"projects": {}}',
+        encoding="utf-8",
+    )
+
+    built: list[Orchestrator] = []
+    original_init = Orchestrator.__init__
+
+    def capturing_init(self: Orchestrator, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        built.append(self)
+
+    monkeypatch.setattr(Orchestrator, "__init__", capturing_init)
+
+    settings = Settings(
+        database_url=pg_url,
+        github_app_client_id="Iv1.test1234",
+        github_app_private_key_file=str(key_file),
+        github_api_url="https://github-api.invalid.test",
+        dispatch_config_file=str(config_file),
+        claude_credential_file=str(tmp_path / "claude-cred"),
+        quota_ceiling_seconds=0,
+    )
+    app = create_app(settings)
+
+    with capture_logs() as logs:
+        async with app.router.lifespan_context(app):
+            assert len(built) == 1
+            assert built[0]._dispatch is None
+
+    assert any(entry.get("event") == "app.dispatch_disabled_no_quota_ceiling" for entry in logs)
+
+
+async def test_a_negotiate_failure_still_disposes_the_engine_and_closes_http(
+    tmp_path: Path, migrated_pg_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding 2: `ensure_provider_account` and `docker.negotiate()`
+    both run before the lifespan's `try: yield`, so — pre-fix — a failure
+    there propagated straight out of `lifespan` without ever reaching the
+    `finally` chain that disposes `engine` and closes `http`/`ntfy_http`.
+    `DockerClient.negotiate` is patched to raise; the fix wraps that whole
+    startup section in its own `try/except` that closes what is already
+    open before re-raising."""
+    from sqlalchemy.ext.asyncio import AsyncEngine
+
+    from werft.runner.docker_api import DockerClient
+
+    key_file = tmp_path / "app-key.pem"
+    key_file.write_text(_generate_private_key_pem())
+    config_file = tmp_path / "dispatch.json"
+    config_file.write_text('{"projects": {}}', encoding="utf-8")
+
+    async def failing_negotiate(self: DockerClient) -> str:
+        raise RuntimeError("no docker daemon reachable")
+
+    monkeypatch.setattr(DockerClient, "negotiate", failing_negotiate)
+
+    disposed: list[bool] = []
+    original_dispose = AsyncEngine.dispose
+
+    async def spying_dispose(self: AsyncEngine, *args: Any, **kwargs: Any) -> None:
+        disposed.append(True)
+        await original_dispose(self, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncEngine, "dispose", spying_dispose)
+
+    settings = Settings(
+        database_url=migrated_pg_url,
+        github_app_client_id="Iv1.test1234",
+        github_app_private_key_file=str(key_file),
+        github_api_url="https://github-api.invalid.test",
+        dispatch_config_file=str(config_file),
+        claude_credential_file=str(tmp_path / "claude-cred"),
+        quota_ceiling_seconds=18000,
+        quota_account_label=f"acct-{uuid.uuid4().hex}",
+    )
+    app = create_app(settings)
+
+    with pytest.raises(RuntimeError, match="no docker daemon reachable"):
+        async with app.router.lifespan_context(app):
+            pass  # pragma: no cover - startup fails before `yield`
+
+    assert disposed == [True]
+
+
 async def test_default_docs_routes_are_not_served(tmp_path: Path) -> None:
     """FastAPI's `/docs`, `/redoc` and `/openapi.json` sit outside `/api/v1`,
     so the bearer dependency mounted on `api_router` never covers them: left

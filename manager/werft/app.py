@@ -305,78 +305,137 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     await engine.dispose()
             return
 
-        private_key_pem = Path(resolved.github_app_private_key_file).read_text()
-        http = httpx.AsyncClient()
-        auth = AppAuth(
-            http,
-            client_id=resolved.github_app_client_id,
-            private_key_pem=private_key_pem,
-            api_url=resolved.github_api_url,
-        )
-        # The same two factories the orchestrator's poll loop uses are also
-        # what the operator API's mutation routes need (onboard, manual
-        # flip, accept's best-effort inline `advance_merging`) — one
-        # composition root, one set of factories, published on `app.state`
-        # rather than each route minting its own `GitHubClient`/`AppAuth`.
-        app.state.ops_for = _ops_factory(auth, http, resolved.github_api_url, MANAGER_PERMISSIONS)
-        app.state.admin_ops_for = _admin_ops_factory(auth, http, resolved.github_api_url)
-
-        # SPEC §7's one knob, reconciled at boot (plan decision D4). `DO UPDATE`
-        # so config + restart is the whole operator surface — there is no seed
-        # script, no migration and no endpoint, because SPEC §9 closes the write
-        # set and a migration would bake a fabricated ceiling into every deploy.
-        # With the ceiling unset, no row exists and nothing dispatches: no
-        # invented ceilings, and no run is parked for it.
-        quota: QuotaPort = NullQuota()
-        if resolved.quota_ceiling_seconds > 0:
-            quota = LedgerQuota(
-                provider=resolved.quota_provider,
-                label=resolved.quota_account_label,
-                fallback_seconds=resolved.quota_block_fallback_seconds,
-                typical_reservation_seconds=resolved.typical_reservation_seconds,
+        # Everything from here down can raise before the `try: yield` below
+        # is ever reached (a missing key file, a DB error out of
+        # `ensure_provider_account`, a `docker.negotiate()` that can't reach
+        # the socket) — and by that point `engine`, and possibly `ntfy_http`,
+        # are already open. Without this `try`, that failure would propagate
+        # straight out of `lifespan` and leak both: the `finally` chain that
+        # closes them lives inside the `try: yield` block below, which a
+        # startup failure never enters. `http`/`docker` are declared here,
+        # ahead of assignment, purely so the `except` can tell "never
+        # opened" apart from "opened, now must be closed" for each.
+        http: httpx.AsyncClient | None = None
+        docker: DockerClient | None = None
+        try:
+            private_key_pem = Path(resolved.github_app_private_key_file).read_text()
+            http = httpx.AsyncClient()
+            auth = AppAuth(
+                http,
+                client_id=resolved.github_app_client_id,
+                private_key_pem=private_key_pem,
+                api_url=resolved.github_api_url,
             )
-            async with app.state.session_factory() as session, session.begin():
-                await ensure_provider_account(
-                    session,
+            # The same two factories the orchestrator's poll loop uses are
+            # also what the operator API's mutation routes need (onboard,
+            # manual flip, accept's best-effort inline `advance_merging`) —
+            # one composition root, one set of factories, published on
+            # `app.state` rather than each route minting its own
+            # `GitHubClient`/`AppAuth`.
+            app.state.ops_for = _ops_factory(
+                auth, http, resolved.github_api_url, MANAGER_PERMISSIONS
+            )
+            app.state.admin_ops_for = _admin_ops_factory(auth, http, resolved.github_api_url)
+
+            # SPEC §7's one knob, reconciled at boot (plan decision D4). `DO
+            # UPDATE` so config + restart is the whole operator surface —
+            # there is no seed script, no migration and no endpoint, because
+            # SPEC §9 closes the write set and a migration would bake a
+            # fabricated ceiling into every deploy. With the ceiling unset,
+            # no row exists and nothing dispatches: no invented ceilings,
+            # and no run is parked for it.
+            quota: QuotaPort = NullQuota()
+            if resolved.quota_ceiling_seconds > 0:
+                quota = LedgerQuota(
                     provider=resolved.quota_provider,
                     label=resolved.quota_account_label,
-                    ceiling_seconds=resolved.quota_ceiling_seconds,
-                    rolling_window_hours=resolved.quota_rolling_window_hours,
-                    window_cap_runs=resolved.quota_window_cap_runs,
-                    provider_window_capacity_seconds=resolved.quota_window_capacity_seconds,
+                    fallback_seconds=resolved.quota_block_fallback_seconds,
+                    typical_reservation_seconds=resolved.typical_reservation_seconds,
                 )
-        app.state.quota = quota  # the cancel route's true-up (D10)
+                async with app.state.session_factory() as session, session.begin():
+                    await ensure_provider_account(
+                        session,
+                        provider=resolved.quota_provider,
+                        label=resolved.quota_account_label,
+                        ceiling_seconds=resolved.quota_ceiling_seconds,
+                        rolling_window_hours=resolved.quota_rolling_window_hours,
+                        window_cap_runs=resolved.quota_window_cap_runs,
+                        provider_window_capacity_seconds=resolved.quota_window_capacity_seconds,
+                    )
+            app.state.quota = quota  # the cancel route's true-up (D10)
 
-        dispatch_services = None
-        docker: DockerClient | None = None
-        if resolved.dispatch_config_file and resolved.claude_credential_file:
-            docker = DockerClient(resolved.docker_url)
-            await docker.negotiate()
-            dispatch_services = DispatchServices(
-                docker=docker,
-                auth=auth,
-                spec=ClaudeSpec(),
-                config=DispatchConfigCache(resolved.dispatch_config_file),
+            # Review finding 1 (Task 17 fix round 1): the brief's literal
+            # three-way gate — dispatch config + credential file + GitHub
+            # creds — omitted the quota ceiling. SPEC §7 ("no reservation,
+            # no claim") makes quota load-bearing for dispatch: with the
+            # ceiling at its 0 default, `quota` above is `NullQuota()`, and
+            # `claim_next` calls `lock_and_resolve`/`next_attempt_no`/
+            # `reserve` — none of which `NullQuota` implements — so the
+            # first `_sweep_dispatch` tick would die with `AttributeError`.
+            # A ceiling of 0 therefore leaves the dispatch plane dark
+            # (`dispatch=None`) rather than failing boot: the operator may
+            # be staging the other three settings ahead of the ceiling, and
+            # a boot failure here would be a worse surprise than a quiet,
+            # loudly-logged no-op.
+            dispatch_services = None
+            if resolved.dispatch_config_file and resolved.claude_credential_file:
+                if resolved.quota_ceiling_seconds > 0:
+                    docker = DockerClient(resolved.docker_url)
+                    await docker.negotiate()
+                    dispatch_services = DispatchServices(
+                        docker=docker,
+                        auth=auth,
+                        spec=ClaudeSpec(),
+                        config=DispatchConfigCache(resolved.dispatch_config_file),
+                        quota=quota,
+                    )
+                else:
+                    logger.warning(
+                        "app.dispatch_disabled_no_quota_ceiling",
+                        dispatch_config_file=resolved.dispatch_config_file,
+                        claude_credential_file=resolved.claude_credential_file,
+                        reason="quota_ceiling_seconds is 0: SPEC §7 requires a "
+                        "configured ceiling before the dispatch plane may claim "
+                        "runs (no reservation, no claim). Set "
+                        "WERFT_QUOTA_CEILING_SECONDS to enable dispatch.",
+                    )
+            orchestrator = Orchestrator(
+                app.state.session_factory,
+                app.state.ops_for,
+                app.state.admin_ops_for,
+                alerts=app.state.alerts,
                 quota=quota,
+                settings=resolved,
+                dispatch=dispatch_services,
             )
-        orchestrator = Orchestrator(
-            app.state.session_factory,
-            app.state.ops_for,
-            app.state.admin_ops_for,
-            alerts=app.state.alerts,
-            quota=quota,
-            settings=resolved,
-            dispatch=dispatch_services,
-        )
-        # The orchestrator's own merging lock, published for the accept
-        # route's inline `advance_merging` kick (api/routes.py). This branch
-        # is the only place an orchestrator exists at all — and it is
-        # exactly the branch that sets `ops_for`, the kick's own guard — so
-        # whenever the kick runs, the poller is running too and the two
-        # genuinely share this instance. The placeholder lock set in
-        # `create_app` below is only ever the one the kick takes when no
-        # orchestrator exists to contend with it.
-        app.state.merging_lock = orchestrator.merging_lock
+            # The orchestrator's own merging lock, published for the accept
+            # route's inline `advance_merging` kick (api/routes.py). This
+            # branch is the only place an orchestrator exists at all — and
+            # it is exactly the branch that sets `ops_for`, the kick's own
+            # guard — so whenever the kick runs, the poller is running too
+            # and the two genuinely share this instance. The placeholder
+            # lock set in `create_app` below is only ever the one the kick
+            # takes when no orchestrator exists to contend with it.
+            app.state.merging_lock = orchestrator.merging_lock
+        except Exception:
+            # Same close order the normal teardown below uses
+            # (ntfy -> http -> docker -> engine), just without the bounded
+            # drain: nothing has been queued on `ntfy_http` yet at this
+            # point in startup, so there is nothing to drain, only to close.
+            try:
+                if ntfy_http is not None:
+                    await ntfy_http.aclose()
+            finally:
+                try:
+                    if http is not None:
+                        await http.aclose()
+                finally:
+                    try:
+                        if docker is not None:
+                            await docker.aclose()
+                    finally:
+                        await engine.dispose()
+            raise
 
         stop = asyncio.Event()
         task = asyncio.create_task(orchestrator.run(stop))
