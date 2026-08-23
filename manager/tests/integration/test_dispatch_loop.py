@@ -112,7 +112,13 @@ async def loop_fixture(migrated_db, db_session, tmp_path, monkeypatch):
         drain_seconds: float = 0.2,
         dispatch: bool = True,
         alerts=None,
+        disk_threshold_percent: float = 100.0,
     ):
+        # 100.0 by default so the tick's disk sweep — which runs
+        # unconditionally, against the *real* filesystem — can never gate
+        # dispatch in a test that is not about the disk. A CI box 90 % full
+        # would otherwise fail every claim assertion in this module for a
+        # reason nothing here mentions. The disk tests pass their own value.
         if not built:  # only the first build in a test; a second adds to it
             await clean_slate()
         tag = uuid.uuid4().hex[:8]
@@ -150,6 +156,7 @@ async def loop_fixture(migrated_db, db_session, tmp_path, monkeypatch):
             max_concurrent_runs=max_concurrent,
             dispatch_max_claims_per_tick=max_claims_per_tick,
             driver_drain_seconds=drain_seconds,
+            disk_threshold_percent=disk_threshold_percent,
         )
         quota = LedgerQuota(label=account_label, typical_reservation_seconds=RESERVATION)
         docker = FakeDocker()
@@ -577,7 +584,11 @@ async def test_disk_over_threshold_blocks_dispatch_and_fires_alert_once(loop_fix
     monkeypatch.setattr(loop_module, "_disk_percent_used", lambda path: 95.0)
     alerts = SpyAlertSink()
     orchestrator, seeded, fakes = await loop_fixture(
-        queued=1, ceiling_slots=10, max_concurrent=10, alerts=alerts
+        queued=1,
+        ceiling_slots=10,
+        max_concurrent=10,
+        alerts=alerts,
+        disk_threshold_percent=90.0,  # the real default; this test is the disk one
     )
 
     await orchestrator.tick_once()

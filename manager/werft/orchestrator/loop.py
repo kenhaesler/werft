@@ -230,6 +230,10 @@ class Orchestrator:
         #: `False` so a fresh manager never gates dispatch before its first
         #: tick has actually looked at the disk.
         self._disk_over = False
+        #: The same rising-edge idiom for the *probe itself*: a permanently
+        #: unreadable `artifacts_root` would otherwise log a warning every
+        #: 15 s forever, which is how a real alert gets tuned out.
+        self._disk_probe_failed = False
         #: Built once, not per sweep and not per driver: both are frozen
         #: bundles of collaborators this orchestrator already owns, and
         #: `driver.py`/`sweeps.py` both say the same thing — one instance,
@@ -482,13 +486,19 @@ class Orchestrator:
         The alert fires on the rising edge only (`over and not self._disk_over`)
         and re-arms the moment usage drops back under threshold, so an
         operator gets exactly one page per incident rather than one per tick
-        for as long as the disk stays full.
+        for as long as the disk stays full. The probe-failure warning is
+        edge-triggered the same way, for the same reason.
         """
         percent = _disk_percent_used(self._settings.artifacts_root)
         if percent is None:
-            logger.warning("disk_probe_failed", path=self._settings.artifacts_root)
+            if self._disk_probe_failed:
+                logger.debug("disk_probe_failed", path=self._settings.artifacts_root)
+            else:
+                logger.warning("disk_probe_failed", path=self._settings.artifacts_root)
+            self._disk_probe_failed = True
             self._disk_over = False
             return
+        self._disk_probe_failed = False
         over = percent >= self._settings.disk_threshold_percent
         if over and not self._disk_over:
             await self._alerts.disk_threshold(percent)
