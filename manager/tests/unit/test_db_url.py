@@ -39,3 +39,41 @@ def test_password_file_set_but_missing_is_a_permanent_error(tmp_path: Path):
 
     with pytest.raises(PermanentError, match="WERFT_DATABASE_PASSWORD_FILE"):
         apply_password_file("postgresql+asyncpg://werft@postgres:5432/werft", str(missing))
+
+
+def test_password_file_empty_is_a_permanent_error(tmp_path: Path):
+    """An empty file would otherwise silently produce a passwordless URL —
+    the manager boots clean and fails opaquely on the first real connection
+    instead of loudly at startup."""
+    secret = tmp_path / "pg_password"
+    secret.write_text("")
+
+    with pytest.raises(PermanentError, match="WERFT_DATABASE_PASSWORD_FILE"):
+        apply_password_file("postgresql+asyncpg://werft@postgres:5432/werft", str(secret))
+
+
+def test_password_file_whitespace_only_is_a_permanent_error(tmp_path: Path):
+    secret = tmp_path / "pg_password"
+    secret.write_text("   \n\n  \n")
+
+    with pytest.raises(PermanentError, match="WERFT_DATABASE_PASSWORD_FILE"):
+        apply_password_file("postgresql+asyncpg://werft@postgres:5432/werft", str(secret))
+
+
+def test_password_file_unreadable_is_a_permanent_error(tmp_path: Path, monkeypatch):
+    """Compose file-secrets inherit host file modes, and the manager does
+    not run as root — `Path.is_file()` passing is not proof the process can
+    actually read the file's contents. A real permission failure is
+    platform/ACL-dependent to reproduce, so this monkeypatches `read_text`
+    to raise the `OSError` subclass a real permission failure would (rather
+    than fighting Windows ACLs / running as non-root in CI)."""
+    secret = tmp_path / "pg_password"
+    secret.write_text("s3cret\n")
+
+    def _raise(*args, **kwargs):
+        raise PermissionError("Permission denied")
+
+    monkeypatch.setattr(Path, "read_text", _raise)
+
+    with pytest.raises(PermanentError, match="WERFT_DATABASE_PASSWORD_FILE"):
+        apply_password_file("postgresql+asyncpg://werft@postgres:5432/werft", str(secret))

@@ -33,5 +33,26 @@ def apply_password_file(database_url: str, password_file: str) -> str:
             f"WERFT_DATABASE_PASSWORD_FILE is set to {password_file!r} but that "
             "file does not exist or is not readable."
         )
-    password = path.read_text().strip()
+    try:
+        contents = path.read_text()
+    except OSError as exc:
+        # Compose file-secrets inherit host file modes, and the manager does
+        # not run as root — `is_file()` passing is not proof the process can
+        # actually read the file's contents. Same taxonomy as the two guards
+        # above: a permission failure here belongs at boot, not surfaced as
+        # an opaque failure the first time a route issues a query.
+        raise PermanentError(
+            f"WERFT_DATABASE_PASSWORD_FILE is set to {password_file!r} but it "
+            f"could not be read: {exc}"
+        ) from exc
+    password = contents.strip()
+    if not password:
+        # An empty/whitespace-only file would otherwise silently produce a
+        # passwordless URL — the manager then boots clean and fails opaquely
+        # on the first real connection instead of at startup where the
+        # operator is watching (same D3 rationale as the other boot guards).
+        raise PermanentError(
+            f"WERFT_DATABASE_PASSWORD_FILE is set to {password_file!r} but its "
+            "contents are empty (after stripping whitespace)."
+        )
     return make_url(database_url).set(password=password).render_as_string(hide_password=False)

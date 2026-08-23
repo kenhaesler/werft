@@ -40,12 +40,17 @@ services:
     restart: "no"
 
   manager:
+    build: {context: .., dockerfile: deploy/manager/Dockerfile}
     image: werft-manager:local
     networks: [internal, docker-proxy-net, mgr_egress, ingress]
-    ports: ["${TS_IP}:8420:8420"]     # ingress only; zero public listeners (SPEC §10)
+    # Required-var form (SPEC §10: zero public listeners): an empty/unset
+    # TS_IP must fail loudly here — the bare-interpolation form silently
+    # collapses to `:8420:8420`, which Docker publishes on ALL interfaces.
+    ports: ["${TS_IP:?TS_IP must be set — see deploy/README.md}:8420:8420"]
     environment:
       <<: *mgr_env
       HTTPS_PROXY: http://egress-proxy:3128
+      HTTP_PROXY: http://egress-proxy:3128
       NO_PROXY: postgres,docker-socket-proxy,egress-proxy
       WERFT_DOCKER_URL: tcp://docker-socket-proxy:2375
       WERFT_RUNS_ROOT: /srv/werft/runs
