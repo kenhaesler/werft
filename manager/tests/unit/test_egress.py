@@ -3,6 +3,7 @@ import sys
 
 import pytest
 
+import werft.runner.egress as egress_mod
 from werft.runner.egress import extract_egress_lines
 
 SUBNET = ["172.24.0.0/29"]
@@ -111,3 +112,17 @@ def test_dest_file_mode_is_0644(tmp_path):
     extract_egress_lines(_log(tmp_path, [hit]), SUBNET, str(dest))
     mode = stat_mod.S_IMODE(os.stat(str(dest)).st_mode)
     assert mode == 0o644
+
+
+def test_write_failure_leaves_no_partial_or_temp_file(tmp_path, monkeypatch):
+    def _boom(*args, **kwargs):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(egress_mod.os, "replace", _boom)
+
+    hit = b"172.24.0.3 ok\n"
+    dest = tmp_path / "out.log"
+    n = extract_egress_lines(_log(tmp_path, [hit]), SUBNET, str(dest))
+    assert n is None
+    assert not dest.exists()
+    assert not (tmp_path / "out.log.tmp").exists()

@@ -20,6 +20,7 @@ matched set does not fit, since the newest activity is the most likely to
 matter to whatever triggered evidence collection.
 """
 
+import contextlib
 import ipaddress
 import os
 import re
@@ -69,6 +70,14 @@ def extract_egress_lines(
     Returns bytes written, `0` if the log was readable but held no matching
     line (no file is created on 0), or `None` when skipped (empty/missing/
     unreadable/non-regular `log_path`, or empty `subnets`). Never raises.
+
+    Note the distinction in the "empty" cases: an empty `log_path` *string*
+    (unconfigured, D7) is what returns `None` here; a `log_path` that points
+    at a real, readable, zero-byte file is not skipped — it is read, found to
+    hold no matching line, and returns `0` like any other no-match log. And a
+    non-empty `subnets` list where every entry fails to parse is treated the
+    same as an empty `subnets` list — no usable subnet means there is nothing
+    to filter on, so this returns `None` rather than `0`.
     """
     if not subnets:
         return None
@@ -118,14 +127,18 @@ def extract_egress_lines(
 
     payload = b"".join(matched)
 
+    dirname = os.path.dirname(dest_path)
+    tmp_path = dest_path + ".tmp"
     try:
-        dirname = os.path.dirname(dest_path)
         if dirname:
             os.makedirs(dirname, exist_ok=True)
-        with open(dest_path, "wb") as out:
+        with open(tmp_path, "wb") as out:
             out.write(payload)
-        os.chmod(dest_path, 0o644)
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, dest_path)
     except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
         return None
 
     return len(payload)
