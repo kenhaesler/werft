@@ -51,6 +51,12 @@ class CollectionReport:
 
 
 @dataclass(frozen=True)
+class TreeSource:
+    src_dir: str
+    dest_prefix: str  # non-empty, no slashes at the edges, e.g. "outputs"
+
+
+@dataclass(frozen=True)
 class _Candidate:
     rel_path: str
     full_path: str
@@ -102,27 +108,34 @@ def _scan(src_root: str, report: CollectionReport, max_file_bytes: int) -> list[
     return candidates
 
 
-def collect_outputs(
-    src_dir: str,
+def _copy_candidates(
+    candidates: list[_Candidate],
     dest_dir: str,
+    report: CollectionReport,
+    max_total_bytes: int,
     *,
-    max_total_bytes: int = MAX_TOTAL_BYTES,
-    max_file_bytes: int = MAX_FILE_BYTES,
-) -> CollectionReport:
-    """Copy regular files from an agent-writable tree into Werft-owned storage."""
-    report = CollectionReport()
-    src_root = os.path.realpath(src_dir)
-    os.makedirs(dest_dir, exist_ok=True)
+    existing: dict[str, int] | None = None,
+) -> None:
+    """Copy pre-sorted candidates into `dest_dir`, enforcing the total-bytes cap.
 
-    candidates = _scan(src_root, report, max_file_bytes)
+    `candidates` must already be sorted smallest-first (see callers): copying
+    smallest-first and dropping whatever no longer fits is what makes SPEC §8's
+    "over-cap drops largest-first" true, and it is deterministic — the agent
+    cannot influence which evidence survives by choosing filenames.
 
-    # SPEC §8: "over-cap drops largest-first". Copying smallest-first and dropping
-    # whatever no longer fits is exactly that, and it is deterministic — the agent
-    # cannot influence which evidence survives by choosing filenames.
-    candidates.sort(key=lambda c: (c.size_bytes, c.rel_path))
+    `existing` (D4) credits bytes a caller already has on disk at a `rel_path`
+    (e.g. a prior collection pass) so a same-content retry is never dropped as
+    `total_cap` for bytes that were already counted. `report.bytes_total` only
+    ever accumulates bytes written by *this* pass.
+    """
+    working_existing = dict(existing) if existing else {}
+    effective_total = sum(working_existing.values())
 
     for candidate in candidates:
-        if report.bytes_total + candidate.size_bytes > max_total_bytes:
+        prospective = (
+            effective_total - working_existing.get(candidate.rel_path, 0) + candidate.size_bytes
+        )
+        if prospective > max_total_bytes:
             report.dropped.append(
                 DroppedEntry(candidate.rel_path, "total_cap", candidate.size_bytes)
             )
@@ -148,5 +161,76 @@ def collect_outputs(
         written = os.path.getsize(target)
         report.artifacts.append(CollectedArtifact(candidate.rel_path, written))
         report.bytes_total += written
+        effective_total = prospective
+        working_existing.pop(candidate.rel_path, None)
+
+
+def collect_outputs(
+    src_dir: str,
+    dest_dir: str,
+    *,
+    max_total_bytes: int = MAX_TOTAL_BYTES,
+    max_file_bytes: int = MAX_FILE_BYTES,
+) -> CollectionReport:
+    """Copy regular files from an agent-writable tree into Werft-owned storage."""
+    report = CollectionReport()
+    src_root = os.path.realpath(src_dir)
+    os.makedirs(dest_dir, exist_ok=True)
+
+    candidates = _scan(src_root, report, max_file_bytes)
+
+    # SPEC §8: "over-cap drops largest-first". See `_copy_candidates`.
+    candidates.sort(key=lambda c: (c.size_bytes, c.rel_path))
+
+    _copy_candidates(candidates, dest_dir, report, max_total_bytes)
+
+    return report
+
+
+def collect_trees(
+    sources: list[TreeSource],
+    dest_dir: str,
+    *,
+    max_total_bytes: int = MAX_TOTAL_BYTES,
+    max_file_bytes: int = MAX_FILE_BYTES,
+    existing: dict[str, int] | None = None,
+) -> CollectionReport:
+    """Collect several agent-writable trees into one destination under one budget.
+
+    Each source's files land under `f"{dest_prefix}/{rel}"` (forward slashes,
+    always — this keeps `Artifact.path` portable between a Windows dev box and
+    the Linux rig, and matches the serving route's `{artifact_path:path}`
+    semantics). A missing `src_dir` is silent: `_scan`'s `os.walk` yields
+    nothing for a path that does not exist, so there is nothing to prefix or
+    drop.
+
+    All candidates from all sources are pooled and sorted once
+    (`key=(size_bytes, rel_path)`) before the single copy pass, so the largest
+    file across the *whole* evidence set — not just its own source — is what
+    gets evicted first when the shared budget runs out.
+    """
+    report = CollectionReport()
+    os.makedirs(dest_dir, exist_ok=True)
+
+    all_candidates: list[_Candidate] = []
+    for source in sources:
+        src_root = os.path.realpath(source.src_dir)
+        dropped_before = len(report.dropped)
+        candidates = _scan(src_root, report, max_file_bytes)
+
+        for i in range(dropped_before, len(report.dropped)):
+            dropped = report.dropped[i]
+            prefixed = f"{source.dest_prefix}/{dropped.rel_path.replace(os.sep, '/')}"
+            report.dropped[i] = DroppedEntry(prefixed, dropped.reason, dropped.size_bytes)
+
+        for candidate in candidates:
+            prefixed_rel = f"{source.dest_prefix}/{candidate.rel_path.replace(os.sep, '/')}"
+            all_candidates.append(
+                _Candidate(prefixed_rel, candidate.full_path, candidate.size_bytes)
+            )
+
+    all_candidates.sort(key=lambda c: (c.size_bytes, c.rel_path))
+
+    _copy_candidates(all_candidates, dest_dir, report, max_total_bytes, existing=existing)
 
     return report

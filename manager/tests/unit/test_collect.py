@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from werft.runner.collect import collect_outputs
+from werft.runner.collect import TreeSource, collect_outputs, collect_trees
 
 
 @pytest.fixture
@@ -186,3 +186,74 @@ def test_empty_tree_is_fine(trees):
     assert report.artifacts == []
     assert report.bytes_total == 0
     assert report.truncated is False
+
+
+def test_collect_trees_prefixes_and_merges(tmp_path):
+    a = tmp_path / "a"
+    a.mkdir()
+    (a / "x.txt").write_bytes(b"aaaa")
+    b = tmp_path / "b" / "nested"
+    b.mkdir(parents=True)
+    (b / "y.txt").write_bytes(b"bb")
+    dest = tmp_path / "dest"
+    report = collect_trees(
+        [TreeSource(str(a), "outputs"), TreeSource(str(tmp_path / "b"), "test-results")],
+        str(dest),
+    )
+    assert {c.rel_path for c in report.artifacts} == {"outputs/x.txt", "test-results/nested/y.txt"}
+    assert (dest / "outputs" / "x.txt").read_bytes() == b"aaaa"
+    assert report.bytes_total == 6 and not report.truncated
+
+
+def test_collect_trees_missing_source_is_silent(tmp_path):
+    dest = tmp_path / "dest"
+    report = collect_trees([TreeSource(str(tmp_path / "absent"), "outputs")], str(dest))
+    assert report.artifacts == [] and report.dropped == [] and not report.truncated
+
+
+def test_collect_trees_budget_spans_sources_largest_first(tmp_path):
+    a = tmp_path / "a"
+    a.mkdir()
+    (a / "big.bin").write_bytes(b"x" * 60)
+    b = tmp_path / "b"
+    b.mkdir()
+    (b / "small.bin").write_bytes(b"x" * 30)
+    report = collect_trees(
+        [TreeSource(str(a), "s1"), TreeSource(str(b), "s2")],
+        str(tmp_path / "dest"),
+        max_total_bytes=80,
+    )
+    # global largest-first drop: the 60-byte file loses regardless of source order
+    assert [c.rel_path for c in report.artifacts] == ["s2/small.bin"]
+    assert [(d.rel_path, d.reason) for d in report.dropped] == [("s1/big.bin", "total_cap")]
+    assert report.truncated
+
+
+def test_collect_trees_overwrite_is_charged_only_its_delta(tmp_path):
+    # D4: a retry re-collection of the same files must never be dropped as total_cap
+    a = tmp_path / "a"
+    a.mkdir()
+    (a / "same.bin").write_bytes(b"x" * 70)
+    dest = tmp_path / "dest"
+    first = collect_trees([TreeSource(str(a), "s1")], str(dest), max_total_bytes=80)
+    assert not first.truncated
+    again = collect_trees(
+        [TreeSource(str(a), "s1")],
+        str(dest),
+        max_total_bytes=80,
+        existing={"s1/same.bin": 70},
+    )
+    assert [c.rel_path for c in again.artifacts] == ["s1/same.bin"]
+    assert again.dropped == [] and not again.truncated
+
+
+def test_collect_trees_dropped_entries_are_prefixed_too(tmp_path):
+    """DroppedEntry rel_paths must carry the source prefix, same as artifacts."""
+    a = tmp_path / "a"
+    a.mkdir()
+    (a / "huge.bin").write_bytes(b"x" * 100)
+    dest = tmp_path / "dest"
+    report = collect_trees([TreeSource(str(a), "outputs")], str(dest), max_file_bytes=10)
+    assert report.artifacts == []
+    assert [d.rel_path for d in report.dropped] == ["outputs/huge.bin"]
+    assert [d.reason for d in report.dropped] == ["too_large"]
