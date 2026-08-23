@@ -12,6 +12,7 @@ from werft.runner.docker_api import (
     DockerApiError,
     DockerClient,
     _build_transport,
+    is_pool_overlap,
     subnets_of,
 )
 
@@ -128,6 +129,134 @@ async def test_remove_container_tolerates_404():
 async def test_remove_network_tolerates_404():
     async with client_with(lambda r: httpx.Response(404, json={"message": "no such"})) as client:
         await client.remove_network("gone")
+
+
+async def test_create_network_without_subnet_is_byte_identical_to_today():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(201, json={"Id": "net123"})
+
+    async with client_with(handler) as client:
+        await client.create_network("werft-run-abc-net")
+    assert seen["body"] == {
+        "Name": "werft-run-abc-net",
+        "Driver": "bridge",
+        "Internal": True,
+        "CheckDuplicate": True,
+    }
+    assert "IPAM" not in seen["body"]
+
+
+async def test_create_network_with_subnet_adds_ipam_config():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(201, json={"Id": "net123"})
+
+    async with client_with(handler) as client:
+        await client.create_network("werft-run-abc-net", subnet="172.24.0.0/29")
+    assert seen["body"]["IPAM"] == {
+        "Driver": "default",
+        "Config": [{"Subnet": "172.24.0.0/29"}],
+    }
+    assert seen["body"]["Internal"] is True
+    assert seen["body"]["Name"] == "werft-run-abc-net"
+
+
+async def test_connect_network_without_ipv4_omits_endpoint_config():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200)
+
+    async with client_with(handler) as client:
+        await client.connect_network("net123", "container1")
+    assert seen["url"].endswith(f"/{API_VERSION}/networks/net123/connect")
+    assert seen["body"] == {"Container": "container1"}
+
+
+async def test_connect_network_with_ipv4_sets_endpoint_config():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200)
+
+    async with client_with(handler) as client:
+        await client.connect_network("net123", "container1", ipv4="172.24.0.2")
+    assert seen["body"] == {
+        "Container": "container1",
+        "EndpointConfig": {"IPAMConfig": {"IPv4Address": "172.24.0.2"}},
+    }
+
+
+async def test_connect_network_raises_on_error():
+    async with client_with(lambda r: httpx.Response(500, json={"message": "boom"})) as client:
+        with pytest.raises(DockerApiError):
+            await client.connect_network("net123", "container1")
+
+
+async def test_disconnect_network_tolerates_404():
+    async with client_with(lambda r: httpx.Response(404, json={"message": "no such"})) as client:
+        await client.disconnect_network("net123", "container1")  # must not raise
+
+
+async def test_disconnect_network_tolerates_not_connected_500():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500, json={"message": "container container1 is not connected to network net123"}
+        )
+
+    async with client_with(handler) as client:
+        await client.disconnect_network("net123", "container1")  # must not raise
+
+
+async def test_disconnect_network_raises_on_unrelated_500():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"message": "boom"})
+
+    async with client_with(handler) as client:
+        with pytest.raises(DockerApiError):
+            await client.disconnect_network("net123", "container1")
+
+
+async def test_disconnect_network_sends_force_by_default():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200)
+
+    async with client_with(handler) as client:
+        await client.disconnect_network("net123", "container1")
+    assert seen["url"].endswith(f"/{API_VERSION}/networks/net123/disconnect")
+
+
+def test_is_pool_overlap_true_on_403():
+    exc = DockerApiError(403, "Pool overlaps with other one on this address space")
+    assert is_pool_overlap(exc) is True
+
+
+def test_is_pool_overlap_true_on_message_case_insensitive():
+    exc = DockerApiError(500, "pool OVERLAPS with other one on this address space")
+    assert is_pool_overlap(exc) is True
+
+
+def test_is_pool_overlap_false_on_unrelated_error():
+    exc = DockerApiError(500, "something else went wrong")
+    assert is_pool_overlap(exc) is False
+
+
+def test_tcp_url_builds_a_plain_http_client_no_unix_transport():
+    _transport, base = _build_transport("tcp://docker-socket-proxy:2375")
+    assert base == "http://docker-socket-proxy:2375"
+    client = DockerClient(url="tcp://docker-socket-proxy:2375")
+    assert str(client._client.base_url).rstrip("/") == "http://docker-socket-proxy:2375"
 
 
 async def test_watch_die_events_filters_by_run_label_and_parses_exit_code():
