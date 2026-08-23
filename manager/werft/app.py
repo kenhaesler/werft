@@ -79,6 +79,11 @@ from werft.runner.docker_api import DockerClient
 
 logger = structlog.get_logger(__name__)
 
+#: The most egress slots the addressing scheme can express: a slot's subnet is
+#: `<egress_subnet_prefix>.<slot>.0/24`, so the slot number is one octet
+#: (`egress_admin._validate_slot` accepts 0..255).
+EGRESS_SLOT_CEILING = 256
+
 #: Cap on `NtfyAlertSink.drain()` at shutdown. `NtfyAlertSink.drain()`
 #: already never raises from an individual spawned task's own exception
 #: (alerts.py: `gather(..., return_exceptions=True)`) — this instead bounds
@@ -278,6 +283,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # check above. `egress_slot_count == 0` means the plumbing is off
     # entirely (today's Internal-only network), so `max_concurrent_runs`
     # is unconstrained by it.
+    # Upper bound, same D3 rationale: a slot's third octet is the slot number
+    # (`egress_admin.slot_subnet` -> `<prefix>.<slot>.0/24`, `_validate_slot`
+    # accepts 0..255), so 256 is the ceiling the addressing scheme can express.
+    # Above it, `_claim_slot` walks off the end of the octet and every claim
+    # past 255 dies on a `ValueError` mid-dispatch instead of at boot, where
+    # the operator is watching.
+    if resolved.egress_slot_count > EGRESS_SLOT_CEILING:
+        raise PermanentError(
+            f"egress_slot_count ({resolved.egress_slot_count}) exceeds the "
+            f"{EGRESS_SLOT_CEILING}-slot ceiling: a slot's subnet is "
+            "<egress_subnet_prefix>.<slot>.0/24, so slot numbers must fit in "
+            "one octet (0..255). Lower WERFT_EGRESS_SLOT_COUNT."
+        )
     if resolved.egress_slot_count > 0 and resolved.max_concurrent_runs > resolved.egress_slot_count:
         raise PermanentError(
             "max_concurrent_runs "

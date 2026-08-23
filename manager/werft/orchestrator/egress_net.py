@@ -19,10 +19,14 @@ full slot table is capacity; an egress-proxy container that is not running is a
 deployment fact; a read-only allowlist directory is a host fact. None of them
 is the run's fault, so none of them may park it — they requeue it with backoff
 and the next attempt finds a healthier host. The one deliberate exception is
-the squid reload signal (D2): the allowlist *file* is the truth squid re-reads,
-so a HUP that did not land is a log line, never a dispatch failure.
+the squid reload signal (D2): the allowlist *file* is the truth, and the HUP is
+what asks squid to re-read it, so a HUP that did not land is a log line, never
+a dispatch failure. It is retried once and escalated to ERROR on the second
+failure, because squid holds the previously-loaded files in memory until it is
+reconfigured — an unreloaded slot keeps serving its last occupant's allowlist.
 """
 
+import asyncio
 from dataclasses import replace
 
 import structlog
@@ -89,8 +93,12 @@ async def attach_egress(
     the placement carrying that slot's resolver and proxy URL.
 
     Everything after a successful create is wrapped: a half-attached network is
-    worse than no network, so any failure gives the slot straight back before
-    raising `EgressUnavailable`.
+    worse than no network, so any failure detaches the two service containers
+    from it (`_release`) before raising `EgressUnavailable`. That is *not* the
+    same as freeing the slot: the slot is the network holding the /24, and only
+    removing that network gives it back — which the caller's teardown path
+    does. `_release` just makes sure squid and dns-guard are not left wired into
+    a network nobody is going to use.
     """
     if not egress_on(settings):
         await lifecycle.prepare(placement)
@@ -126,7 +134,7 @@ async def attach_egress(
         )
         raise EgressUnavailable(f"egress slot {slot} could not be attached: {exc}") from exc
 
-    await _reload_squid(docker, settings, run_id)
+    await _reload_squid(docker, settings, run_id, slot)
     logger.info("egress.slot_claimed", run_id=run_id, slot=slot, hosts=len(hosts))
     return placement_with_slot(placement, settings, slot)
 
@@ -157,7 +165,7 @@ async def detach_egress(
         # Best effort by ruling: the slot's next occupant rewrites this file
         # before its container exists, so a stale file is never *reachable*.
         logger.warning("egress.allowlist_clear_failed", run_id=run_id, slot=slot, error=str(exc))
-    await _reload_squid(docker, settings, run_id)
+    await _reload_squid(docker, settings, run_id, slot)
     await _release(docker, settings, network_name=network_name, slot=slot, run_id=run_id)
 
 
@@ -171,7 +179,16 @@ async def _claim_slot(
             await lifecycle.prepare(placement, subnet=egress_admin.slot_subnet(slot, prefix=prefix))
         except DockerApiError as exc:
             if is_pool_overlap(exc):
-                logger.debug("egress.slot_taken", run_id=run_id, slot=slot)
+                # The daemon's own wording, kept: it is the only evidence that
+                # this really was a pool collision and not some other refusal
+                # that happens to have been misread as one.
+                logger.debug(
+                    "egress.slot_taken",
+                    run_id=run_id,
+                    slot=slot,
+                    status_code=exc.status_code,
+                    daemon_message=exc.message,
+                )
                 continue
             raise EgressUnavailable(f"egress slot {slot} could not be created: {exc}") from exc
         return slot
@@ -196,9 +213,52 @@ async def _release(
             )
 
 
-async def _reload_squid(docker: DockerClient, settings: Settings, run_id: str) -> None:
-    """D2: the file is the truth, the signal is the optimisation."""
-    try:
-        await docker.kill_container(settings.egress_proxy_container, signal="HUP")
-    except Exception as exc:  # noqa: BLE001 - never fails a run
-        logger.warning("egress.allowlist_reload_failed", run_id=run_id, error=str(exc))
+#: One retry of the squid HUP, with this pause between attempts. A reload that
+#: never lands leaves slot K serving its *previous* occupant's allowlist — which
+#: may be broader, and belong to a different project — until the next run on
+#: that slot HUPs successfully. D2 still forbids failing the dispatch over it,
+#: so the mitigation is: try twice, then shout.
+_RELOAD_RETRY_DELAY_SECONDS = 1.0
+
+
+async def _reload_squid(
+    docker: DockerClient, settings: Settings, run_id: str, slot: int | None = None
+) -> None:
+    """D2: the file is the truth, the signal is the optimisation.
+
+    Tolerated but not shrugged at: squid caches the `dstdomain` files in memory
+    until it is reconfigured, so a HUP that did not land means the slot keeps
+    enforcing whatever was written for its last occupant. One retry covers the
+    common transient (a proxy container mid-restart); a second failure is an
+    ERROR, because the fleet is now enforcing a stale allowlist on a named slot
+    and only an operator can notice that.
+    """
+    for attempt in (1, 2):
+        try:
+            await docker.kill_container(settings.egress_proxy_container, signal="HUP")
+            return
+        except Exception as exc:  # noqa: BLE001 - never fails a run
+            if attempt == 1:
+                logger.warning(
+                    "egress.allowlist_reload_failed",
+                    run_id=run_id,
+                    slot=slot,
+                    attempt=attempt,
+                    retrying=True,
+                    error=str(exc),
+                )
+                await asyncio.sleep(_RELOAD_RETRY_DELAY_SECONDS)
+                continue
+            logger.error(
+                "egress.allowlist_reload_failed",
+                run_id=run_id,
+                slot=slot,
+                attempt=attempt,
+                retrying=False,
+                container=settings.egress_proxy_container,
+                error=str(exc),
+                note=(
+                    "squid was not reloaded; its slot allowlists remain as last "
+                    "loaded, which may be a previous occupant's"
+                ),
+            )

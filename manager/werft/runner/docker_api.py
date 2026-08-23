@@ -87,10 +87,15 @@ def is_pool_overlap(exc: DockerApiError) -> bool:
 
     Docker's own refusal is the slot lock (SPEC intent): callers claim a run
     network by attempting create-with-subnet and treating this as "taken".
-    The daemon has been observed to answer both with `403` and with a `500`
-    whose message names the collision — so either signal counts.
+    The daemon has been observed to answer with both `403` and `500` for this,
+    so the **status code is not the discriminator — the message is**. A bare
+    403 must not count: `docker-socket-proxy` answers 403 for every endpoint
+    its permission set denies, and treating that as "slot taken" would walk the
+    whole slot table and report "all egress slots are in use" when the real
+    fault is a misconfigured proxy — a permissions problem wearing a capacity
+    problem's clothes, at 03:00, unattended.
     """
-    return exc.status_code == 403 or "pool overlaps" in exc.message.lower()
+    return "pool overlaps" in exc.message.lower()
 
 
 class DockerClient:

@@ -114,6 +114,20 @@ def test_concurrency_at_or_below_egress_slot_count_boots_clean() -> None:
     create_app(Settings(egress_slot_count=2, max_concurrent_runs=2))
 
 
+def test_egress_slot_count_above_the_octet_ceiling_fails_boot_loudly() -> None:
+    """A slot's subnet is `<prefix>.<slot>.0/24`, so the slot number is one
+    octet and 256 is the whole table. Past it, `_claim_slot` would walk off the
+    end and die on `egress_admin._validate_slot`'s `ValueError` mid-dispatch,
+    at 03:00 — the guard moves that to boot, where the operator is watching."""
+    with pytest.raises(PermanentError, match="egress_slot_count.*256"):
+        create_app(Settings(egress_slot_count=257, max_concurrent_runs=1))
+
+
+def test_egress_slot_count_at_the_ceiling_boots_clean() -> None:
+    """The boundary: 256 slots is exactly what 0..255 expresses."""
+    create_app(Settings(egress_slot_count=256, max_concurrent_runs=1))
+
+
 def test_egress_slots_off_ignores_concurrency_entirely() -> None:
     """`egress_slot_count == 0` means the egress plumbing is off (SPEC
     §4.5): no slots to run out of, so an arbitrarily high concurrency is

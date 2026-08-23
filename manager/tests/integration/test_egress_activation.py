@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 
 import pytest
+from structlog.testing import capture_logs
 
 from tests.fakes import write_outputs
 from tests.integration import test_driver
@@ -31,8 +32,9 @@ from tests.integration.test_driver import (
     sweep_deps_of,
 )
 from werft.domain.runs import run_branch_name
+from werft.orchestrator import egress_net
 from werft.orchestrator.driver import attend_run
-from werft.orchestrator.sweeps import reap_run_containers
+from werft.orchestrator.sweeps import RUN_ID_LABEL, reap_run_containers
 from werft.runner.egress_admin import BASE_ALLOW, write_allowlist
 
 #: `test_driver`'s harness, re-bound so pytest registers the same fixtures here
@@ -84,6 +86,23 @@ def allowlist_text(allow_dir: str, slot: int) -> str:
 
 def subnets_of_calls(fakes) -> list[str | None]:
     return [subnet for _name, subnet in fakes.docker.created_networks]
+
+
+def seed_labelled_container(fakes, run_id) -> str:
+    """Put the run's container in the fake daemon's listing, labelled the way
+    the sweep finds it (`werft.run_id`).
+
+    The sweep tests need this: without a container to find, `reap_run_containers`
+    kills nothing, and both "the reap does the same teardown as the driver" and
+    "the egress-off reap signals nothing" pass vacuously — the SIGKILL half of
+    the sequence is never exercised and a stray HUP would be indistinguishable
+    from no signal at all.
+    """
+    container_id = fakes.docker.container_id
+    fakes.docker.containers.append(
+        {"Id": container_id, "Labels": {RUN_ID_LABEL: str(run_id)}, "State": "running"}
+    )
+    return container_id
 
 
 # --- 1: off ------------------------------------------------------------------
@@ -209,19 +228,60 @@ async def test_squid_is_hupped_after_the_allowlist_is_written(deps_fixture, tmp_
     assert (PROXY, "HUP") in hups[0]
 
 
-async def test_a_failed_hup_does_not_fail_the_run(deps_fixture, tmp_path):
+async def test_a_failed_hup_is_retried_once_then_tolerated(deps_fixture, tmp_path, monkeypatch):
     """D2: the allowlist file is the truth; a reload that did not land is a log
-    line, not a dispatch failure."""
+    line, not a dispatch failure. But squid holds the previously-loaded files in
+    memory, so a slot whose HUP never landed keeps serving its *last occupant's*
+    allowlist — hence one retry before giving up, and an ERROR when it does."""
     driver_deps, run_id, fakes = deps_fixture
+    monkeypatch.setattr(egress_net, "_RELOAD_RETRY_DELAY_SECONDS", 0.0)
     enable(fakes, tmp_path)
     fakes.docker.error = RuntimeError("squid is not listening")
     fakes.docker.failing_ops = {"kill_container"}
     fakes.on_started = lambda p: write_outputs(p, status="success")
     fakes.ops.ref_shas[run_branch_name(run_id)] = "f" * 40  # the agent pushed
 
-    await attend_run(driver_deps, run_id)  # must not raise
+    with capture_logs() as logs:
+        await attend_run(driver_deps, run_id)  # must not raise
 
     assert (await fetch(fakes, run_id)).status == "awaiting_review"
+    # Attach's reload is signalled twice, not once (this fixture's `network
+    # inspect` body reports a non-slot subnet, so teardown derives no slot and
+    # never reaches its own reload — one reload point, two attempts).
+    hups = [c for c, signal in fakes.docker.kill_signals if signal == "HUP"]
+    assert hups == [PROXY, PROXY]
+    reload_failures = [e for e in logs if e.get("event") == "egress.allowlist_reload_failed"]
+    assert [e["log_level"] for e in reload_failures] == ["warning", "error"]
+    assert [e["attempt"] for e in reload_failures] == [1, 2]
+    assert all(e["slot"] == 0 and e["run_id"] == str(run_id) for e in reload_failures)
+
+
+async def test_a_hup_that_lands_on_the_retry_is_not_escalated(deps_fixture, tmp_path, monkeypatch):
+    """The transient the retry exists for: the first signal fails, the second
+    lands, and nothing is logged at ERROR."""
+    driver_deps, run_id, fakes = deps_fixture
+    monkeypatch.setattr(egress_net, "_RELOAD_RETRY_DELAY_SECONDS", 0.0)
+    enable(fakes, tmp_path)
+    fakes.on_started = lambda p: write_outputs(p, status="success")
+
+    real_kill = fakes.docker.kill_container
+    attempts = {"n": 0}
+
+    async def flaky_kill(container_id, signal="SIGKILL"):
+        if signal == "HUP":
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError("squid is mid-restart")
+        await real_kill(container_id, signal)
+
+    fakes.docker.kill_container = flaky_kill
+
+    with capture_logs() as logs:
+        await attend_run(driver_deps, run_id)
+
+    assert attempts["n"] >= 2
+    assert (PROXY, "HUP") in fakes.docker.kill_signals  # the retry landed
+    assert not any(e.get("log_level") == "error" for e in logs)
 
 
 # --- placement ---------------------------------------------------------------
@@ -262,12 +322,15 @@ async def test_teardown_clears_the_allowlist_and_gives_the_slot_back(deps_fixtur
 
 async def test_the_sweep_tears_a_dead_runs_slot_down_the_same_way(deps_fixture, tmp_path):
     """Crash recovery is the *normal* path, so the sweep owes the identical
-    sequence: clear, reload, detach both services, remove the network."""
+    sequence: kill the run's container, clear, reload, detach both services,
+    remove the network — in that order, with a real container in the listing so
+    the reap's own SIGKILL is exercised alongside squid's HUP."""
     driver_deps, run_id, fakes = deps_fixture
     allow_dir = enable(fakes, tmp_path)
 
     write_allowlist(allow_dir, 2, ["example.com"])
-    await set_running_with_container(fakes, run_id, fakes.docker.container_id)
+    container_id = seed_labelled_container(fakes, run_id)
+    await set_running_with_container(fakes, run_id, container_id)
     fakes.docker.network_body = {"IPAM": {"Config": [{"Subnet": "10.90.2.0/24"}]}}
 
     ok = await reap_run_containers(sweep_deps_of(driver_deps, fakes), run_id, None)
@@ -276,22 +339,38 @@ async def test_the_sweep_tears_a_dead_runs_slot_down_the_same_way(deps_fixture, 
     assert allowlist_text(allow_dir, 2) == ""
     assert (network_of(run_id), PROXY, True) in fakes.docker.disconnected
     assert (network_of(run_id), DNS_GUARD, True) in fakes.docker.disconnected
+    # Two distinct signals to two distinct targets: the runner is SIGKILLed,
+    # squid is HUPped. The HUP must never reach the runner, nor SIGKILL squid.
+    assert (container_id, "SIGKILL") in fakes.docker.kill_signals
     assert (PROXY, "HUP") in fakes.docker.kill_signals
+    assert (container_id, "HUP") not in fakes.docker.kill_signals
+    assert (PROXY, "SIGKILL") not in fakes.docker.kill_signals
     order = fakes.docker.calls
+    # The real sequence: the container dies first, then the slot is given back,
+    # then the network goes.
+    assert order.index(f"kill:{container_id}") < order.index(
+        f"disconnect:{network_of(run_id)}:{PROXY}"
+    )
     assert order.index(f"disconnect:{network_of(run_id)}:{PROXY}") < order.index(
         f"remove_network:{network_of(run_id)}"
     )
 
 
 async def test_the_sweep_leaves_an_egress_off_run_alone(deps_fixture):
-    """Off-mode parity for the sweep: nothing to clear, nothing to detach."""
+    """Off-mode parity for the sweep: the run's container is still reaped —
+    seeded here so the assertion below is about the *absence of egress work*
+    next to real reap work, not about a reap that did nothing at all — but
+    nothing is detached and squid is never signalled."""
     driver_deps, run_id, fakes = deps_fixture
-    await set_running_with_container(fakes, run_id, fakes.docker.container_id)
+    container_id = seed_labelled_container(fakes, run_id)
+    await set_running_with_container(fakes, run_id, container_id)
 
     await reap_run_containers(sweep_deps_of(driver_deps, fakes), run_id, None)
 
+    assert (container_id, "SIGKILL") in fakes.docker.kill_signals  # the reap ran
     assert fakes.docker.disconnected == []
-    assert fakes.docker.kill_signals == []
+    assert not any(signal == "HUP" for _c, signal in fakes.docker.kill_signals)
+    assert PROXY not in [c for c, _s in fakes.docker.kill_signals]
 
 
 # --- re-adoption -------------------------------------------------------------

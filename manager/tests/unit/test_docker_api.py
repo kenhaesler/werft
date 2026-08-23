@@ -251,7 +251,7 @@ async def test_disconnect_network_force_false_is_sent_verbatim():
     assert seen["body"] == {"Container": "container1", "Force": False}
 
 
-def test_is_pool_overlap_true_on_403():
+def test_is_pool_overlap_true_on_403_with_the_message():
     exc = DockerApiError(403, "Pool overlaps with other one on this address space")
     assert is_pool_overlap(exc) is True
 
@@ -263,6 +263,15 @@ def test_is_pool_overlap_true_on_message_case_insensitive():
 
 def test_is_pool_overlap_false_on_unrelated_error():
     exc = DockerApiError(500, "something else went wrong")
+    assert is_pool_overlap(exc) is False
+
+
+def test_is_pool_overlap_false_on_a_bare_403_without_the_message():
+    """The message is the discriminator, not the status: `docker-socket-proxy`
+    answers 403 for every endpoint its permission set denies, and a
+    permissions failure must never be read as "this slot is taken" (which
+    would walk the whole table and report a bogus capacity exhaustion)."""
+    exc = DockerApiError(403, "Forbidden: NETWORKS=0 in docker-socket-proxy")
     assert is_pool_overlap(exc) is False
 
 
