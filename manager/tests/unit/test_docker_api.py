@@ -12,6 +12,7 @@ from werft.runner.docker_api import (
     DockerApiError,
     DockerClient,
     _build_transport,
+    subnets_of,
 )
 
 
@@ -169,3 +170,55 @@ async def test_watch_die_events_skips_blank_lines():
     async with client_with(handler) as client:
         events = [event async for event in client.watch_die_events("run-1")]
     assert [e.exit_code for e in events] == [0]
+
+
+async def test_inspect_network_returns_body_on_200():
+    body = {"Id": "net123", "Name": "werft-run-abc-net", "IPAM": {"Config": []}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/networks/werft-run-abc-net")
+        return httpx.Response(200, json=body)
+
+    async with client_with(handler) as client:
+        assert await client.inspect_network("werft-run-abc-net") == body
+
+
+async def test_inspect_network_returns_none_on_404():
+    async with client_with(lambda r: httpx.Response(404, json={"message": "no such"})) as client:
+        assert await client.inspect_network("gone") is None
+
+
+async def test_inspect_network_raises_on_other_error():
+    async with client_with(lambda r: httpx.Response(500, json={"message": "boom"})) as client:
+        with pytest.raises(DockerApiError) as excinfo:
+            await client.inspect_network("bad")
+    assert excinfo.value.status_code == 500
+
+
+def test_subnets_of_extracts_subnets_from_a_realistic_inspect_body():
+    network = {
+        "Id": "net123",
+        "Name": "werft-run-abc-net",
+        "IPAM": {
+            "Driver": "default",
+            "Config": [{"Subnet": "172.24.0.0/29", "Gateway": "172.24.0.1"}],
+        },
+    }
+    assert subnets_of(network) == ["172.24.0.0/29"]
+
+
+def test_subnets_of_none_is_empty():
+    assert subnets_of(None) == []
+
+
+def test_subnets_of_null_config_is_empty():
+    assert subnets_of({"IPAM": {"Config": None}}) == []
+
+
+def test_subnets_of_skips_entries_missing_subnet_key():
+    network = {"IPAM": {"Config": [{"Gateway": "172.24.0.1"}, {"Subnet": "10.0.0.0/24"}]}}
+    assert subnets_of(network) == ["10.0.0.0/24"]
+
+
+def test_subnets_of_missing_ipam_is_empty():
+    assert subnets_of({}) == []
