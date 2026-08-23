@@ -118,9 +118,20 @@ def extract_egress_lines(
     if not matched:
         return 0
 
-    total = sum(len(line) for line in matched)
-    while total > max_out_bytes and matched:
-        total -= len(matched.pop(0))
+    # Front-truncate to the newest `max_out_bytes`. Computed as a single cut
+    # index walked from the end, then one slice: the obvious
+    # `while total > cap: matched.pop(0)` is O(n^2) (every `pop(0)` shifts the
+    # whole list), and this runs on the orchestrator's only event loop against
+    # a *shared* proxy log, so a busy rig turns it into minutes of stall.
+    kept_bytes = 0
+    cut = 0
+    for index in range(len(matched) - 1, -1, -1):
+        length = len(matched[index])
+        if kept_bytes + length > max_out_bytes:
+            cut = index + 1
+            break
+        kept_bytes += length
+    matched = matched[cut:]
 
     if not matched:
         return 0
@@ -131,7 +142,13 @@ def extract_egress_lines(
     tmp_path = dest_path + ".tmp"
     try:
         if dirname:
-            os.makedirs(dirname, exist_ok=True)
+            # 0700 like every other directory Werft creates under a run
+            # (`workspace.create_run_dirs`): the staged extract holds whatever
+            # the run's traffic revealed, and the umask default would leave it
+            # world-traversable.
+            os.makedirs(dirname, mode=0o700, exist_ok=True)
+            if os.name != "nt":
+                os.chmod(dirname, 0o700)
         with open(tmp_path, "wb") as out:
             out.write(payload)
         os.chmod(tmp_path, 0o644)

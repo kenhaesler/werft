@@ -222,3 +222,20 @@ def test_subnets_of_skips_entries_missing_subnet_key():
 
 def test_subnets_of_missing_ipam_is_empty():
     assert subnets_of({}) == []
+
+
+def test_subnets_of_non_dict_config_entry_is_skipped_not_raised():
+    """A malformed IPAM entry reaches `subnets_of` from a never-raises teardown
+    path (driver `_capture_network_subnets`, sweeps' reap). `config["Subnet"]`
+    on a non-dict would raise `TypeError` and skip the rest of the teardown —
+    `remove_secrets` included."""
+    assert subnets_of({"IPAM": {"Config": [42]}}) == []
+    assert subnets_of({"IPAM": {"Config": [42, {"Subnet": "10.0.0.0/24"}]}}) == ["10.0.0.0/24"]
+
+
+def test_subnets_of_non_list_config_is_empty():
+    assert subnets_of({"IPAM": {"Config": {"Subnet": "10.0.0.0/24"}}}) == []
+
+
+def test_subnets_of_non_dict_ipam_is_empty():
+    assert subnets_of({"IPAM": []}) == []

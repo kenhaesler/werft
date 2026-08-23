@@ -38,13 +38,21 @@ def _as_tuple(version: str) -> tuple[int, ...]:
 def subnets_of(network: dict[str, Any] | None) -> list[str]:
     """Extract the IPAM subnets from a `network inspect` body.
 
-    Tolerates every degenerate shape (None network, missing IPAM/Config,
-    a null Config, or a Config entry without a Subnet key) by returning [].
+    Tolerates every degenerate shape (None network, missing IPAM/Config, a
+    null Config, a non-dict Config entry, or a Config entry without a Subnet
+    key) by returning []. The callers sit on never-raises teardown paths, so
+    "malformed body" must degrade to "no subnets", never to a `TypeError` that
+    skips the rest of the teardown.
     """
-    if not network:
+    if not isinstance(network, dict):
         return []
-    configs = (network.get("IPAM") or {}).get("Config") or []
-    return [config["Subnet"] for config in configs if "Subnet" in config]
+    ipam = network.get("IPAM")
+    configs = (ipam if isinstance(ipam, dict) else {}).get("Config")
+    if not isinstance(configs, list):
+        return []
+    return [
+        config["Subnet"] for config in configs if isinstance(config, dict) and "Subnet" in config
+    ]
 
 
 class DockerApiError(Exception):

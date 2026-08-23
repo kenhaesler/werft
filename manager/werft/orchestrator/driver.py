@@ -821,13 +821,17 @@ class _Driver:
         it. `[]` on any error — including a daemon outage — because the network
         may legitimately already be gone (a re-drive that never adopted a
         network, or a sweep path racing an operator cancel); that is routine,
-        never worth more than debug."""
+        never worth more than debug.
+
+        `subnets_of` is inside the `try` on purpose: a malformed IPAM body
+        must degrade to `[]` like a daemon outage does, never raise out of a
+        teardown chain that still has `remove_secrets` left to run."""
         try:
             network = await self._deps.docker.inspect_network(self._placement.network_name)
+            return subnets_of(network)
         except Exception as exc:  # noqa: BLE001 - the network may already be gone
             logger.debug("driver.inspect_network_failed", run_id=str(self._run_id), error=str(exc))
             return []
-        return subnets_of(network)
 
     # -- helpers --------------------------------------------------------------
 

@@ -518,3 +518,29 @@ async def test_symlinked_source_root_never_reaches_the_served_store(
             with open(os.path.join(dirpath, name), "rb") as handle:
                 assert b"ghp_supersecret" not in handle.read()
 
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes are not real on Windows")
+async def test_store_directories_are_created_0700(tmp_path, migrated_db, db_session, factory):
+    project = await seed_project(db_session)
+    run_id = await seed_run(db_session, project)
+
+    run_dir = tmp_path / "run"
+    outputs_dir = run_dir / "outputs"
+    outputs_dir.mkdir(parents=True)
+    (outputs_dir / "log.jsonl").write_bytes(b"ab")
+
+    store = tmp_path / "store"
+    report = await collect_run_evidence(
+        factory,
+        run_id=run_id,
+        placement=make_placement(run_id, run_dir),
+        artifacts_root=str(store),
+        subnets=[],
+        squid_access_log="",
+        dns_guard_query_log="",
+    )
+
+    assert report is not None
+    run_store = store / str(run_id)
+    assert run_store.stat().st_mode & 0o777 == 0o700
+    assert (run_store / "artifacts").stat().st_mode & 0o777 == 0o700

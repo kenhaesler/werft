@@ -12,6 +12,7 @@ error, anything) must never raise — it is logged and swallowed, returning
 `None`.
 """
 
+import asyncio
 import os
 from typing import Any
 from uuid import UUID
@@ -23,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from werft.db.models import Artifact, RunEvent
 from werft.runner import collect as _collect
-from werft.runner.collect import CollectionReport, TreeSource, collect_trees
+from werft.runner.collect import DIR_MODE, CollectionReport, TreeSource, collect_trees
 from werft.runner.create_body import RunPlacement
 from werft.runner.egress import extract_egress_lines
 
@@ -80,6 +81,44 @@ def _build_existing(dest_root: str) -> dict[str, int]:
     return existing
 
 
+def _collect_on_disk(
+    *,
+    run_id: UUID,
+    run_dir: str,
+    artifacts_root: str,
+    subnets: list[str],
+    squid_access_log: str,
+    dns_guard_query_log: str,
+) -> CollectionReport:
+    """Every filesystem step of a collection pass, in one synchronous call.
+
+    Extracted so `collect_run_evidence` can hand the whole thing to
+    `asyncio.to_thread`: staging egress reads up to a 32 MiB tail of a shared
+    proxy log, `_build_existing` walks the store, and `collect_trees` copies up
+    to 100 MiB — hundreds of milliseconds of blocking syscalls that used to run
+    on the orchestrator's *only* event loop, stalling every other run's
+    heartbeat and lease renewal behind one teardown.
+    """
+    _stage_egress(run_dir, subnets, squid_access_log, dns_guard_query_log)
+
+    run_store = os.path.join(artifacts_root, str(run_id))
+    os.makedirs(run_store, mode=DIR_MODE, exist_ok=True)
+    if os.name != "nt":  # POSIX-only, like `workspace._harden`
+        os.chmod(run_store, DIR_MODE)
+    dest = os.path.join(run_store, "artifacts")
+
+    existing = _build_existing(dest)
+
+    sources = [TreeSource(os.path.join(run_dir, src), prefix) for src, prefix in EVIDENCE_SOURCES]
+    return collect_trees(
+        sources,
+        dest,
+        max_total_bytes=MAX_TOTAL_BYTES,
+        max_file_bytes=MAX_FILE_BYTES,
+        existing=existing,
+    )
+
+
 def _event_payload(report: CollectionReport) -> dict[str, Any]:
     dropped = [
         {"path": d.rel_path, "reason": d.reason, "bytes": d.size_bytes} for d in report.dropped
@@ -130,23 +169,19 @@ async def collect_run_evidence(
 
     Returns the `CollectionReport`, or `None` only when the whole pass was
     swallowed by the D11 wrapper (never raises).
+
+    The filesystem half runs in a worker thread (`_collect_on_disk`); only the
+    DB transaction stays on the loop.
     """
     try:
-        _stage_egress(placement.run_dir, subnets, squid_access_log, dns_guard_query_log)
-
-        dest = os.path.join(artifacts_root, str(run_id), "artifacts")
-        existing = _build_existing(dest)
-
-        sources = [
-            TreeSource(os.path.join(placement.run_dir, src), prefix)
-            for src, prefix in EVIDENCE_SOURCES
-        ]
-        report = collect_trees(
-            sources,
-            dest,
-            max_total_bytes=MAX_TOTAL_BYTES,
-            max_file_bytes=MAX_FILE_BYTES,
-            existing=existing,
+        report = await asyncio.to_thread(
+            _collect_on_disk,
+            run_id=run_id,
+            run_dir=placement.run_dir,
+            artifacts_root=artifacts_root,
+            subnets=subnets,
+            squid_access_log=squid_access_log,
+            dns_guard_query_log=dns_guard_query_log,
         )
 
         async with session_factory() as session, session.begin():

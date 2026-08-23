@@ -140,13 +140,17 @@ async def _capture_network_subnets(deps: SweepDeps, run_id: UUID, network_name: 
     caller removes it. `[]` on any error — including a daemon outage —
     because the network may legitimately already be gone (a run whose driver
     never got far enough to create one, or a second sweep tick racing the
-    first's cleanup); that is routine, never worth more than debug."""
+    first's cleanup); that is routine, never worth more than debug.
+
+    `subnets_of` is inside the `try` on purpose: a malformed IPAM body must
+    degrade to `[]` like a daemon outage does, never raise out of a reap that
+    still has the network removal and `remove_secrets` left to run."""
     try:
         network = await deps.docker.inspect_network(network_name)
+        return subnets_of(network)
     except Exception as exc:  # noqa: BLE001 - the network may already be gone
         logger.debug("sweep.inspect_network_failed", run_id=str(run_id), error=str(exc))
         return []
-    return subnets_of(network)
 
 
 async def reap_run_containers(deps: SweepDeps, run_id: UUID, container_id: str | None) -> bool:
