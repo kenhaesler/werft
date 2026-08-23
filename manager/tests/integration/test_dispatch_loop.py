@@ -24,7 +24,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from tests.fakes import FakeDocker
-from tests.integration.test_loop import FakeRepoOps
+from tests.integration.test_loop import FakeRepoOps, SpyAlertSink
 from werft.config.dispatch import DispatchConfigCache
 from werft.config.settings import Settings
 from werft.db.models import Run, RunEvent
@@ -33,7 +33,7 @@ from werft.orchestrator import loop as loop_module
 from werft.orchestrator.loop import DispatchServices, Orchestrator
 from werft.quota.ledger import LedgerQuota
 
-__all__ = ["FakeDocker", "FakeRepoOps"]
+__all__ = ["FakeDocker", "FakeRepoOps", "SpyAlertSink"]
 
 #: The per-claim reservation every fixture project asks for, so a ceiling of
 #: `slots * RESERVATION` admits exactly `slots` claims.
@@ -111,6 +111,7 @@ async def loop_fixture(migrated_db, db_session, tmp_path, monkeypatch):
         max_claims_per_tick: int = 4,
         drain_seconds: float = 0.2,
         dispatch: bool = True,
+        alerts=None,
     ):
         if not built:  # only the first build in a test; a second adds to it
             await clean_slate()
@@ -167,7 +168,7 @@ async def loop_fixture(migrated_db, db_session, tmp_path, monkeypatch):
             factory,
             lambda project: FakeRepoOps(),
             lambda project: FakeRepoOps(),
-            alerts=NullAlertSink(),
+            alerts=alerts or NullAlertSink(),
             quota=quota,
             settings=settings,
             dispatch=services,
@@ -561,3 +562,41 @@ async def test_the_dispatch_config_is_re_read_once_per_sweep(loop_fixture):
     _write_dispatch_file(seeded.config_file, seeded.slug, NEW_DIGEST)
     await orchestrator.tick_once()
     assert (await fetch(seeded, fakes.driver.attended[0])).runner_image_digest == NEW_DIGEST
+
+
+# --- disk threshold: dispatch-gate half (T8, plan decision D9) --------------------
+#
+# The alert's rising-edge/re-arm bookkeeping is pinned in
+# `test_loop.py`'s plain (dispatch-less) construction; these two need a real
+# `DispatchServices` — a claimable `queued` row plus concurrency headroom —
+# to prove the gate actually withholds (and later releases) a claim rather
+# than merely firing the alert.
+
+
+async def test_disk_over_threshold_blocks_dispatch_and_fires_alert_once(loop_fixture, monkeypatch):
+    monkeypatch.setattr(loop_module, "_disk_percent_used", lambda path: 95.0)
+    alerts = SpyAlertSink()
+    orchestrator, seeded, fakes = await loop_fixture(
+        queued=1, ceiling_slots=10, max_concurrent=10, alerts=alerts
+    )
+
+    await orchestrator.tick_once()
+
+    assert alerts.disk_threshold_calls == [95.0]
+    assert await count_status(seeded, "queued") == 1
+    assert await count_status(seeded, "claimed") + await count_status(seeded, "running") == 0
+    assert fakes.dispatch.calls == 0  # claim_next never even reached
+
+
+async def test_disk_probe_failure_fails_open_and_dispatch_proceeds(loop_fixture, monkeypatch):
+    monkeypatch.setattr(loop_module, "_disk_percent_used", lambda path: None)
+    alerts = SpyAlertSink()
+    orchestrator, seeded, fakes = await loop_fixture(
+        queued=1, ceiling_slots=10, max_concurrent=10, alerts=alerts
+    )
+
+    await orchestrator.tick_once()
+
+    assert alerts.disk_threshold_calls == []
+    assert await count_status(seeded, "claimed") + await count_status(seeded, "running") == 1
+    assert await count_status(seeded, "queued") == 0

@@ -1029,3 +1029,49 @@ async def test_run_executes_loops_and_stops_promptly_after_the_stop_event(
     await asyncio.sleep(0.05)
     stop.set()
     await asyncio.wait_for(task, timeout=5)
+
+
+# -- disk threshold: edge-triggered alert (T8, plan decision D9) -----------------
+#
+# The dispatch-blocking half of the gate — that `_sweep_dispatch` actually
+# claims nothing over threshold, and that it proceeds again once the probe
+# recovers — needs a real `DispatchServices` (queued row + capacity), which
+# lives in `test_dispatch_loop.py`'s `loop_fixture`; see
+# `test_disk_over_threshold_blocks_dispatch_and_fires_alert_once` and
+# `test_disk_probe_failure_fails_open_and_dispatch_proceeds` there. These
+# cases only pin the alert's rising-edge/re-arm bookkeeping, using
+# `make_orchestrator`'s plain (dispatch-less) construction.
+
+
+async def test_disk_alert_does_not_refire_on_a_second_over_threshold_tick(
+    orchestrator_session_factory, monkeypatch
+) -> None:
+    monkeypatch.setattr(loop_module, "_disk_percent_used", lambda path: 95.0)
+    alerts = SpyAlertSink()
+    orchestrator = make_orchestrator(
+        orchestrator_session_factory, ops_for=lambda p: FakeRepoOps(), alerts=alerts
+    )
+
+    await orchestrator.tick_once()
+    await orchestrator.tick_once()
+
+    assert alerts.disk_threshold_calls == [95.0]
+
+
+async def test_disk_alert_rearms_after_dropping_below_threshold(
+    orchestrator_session_factory, monkeypatch
+) -> None:
+    percent = {"value": 95.0}
+    monkeypatch.setattr(loop_module, "_disk_percent_used", lambda path: percent["value"])
+    alerts = SpyAlertSink()
+    orchestrator = make_orchestrator(
+        orchestrator_session_factory, ops_for=lambda p: FakeRepoOps(), alerts=alerts
+    )
+
+    await orchestrator.tick_once()  # over: fires
+    percent["value"] = 50.0
+    await orchestrator.tick_once()  # under: re-arms, no fire
+    percent["value"] = 95.0
+    await orchestrator.tick_once()  # over again: fires
+
+    assert alerts.disk_threshold_calls == [95.0, 95.0]
