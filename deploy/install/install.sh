@@ -68,11 +68,16 @@ install_docker() {
     command -v dnf >/dev/null 2>&1 || { echo "install.sh: dnf not found (Rocky Linux 10 required)" >&2; exit 1; }
     dnf -y install dnf-plugins-core
     dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
-    dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin container-selinux
+    # python3 is required later by write_daemon_json's JSON merge and by
+    # ensure_dns_allow_conf's call into gen-dns-allow.sh — a minimal Rocky 10
+    # install does not guarantee it, so pull it in alongside Docker CE here.
+    dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin container-selinux python3
     systemctl enable --now docker
 }
 
 write_daemon_json() {
+    command -v python3 >/dev/null 2>&1 \
+        || { echo "install.sh: python3 not found — cannot merge /etc/docker/daemon.json" >&2; exit 1; }
     local daemon_json="/etc/docker/daemon.json"
     mkdir -p /etc/docker
     python3 - "$daemon_json" <<'PYEOF'
@@ -125,14 +130,21 @@ seed_egress_allow() {
     } > "${allow_dir}/manager.txt"
     chmod 0644 "${allow_dir}/manager.txt"
 
+    # slotN.txt are only-if-absent: they're rewritten live by the manager
+    # (per-run egress allowlists) and HUP'd into squid. A maintenance re-run
+    # of install.sh must never truncate a currently-running slot's allowlist
+    # out from under a live run — manager.txt above stays rewrite-on-run
+    # because it's operator-owned config (e.g. --ntfy-host can change).
     local i
     for i in 0 1 2 3; do
-        : > "${allow_dir}/slot${i}.txt"
+        [ -f "${allow_dir}/slot${i}.txt" ] || : > "${allow_dir}/slot${i}.txt"
         chmod 0644 "${allow_dir}/slot${i}.txt"
     done
 }
 
 ensure_dns_allow_conf() {
+    command -v python3 >/dev/null 2>&1 \
+        || { echo "install.sh: python3 not found — cannot generate dns-allow.conf" >&2; exit 1; }
     local gen="${SCRIPT_DIR}/../dns-guard/gen-dns-allow.sh"
     local out="/opt/werft/config/dns-allow.conf"
     local dispatch="/opt/werft/config/dispatch.json"

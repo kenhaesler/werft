@@ -44,8 +44,11 @@ assert_docker_version() {
 
 assert_containerd_version() {
     local v
-    v=$(containerd --version 2>/dev/null | awk '{print $3}' | tr -d v) \
-        || return $(_fail containerd "containerd not found")
+    # command -v gate first: the pipeline below always exits 0 (its status is
+    # `tr`'s), so a missing containerd would otherwise fall through to
+    # `_vergte "" ...` and print a misleading `"" < floor` message.
+    command -v containerd >/dev/null 2>&1 || return $(_fail containerd "containerd not found")
+    v=$(containerd --version 2>/dev/null | awk '{print $3}' | tr -d v)
     _vergte "$v" "$CONTAINERD_FLOOR" || _fail containerd "$v < floor $CONTAINERD_FLOOR"
 }
 
