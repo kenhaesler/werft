@@ -19,6 +19,7 @@ one conversion point.
 """
 
 import json
+import re
 from pathlib import Path
 
 import structlog
@@ -29,6 +30,20 @@ from werft.domain.errors import PermanentError
 logger = structlog.get_logger(__name__)
 
 SETTING_NAME = "WERFT_DISPATCH_CONFIG_FILE"
+
+#: SPEC §4.5's own examples, closed vocabulary. PyPI needs both hosts; the dnf
+#: set is the Rocky mirror pair the base image already uses.
+REGISTRY_PRESETS: dict[str, tuple[str, ...]] = {
+    "npm": ("registry.npmjs.org",),
+    "pypi": ("pypi.org", "files.pythonhosted.org"),
+    "dnf-rocky": ("mirrors.rockylinux.org", "dl.rockylinux.org"),
+    "crates": ("crates.io", "static.crates.io", "index.crates.io"),
+    "go": ("proxy.golang.org", "sum.golang.org"),
+}
+
+_HOSTNAME = re.compile(
+    r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+)
 
 
 class ProjectDispatch(BaseModel):
@@ -45,6 +60,11 @@ class ProjectDispatch(BaseModel):
     timeout_seconds: int = Field(default=5400, gt=0, le=90 * 60)
     memory_bytes: int = Field(default=4 << 30, ge=2 << 30, le=32 << 30)
     nano_cpus: int = Field(default=2_000_000_000, ge=1_000_000_000, le=8_000_000_000)
+    #: SPEC §4.5: the project's declared registry set, by preset name — werft
+    #: config, never repo config. Expanded by `egress_hosts()`.
+    registries: list[str] = Field(default_factory=list)
+    #: SPEC §4.5: "the project's declared extra hosts" — literal hostnames.
+    extra_hosts: list[str] = Field(default_factory=list)
 
     @field_validator("image_digest")
     @classmethod
@@ -54,6 +74,33 @@ class ProjectDispatch(BaseModel):
                 f"image {value!r} must be digest-pinned with @sha256: (SPEC §4.1); got a tag"
             )
         return value
+
+    @field_validator("registries")
+    @classmethod
+    def _known_presets(cls, value: list[str]) -> list[str]:
+        unknown = [r for r in value if r not in REGISTRY_PRESETS]
+        if unknown:
+            raise ValueError(
+                f"unknown registry preset(s) {unknown!r}; known: {sorted(REGISTRY_PRESETS)}"
+            )
+        return value
+
+    @field_validator("extra_hosts")
+    @classmethod
+    def _hostname_shaped(cls, value: list[str]) -> list[str]:
+        for host in value:
+            if not _HOSTNAME.match(host.lower()):
+                raise ValueError(f"extra host {host!r} is not a bare hostname")
+        return value
+
+    def egress_hosts(self) -> list[str]:
+        """SPEC §4.5: presets expanded, extra hosts merged, sorted and deduped
+        so the driver (a later task) gets a stable, comparable host list."""
+        hosts: set[str] = set()
+        for preset in self.registries:
+            hosts.update(REGISTRY_PRESETS[preset])
+        hosts.update(h.lower() for h in self.extra_hosts)
+        return sorted(hosts)
 
 
 class DispatchConfig(BaseModel):

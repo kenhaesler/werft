@@ -1,11 +1,13 @@
 import json
 
 import pytest
+from pydantic import ValidationError
 from structlog.testing import capture_logs
 
 from werft.config.dispatch import (
     DispatchConfig,
     DispatchConfigCache,
+    ProjectDispatch,
     dispatch_for,
     load_dispatch_config,
 )
@@ -125,3 +127,36 @@ def test_a_malformed_file_mid_flight_keeps_the_last_good_config(tmp_path):
     (tmp_path / "dispatch.json").write_text("{ broken", encoding="utf-8")
 
     assert cache.current() == good
+
+
+def test_registries_expand_presets_and_merge_extra_hosts():
+    p = ProjectDispatch(
+        image_digest="img@sha256:" + "a" * 64,
+        model="m",
+        registries=["npm", "pypi"],
+        extra_hosts=["example.internal.works"],
+    )
+    hosts = p.egress_hosts()
+    assert "registry.npmjs.org" in hosts
+    assert "pypi.org" in hosts and "files.pythonhosted.org" in hosts
+    assert "example.internal.works" in hosts
+    assert hosts == sorted(set(hosts))
+
+
+def test_unknown_registry_preset_refused_at_validation():
+    with pytest.raises(ValidationError):
+        ProjectDispatch(
+            image_digest="img@sha256:" + "a" * 64, model="m", registries=["maven-central-typo"]
+        )
+
+
+def test_extra_host_shape_refused():
+    # hostnames only: no scheme, no slash, no port, no wildcard
+    for bad in ["https://x.y", "x.y/path", "x.y:443", "*.y.z", ""]:
+        with pytest.raises(ValidationError):
+            ProjectDispatch(image_digest="img@sha256:" + "a" * 64, model="m", extra_hosts=[bad])
+
+
+def test_default_registries_empty_and_hosts_still_sorted():
+    p = ProjectDispatch(image_digest="img@sha256:" + "a" * 64, model="m")
+    assert p.egress_hosts() == []
