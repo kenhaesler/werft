@@ -347,6 +347,10 @@ async def test_egress_staged_and_collected(tmp_path, migrated_db, db_session, fa
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlinks/FIFOs are POSIX-only")
 async def test_hostile_tree_zero_nonregular_bytes(tmp_path, migrated_db, db_session, factory):
+    """Non-regular entries *inside* a source tree. The other half of the same
+    threat — the source *root* itself being a link — is
+    `test_symlinked_source_root_never_reaches_the_served_store` below.
+    """
     project = await seed_project(db_session)
     run_id = await seed_run(db_session, project)
 
@@ -455,3 +459,62 @@ def test_event_payload_elides_dropped_past_100():
     assert len(payload["dropped"]) == 100
     assert payload["dropped_elided"] == 1
     assert payload["dropped"][0] == {"path": "outputs/f0.bin", "reason": "total_cap", "bytes": 1}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks are POSIX-only")
+async def test_symlinked_source_root_never_reaches_the_served_store(
+    tmp_path, migrated_db, db_session, factory
+):
+    """The end-to-end shape of the escape: the agent owns `workspace/`, so it
+    can replace `.werft-artifacts` with a link at the manager's *own* secrets
+    directory. Collection runs before `remove_secrets` (and on the sweep path
+    revoke may never have happened at all), and the store is served over HTTP —
+    so a followed root is a credential leak, not a tidiness bug.
+    """
+    project = await seed_project(db_session)
+    run_id = await seed_run(db_session, project)
+
+    run_dir = tmp_path / "run"
+    placement = make_placement(run_id, run_dir)
+
+    secrets_dir = run_dir / "secrets"
+    secrets_dir.mkdir(parents=True)
+    (secrets_dir / "git_token").write_bytes(b"ghp_supersecret_do_not_collect")
+
+    workspace = run_dir / "workspace"
+    workspace.mkdir(parents=True)
+    os.symlink(str(secrets_dir), str(workspace / ".werft-artifacts"))
+
+    outputs_dir = run_dir / "outputs"
+    outputs_dir.mkdir(parents=True)
+    (outputs_dir / "log.jsonl").write_bytes(b"ab")
+
+    store = tmp_path / "store"
+
+    report = await collect_run_evidence(
+        factory,
+        run_id=run_id,
+        placement=placement,
+        artifacts_root=str(store),
+        subnets=[],
+        squid_access_log="",
+        dns_guard_query_log="",
+    )
+
+    assert report is not None
+    assert {c.rel_path for c in report.artifacts} == {"outputs/log.jsonl"}
+    assert ("werft-artifacts", "not_regular") in [(d.rel_path, d.reason) for d in report.dropped]
+
+    rows = (
+        (await db_session.execute(select(Artifact).where(Artifact.run_id == run_id)))
+        .scalars()
+        .all()
+    )
+    assert {r.path for r in rows} == {"outputs/log.jsonl"}
+
+    # Not one token byte anywhere under the HTTP-served store.
+    for dirpath, _dirnames, filenames in os.walk(store):
+        for name in filenames:
+            with open(os.path.join(dirpath, name), "rb") as handle:
+                assert b"ghp_supersecret" not in handle.read()
+

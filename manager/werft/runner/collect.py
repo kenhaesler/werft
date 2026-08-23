@@ -27,6 +27,20 @@ from dataclasses import dataclass, field
 MAX_TOTAL_BYTES = 100 * 1024 * 1024
 MAX_FILE_BYTES = 25 * 1024 * 1024
 
+#: Every directory Werft creates under `artifacts_root` is as private as
+#: `workspace.create_run_dirs` makes the run dir — collected evidence is
+#: served only through the authenticated API, never off the filesystem.
+DIR_MODE = 0o700
+
+
+def _harden_dir(path: str) -> None:
+    """Mirror `workspace._harden`. POSIX-only: Windows ignores these bits and
+    the dev box is not the deployment target. `makedirs(mode=...)` alone is not
+    enough — it is masked by the umask and skipped for intermediate levels."""
+    if os.name == "nt":
+        return
+    os.chmod(path, DIR_MODE)
+
 
 @dataclass(frozen=True)
 class CollectedArtifact:
@@ -143,7 +157,7 @@ def _copy_candidates(
             continue
 
         target = os.path.join(dest_dir, candidate.rel_path)
-        os.makedirs(os.path.dirname(target), exist_ok=True)
+        os.makedirs(os.path.dirname(target), mode=DIR_MODE, exist_ok=True)
         try:
             fd = os.open(candidate.full_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         except OSError:
@@ -172,10 +186,19 @@ def collect_outputs(
     max_total_bytes: int = MAX_TOTAL_BYTES,
     max_file_bytes: int = MAX_FILE_BYTES,
 ) -> CollectionReport:
-    """Copy regular files from an agent-writable tree into Werft-owned storage."""
+    """Copy regular files from an agent-writable tree into Werft-owned storage.
+
+    `src_dir` is resolved with `realpath` here, which is only safe because this
+    entry point's root is **manager-created** (`lifecycle.py` makes the run's
+    `outputs/` before the container ever starts) and therefore cannot itself be
+    a link the agent planted. `collect_trees` — whose roots are agent-created
+    directories inside the rw workspace — deliberately does *not* resolve, and
+    lstat-checks each root instead.
+    """
     report = CollectionReport()
     src_root = os.path.realpath(src_dir)
-    os.makedirs(dest_dir, exist_ok=True)
+    os.makedirs(dest_dir, mode=DIR_MODE, exist_ok=True)
+    _harden_dir(dest_dir)
 
     candidates = _scan(src_root, report, max_file_bytes)
 
@@ -200,9 +223,16 @@ def collect_trees(
     Each source's files land under `f"{dest_prefix}/{rel}"` (forward slashes,
     always — this keeps `Artifact.path` portable between a Windows dev box and
     the Linux rig, and matches the serving route's `{artifact_path:path}`
-    semantics). A missing `src_dir` is silent: `_scan`'s `os.walk` yields
-    nothing for a path that does not exist, so there is nothing to prefix or
-    drop.
+    semantics). A missing `src_dir` is silent: an `OSError` from the root's
+    `lstat` is skipped, so there is nothing to prefix or drop.
+
+    **The source roots are never resolved.** Three of them are agent-created
+    directories inside the rw workspace, so `ln -s ../secrets .werft-artifacts`
+    (or an absolute link to any host path) would redirect the whole walk into
+    the manager's own secrets — and collection runs *before* `remove_secrets`,
+    with the sweep path having possibly never revoked at all. Each root is
+    therefore `lstat`ed (which does not resolve the final component) and
+    dropped as `not_regular` unless it is a real directory.
 
     All candidates from all sources are pooled and sorted once
     (`key=(size_bytes, rel_path)`) before the single copy pass, so the largest
@@ -210,11 +240,22 @@ def collect_trees(
     gets evicted first when the shared budget runs out.
     """
     report = CollectionReport()
-    os.makedirs(dest_dir, exist_ok=True)
+    os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+    _harden_dir(dest_dir)
 
     all_candidates: list[_Candidate] = []
     for source in sources:
-        src_root = os.path.realpath(source.src_dir)
+        src_root = source.src_dir  # never resolved: see the docstring
+        try:
+            root_info = os.lstat(src_root)
+        except OSError:
+            continue  # a missing source stays a silent no-op
+        if not stat.S_ISDIR(root_info.st_mode):
+            # lstat does not resolve, so a symlinked root fails this check even
+            # when it points at a directory: the walk never starts.
+            report.dropped.append(DroppedEntry(source.dest_prefix, "not_regular"))
+            continue
+
         dropped_before = len(report.dropped)
         candidates = _scan(src_root, report, max_file_bytes)
 

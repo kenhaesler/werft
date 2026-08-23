@@ -257,3 +257,70 @@ def test_collect_trees_dropped_entries_are_prefixed_too(tmp_path):
     assert report.artifacts == []
     assert [d.rel_path for d in report.dropped] == ["outputs/huge.bin"]
     assert [d.reason for d in report.dropped] == ["too_large"]
+
+
+def test_collect_trees_symlinked_source_root_is_dropped_not_followed(tmp_path):
+    """Three of `EVIDENCE_SOURCES`' roots are *agent-created* directories inside
+    the rw workspace, so `ln -s ../secrets .werft-artifacts` would redirect the
+    whole walk into the manager's own secrets — collected before
+    `remove_secrets` runs, into an HTTP-served store. The root is `lstat`ed
+    (never resolved), so a link is a bounded no-op that leaves a drop behind.
+    """
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    (secrets / "git_token.txt").write_bytes(b"ghp_supersecret")
+
+    root = tmp_path / "workspace" / ".werft-artifacts"
+    root.parent.mkdir(parents=True)
+    symlink_or_skip(root, secrets, directory=True)
+
+    dest = tmp_path / "dest"
+    report = collect_trees([TreeSource(str(root), "werft-artifacts")], str(dest))
+
+    assert report.artifacts == []
+    assert report.bytes_total == 0
+    assert [(d.rel_path, d.reason) for d in report.dropped] == [("werft-artifacts", "not_regular")]
+    assert not any(dest.rglob("*"))
+
+
+def test_collect_trees_source_root_that_is_a_regular_file_is_dropped(tmp_path):
+    root = tmp_path / "outputs"
+    root.write_bytes(b"not a directory")
+    dest = tmp_path / "dest"
+
+    report = collect_trees([TreeSource(str(root), "outputs")], str(dest))
+
+    assert report.artifacts == []
+    assert [(d.rel_path, d.reason) for d in report.dropped] == [("outputs", "not_regular")]
+
+
+def test_collect_trees_a_dropped_root_does_not_stop_its_siblings(tmp_path):
+    good = tmp_path / "outputs"
+    good.mkdir()
+    (good / "log.jsonl").write_bytes(b"ab")
+    bad = tmp_path / "test-results"
+    bad.write_bytes(b"x")
+
+    report = collect_trees(
+        [TreeSource(str(bad), "test-results"), TreeSource(str(good), "outputs")],
+        str(tmp_path / "dest"),
+    )
+
+    assert [c.rel_path for c in report.artifacts] == ["outputs/log.jsonl"]
+    assert [(d.rel_path, d.reason) for d in report.dropped] == [("test-results", "not_regular")]
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="POSIX modes are not real on Windows (only the read-only bit)"
+)
+def test_collect_trees_creates_the_destination_0700(tmp_path):
+    src = tmp_path / "a"
+    src.mkdir()
+    (src / "nested").mkdir()
+    (src / "nested" / "x.txt").write_bytes(b"x")
+    dest = tmp_path / "dest"
+
+    collect_trees([TreeSource(str(src), "outputs")], str(dest))
+
+    assert dest.stat().st_mode & 0o777 == 0o700
+    assert (dest / "outputs").stat().st_mode & 0o077 == 0
