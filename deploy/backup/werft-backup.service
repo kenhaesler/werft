@@ -1,0 +1,8 @@
+[Unit]
+Description=Werft nightly backup (pg_dump + restic)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/werft/compose/backup/werft-backup.sh
