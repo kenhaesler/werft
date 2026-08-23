@@ -6,7 +6,9 @@
 # manager container is broken or the whole stack is down: only postgres needs
 # to be up for the dump half, and restic still pushes whatever dumps already
 # exist on disk even if pg_isready never succeeds this run.
-set -euo pipefail
+# -E: without it bash does not inherit the ERR trap into functions/subshells, so
+# a failure inside one would notify nothing.
+set -Eeuo pipefail
 COMPOSE=/opt/werft/compose/compose.yaml
 DUMPS=/opt/werft/backups/dumps
 NTFY_URL_FILE=/opt/werft/secrets/ntfy_url        # optional; alert on failure
@@ -28,6 +30,10 @@ if docker compose -f "$COMPOSE" exec -T postgres pg_isready -U werft -d werft >/
     docker compose -f "$COMPOSE" exec -T postgres \
         pg_dump -Fc -U werft werft > "$DUMPS/werft-$STAMP.dump.tmp"
     mv "$DUMPS/werft-$STAMP.dump.tmp" "$DUMPS/werft-$STAMP.dump"
+    # SC2012: `ls -t` is deliberate — newest-first by mtime is the ordering
+    # retention needs, and these filenames are ours (`werft-YYYY-MM-DD.dump`),
+    # never user-supplied, so the non-alphanumeric hazard does not apply.
+    # shellcheck disable=SC2012
     ls -1t "$DUMPS"/werft-*.dump | tail -n +15 | xargs -r rm --   # local dumps: keep 14
 else
     notify "werft-backup: postgres down; pushing previous dumps only"
@@ -40,8 +46,18 @@ fi
 # grows a symlink that resolves into /opt/werft/secrets — restic follows
 # symlink targets it's told to back up, so an explicit exclude costs nothing
 # and prevents a future refactor from silently sweeping the key offsite.
+# D9 amendment (T9 final review): a *live* run's tree carries plaintext
+# credentials — `runs/<id>/secrets/` holds the GitHub installation token and the
+# CLAUDE_CODE_OAUTH_TOKEN, and its `task.json` still carries them in `env` until
+# the teardown scrub rewrites it. The nightly timer fires at 03:30 regardless of
+# what is mid-flight, so without these excludes every live run's credentials go
+# offsite in cleartext. `task.json` is reconstructible from the row and, once
+# scrubbed, carries no evidence value the collected artifacts do not already
+# hold — so excluding it unconditionally costs nothing.
 restic backup \
     --exclude /opt/werft/secrets/github_app_key \
+    --exclude '/srv/werft/runs/*/secrets' \
+    --exclude '/srv/werft/runs/*/task.json' \
     "$DUMPS" /opt/werft/compose /opt/werft/config /srv/werft/runs
 restic forget --keep-daily 14 --keep-weekly 8 --prune
 
