@@ -22,6 +22,7 @@ and skip everywhere else, including this Windows dev box.
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -62,6 +63,28 @@ def _run(
         ["bash", "-c", f"source '{FLOORS_SH}' && {func}"],
         cwd=REPO_ROOT,
         env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+def _run_hermetic(func: str, empty_dir: Path) -> subprocess.CompletedProcess[str]:
+    """Source floors.sh and invoke `func` with PATH restricted to
+    `empty_dir` alone -- no system binaries reachable at all. Use this for
+    "command absent" cases: a PATH-prepend (as `_run` does) only shadows a
+    binary of the same name, so it silently falls through to a real system
+    binary of a DIFFERENT name that happens to already be on PATH (e.g.
+    ubuntu-24.04 runners ship containerd preinstalled). Resolve bash's own
+    absolute path first via `shutil.which` before clobbering PATH, since an
+    empty PATH would otherwise make `bash` itself unresolvable to invoke.
+    """
+    bash = shutil.which("bash")
+    assert bash is not None, "bash not found on PATH to resolve its own absolute path"
+    return subprocess.run(
+        [bash, "-c", f"source '{FLOORS_SH}' && {func}"],
+        cwd=REPO_ROOT,
+        env={"PATH": str(empty_dir)},
         capture_output=True,
         text=True,
         timeout=10,
@@ -187,8 +210,11 @@ def test_containerd_version_violated_below_floor(tmp_path: Path) -> None:
 
 def test_containerd_version_violated_absent(tmp_path: Path) -> None:
     """No containerd on PATH at all: the `command -v` gate must fire before
-    the `_vergte "" ...` fallthrough that would print a misleading message."""
-    result = _run("assert_containerd_version", tmp_path)
+    the `_vergte "" ...` fallthrough that would print a misleading message.
+    Hermetic PATH (not a same-name-shadowing prepend): ubuntu-24.04 CI
+    runners ship containerd preinstalled, so a plain PATH-prepend would
+    still resolve the real system binary and this floor would pass."""
+    result = _run_hermetic("assert_containerd_version", tmp_path)
     _assert_fail(result, "containerd")
     assert "not found" in result.stderr
 
@@ -229,8 +255,10 @@ def test_selinux_enforcing_violated_permissive(tmp_path: Path) -> None:
 
 
 def test_selinux_enforcing_violated_missing(tmp_path: Path) -> None:
-    """getenforce not installed: `2>/dev/null` output is empty, != Enforcing."""
-    _assert_fail(_run("assert_selinux_enforcing", tmp_path), "selinux")
+    """getenforce not installed: `2>/dev/null` output is empty, != Enforcing.
+    Hermetic PATH: a getenforce binary could plausibly exist on some CI
+    runner base image, so shadow-by-prepend isn't reliable here either."""
+    _assert_fail(_run_hermetic("assert_selinux_enforcing", tmp_path), "selinux")
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +392,9 @@ def test_tailscale_up_satisfied(tmp_path: Path) -> None:
 
 
 def test_tailscale_up_violated_absent(tmp_path: Path) -> None:
-    _assert_fail(_run("assert_tailscale_up", tmp_path), "tailscale")
+    """Hermetic PATH: a tailscale binary could plausibly be preinstalled on
+    some CI runner image, so shadow-by-prepend isn't reliable here either."""
+    _assert_fail(_run_hermetic("assert_tailscale_up", tmp_path), "tailscale")
 
 
 def test_tailscale_up_violated_not_up(tmp_path: Path) -> None:
