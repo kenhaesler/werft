@@ -4,6 +4,7 @@ import os
 
 import pytest
 
+from werft.runner import collect as collect_module
 from werft.runner.collect import TreeSource, collect_outputs, collect_trees
 
 
@@ -310,17 +311,56 @@ def test_collect_trees_a_dropped_root_does_not_stop_its_siblings(tmp_path):
     assert [(d.rel_path, d.reason) for d in report.dropped] == [("test-results", "not_regular")]
 
 
-@pytest.mark.skipif(
-    os.name != "posix", reason="POSIX modes are not real on Windows (only the read-only bit)"
-)
-def test_collect_trees_creates_the_destination_0700(tmp_path):
+def test_collect_trees_hardens_every_directory_level_it_creates(tmp_path, monkeypatch):
+    """The platform-independent half of the 0700 guarantee: which paths get
+    hardened. Runs on Windows too — `_harden_dir` is where the no-op lives —
+    so the level walk this pins is not a Linux-only claim.
+    """
+    hardened: list[str] = []
+    monkeypatch.setattr(collect_module, "_harden_dir", hardened.append)
+
     src = tmp_path / "a"
     src.mkdir()
-    (src / "nested").mkdir()
-    (src / "nested" / "x.txt").write_bytes(b"x")
+    (src / "nested" / "deeper").mkdir(parents=True)
+    (src / "nested" / "deeper" / "x.txt").write_bytes(b"x")
     dest = tmp_path / "dest"
 
     collect_trees([TreeSource(str(src), "outputs")], str(dest))
 
-    assert dest.stat().st_mode & 0o777 == 0o700
-    assert (dest / "outputs").stat().st_mode & 0o077 == 0
+    assert sorted({os.path.relpath(p, tmp_path).replace(os.sep, "/") for p in hardened}) == [
+        "dest",
+        "dest/outputs",
+        "dest/outputs/nested",
+        "dest/outputs/nested/deeper",
+    ]
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="POSIX modes are not real on Windows (only the read-only bit)"
+)
+def test_collect_trees_creates_the_destination_0700(tmp_path):
+    """*Every* level, not just the leaf. `os.makedirs(mode=...)` passes the mode
+    to the leaf only — CPython recurses for the intermediate levels without it,
+    so `dest/outputs` (an intermediate on the way to `dest/outputs/nested`)
+    came out 0755 while `dest/outputs/nested` was correctly 0700. One
+    world-traversable step is all it takes to reach the evidence below it.
+    """
+    src = tmp_path / "a"
+    src.mkdir()
+    (src / "nested" / "deeper").mkdir(parents=True)
+    (src / "nested" / "deeper" / "x.txt").write_bytes(b"x")
+    dest = tmp_path / "dest"
+
+    collect_trees([TreeSource(str(src), "outputs")], str(dest))
+
+    assert (dest / "outputs" / "nested" / "deeper" / "x.txt").read_bytes() == b"x"
+
+    levels = [dest, *sorted(p for p in dest.rglob("*") if p.is_dir())]
+    assert [p.relative_to(tmp_path).as_posix() for p in levels] == [
+        "dest",
+        "dest/outputs",
+        "dest/outputs/nested",
+        "dest/outputs/nested/deeper",
+    ]
+    for level in levels:
+        assert level.stat().st_mode & 0o777 == 0o700, f"{level} is not 0700"

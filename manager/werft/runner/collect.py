@@ -19,6 +19,7 @@ Two properties are deliberate and were both wrong in the first draft:
   abort collection and cost the run its entire evidence trail.
 """
 
+import contextlib
 import os
 import shutil
 import stat
@@ -36,10 +37,33 @@ DIR_MODE = 0o700
 def _harden_dir(path: str) -> None:
     """Mirror `workspace._harden`. POSIX-only: Windows ignores these bits and
     the dev box is not the deployment target. `makedirs(mode=...)` alone is not
-    enough — it is masked by the umask and skipped for intermediate levels."""
+    enough — it is masked by the umask and, crucially, CPython recurses for the
+    intermediate levels *without* passing the mode at all (only the leaf gets
+    it), so those come out `0o777 & ~umask` — 0755 on the rig."""
     if os.name == "nt":
         return
-    os.chmod(path, DIR_MODE)
+    with contextlib.suppress(OSError):
+        os.chmod(path, DIR_MODE)
+
+
+def _harden_parents(dest_dir: str, rel_path: str) -> None:
+    """Harden every directory level `rel_path` needs beneath `dest_dir`.
+
+    A single `chmod` on the deepest parent is not enough: for
+    `outputs/nested/x.txt`, `os.makedirs` creates `dest/outputs` as an
+    *intermediate* level at 0755 and only `dest/outputs/nested` at 0700 — and
+    one world-traversable step is all it takes to reach the evidence below it.
+    Walking the parts is O(depth) per file against trees that are a handful of
+    levels deep, which is far cheaper than the copy it accompanies.
+
+    The Windows no-op lives in `_harden_dir`, the one place that knows about
+    modes, so the level walk itself stays testable on the dev box.
+    """
+    parts = rel_path.replace("/", os.sep).split(os.sep)[:-1]  # drop the filename
+    current = dest_dir
+    for part in parts:
+        current = os.path.join(current, part)
+        _harden_dir(current)
 
 
 @dataclass(frozen=True)
@@ -158,6 +182,7 @@ def _copy_candidates(
 
         target = os.path.join(dest_dir, candidate.rel_path)
         os.makedirs(os.path.dirname(target), mode=DIR_MODE, exist_ok=True)
+        _harden_parents(dest_dir, candidate.rel_path)
         try:
             fd = os.open(candidate.full_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         except OSError:
