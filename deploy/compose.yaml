@@ -61,6 +61,13 @@ services:
       WERFT_CLAUDE_CREDENTIAL_FILE: /run/secrets/claude_credential
       WERFT_NTFY_URL: ${NTFY_URL}
       WERFT_NTFY_TOKEN_FILE: /run/secrets/ntfy_token
+      # SPEC §7: the operator's dispatch quota ceiling, from .env so it
+      # survives Stage 2's `rsync --delete` re-stage of this tree (a value
+      # edited into this file would be reverted on the next deploy, silently
+      # taking dispatch dark again). The `:-0` default is the safe one and is
+      # deliberate: 0 means the dispatch plane never claims a run, so an
+      # unconfigured host stays dark rather than inventing a ceiling.
+      WERFT_QUOTA_CEILING_SECONDS: ${QUOTA_CEILING_SECONDS:-0}
       WERFT_EGRESS_SLOT_COUNT: "4"
       WERFT_EGRESS_SUBNET_PREFIX: "10.90"
       WERFT_EGRESS_ALLOWLIST_DIR: /srv/werft/egress/allow

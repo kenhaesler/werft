@@ -28,6 +28,7 @@ Copy `.env.example` to `.env` next to `compose.yaml` and fill in:
 | `SOCKET_PROXY_IMAGE` | `tecnativa/docker-socket-proxy@sha256:<digest>` — digest-pinned. |
 | `GITHUB_APP_CLIENT_ID` | The GitHub App's OAuth client ID (the JWT `iss` claim). Empty means "GitHub integration not configured" — the manager still boots, API-only, orchestrator dark. |
 | `NTFY_URL` | Base URL of the ntfy instance alerts publish to (e.g. `https://ntfy.example.com`). Empty means "no alerts": `NullAlertSink` stays wired. |
+| `QUOTA_CEILING_SECONDS` | SPEC §7 dispatch quota ceiling, in seconds of agent wall-clock per window; becomes `WERFT_QUOTA_CEILING_SECONDS`. Empty/unset interpolates to `0`, at which **the dispatch plane never claims a run** — the manager boots, serves the API, and quietly never dispatches (one `app.dispatch_disabled_no_quota_ceiling` warning at boot). Set it deliberately, e.g. `18000`. |
 
 `werft-manager` and `werft-egress-proxy`/`werft-dns-guard` are built locally
 (`image: ...:local`) — they are not pulled, so they carry no digest pin in
@@ -68,13 +69,14 @@ Notable ones:
 | `WERFT_EGRESS_SUBNET_PREFIX` | `egress_subnet_prefix` | `"10.90"` — first two octets of the per-slot runner subnets (slot *K* = `10.90.K.0/24`, matching `squid.conf`'s `slotN_src` ACLs). Set explicitly even though it's also the default, for legibility next to `EGRESS_SLOT_COUNT`. |
 | `WERFT_EGRESS_ALLOWLIST_DIR` | `egress_allowlist_dir` | `/srv/werft/egress/allow` — shared by bind mount with `egress-proxy`'s `/etc/squid/allow`. |
 | `WERFT_SQUID_ACCESS_LOG` / `WERFT_DNS_GUARD_QUERY_LOG` | `squid_access_log` / `dns_guard_query_log` | SPEC §8 evidence collection paths; empty means "not deployed, collect nothing" — set here since this compose stack *does* deploy both. |
+| `WERFT_QUOTA_CEILING_SECONDS` | `quota_ceiling_seconds` | Interpolated from `.env`'s `QUOTA_CEILING_SECONDS` (`${QUOTA_CEILING_SECONDS:-0}`). SPEC §7 — `0` means dispatch stays dark, no invented ceiling. It is an `.env` key rather than a literal here for a reason: the RUNBOOK re-stages this whole tree with `rsync --delete` on every deploy, so a value edited into `compose.yaml` would be reverted (and dispatch would go dark) on the next upgrade, while `.env` is excluded from that delete. |
 
-Not set in `compose.yaml` (left at their `Settings` defaults, an operator
-concern rather than a deploy-stack one): `WERFT_QUOTA_CEILING_SECONDS` (SPEC
-§7 — `0` means dispatch stays dark, no invented ceiling), `WERFT_TICK_SECONDS`
-and the other poll cadences, `WERFT_MAX_CONCURRENT_RUNS`. Add them to the
-`manager` service's `environment:` block, or to `.env` plus a new
-interpolated key, if you need to change them from their code defaults.
+Not set in `compose.yaml` at all (left at their `Settings` defaults, an
+operator concern rather than a deploy-stack one): `WERFT_TICK_SECONDS` and
+the other poll cadences, `WERFT_MAX_CONCURRENT_RUNS`. If you need to change
+one from its code default, add it as a **new interpolated `.env` key** —
+following `QUOTA_CEILING_SECONDS`'s shape — rather than as a literal in
+`compose.yaml`, which the deploy re-stage would overwrite.
 
 ## The database password seam
 

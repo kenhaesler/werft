@@ -70,8 +70,14 @@ Cloning the repo does not do this by itself — stage it explicitly:
 
 ```sh
 sudo mkdir -p /opt/werft/compose
-sudo rsync -a --delete /opt/werft/src/deploy/ /opt/werft/compose/
+sudo rsync -a --delete --exclude .env /opt/werft/src/deploy/ /opt/werft/compose/
 ```
+
+`--exclude .env` is load-bearing: `.env` is the one file in this directory
+the *operator* owns (Stage 3 writes it), it is not in the repo, and without
+the exclude `--delete` would destroy it on every re-stage. It is also why
+nothing host-specific belongs in `compose.yaml` itself — a value hand-edited
+into a tracked file here is reverted by the next deploy, silently.
 
 (Re-run this `rsync` on every deploy of a new commit — `install.sh` does
 not do it for you; it only reads `deploy/install/`, `deploy/dns-guard/`,
@@ -196,22 +202,24 @@ inside `dnsmasq.d/`, the **directory** compose bind-mounts at
 `deploy/README.md`, "Rolling out an egress allowlist change", for why the
 mount is a directory and why a regeneration needs a `restart`, not a HUP).
 
-**Set the dispatch quota ceiling.** `WERFT_QUOTA_CEILING_SECONDS` defaults
-to `0`, and at `0` the manager refuses to dispatch anything — Stage 5 below
-cannot produce a run until it is set. `compose.yaml` deliberately does not
-pick a value (it is the operator's SPEC §7 knob, not a deploy-stack fact —
-see `deploy/README.md`'s "Not set in `compose.yaml`" paragraph). Add it to
-the `manager` service's `environment:` block before the first `up`:
+**Set the dispatch quota ceiling** — in `.env`, alongside the keys above,
+**never by editing `compose.yaml`**. `WERFT_QUOTA_CEILING_SECONDS` defaults
+to `0`, and at `0` the manager refuses to dispatch anything, so Stage 5
+below cannot produce a run until it is set. `compose.yaml` interpolates it
+(`WERFT_QUOTA_CEILING_SECONDS: ${QUOTA_CEILING_SECONDS:-0}`) precisely so
+the value lives in the one file Stage 2's `rsync --delete --exclude .env`
+preserves — a number hand-edited into `compose.yaml` would be reverted by
+the next deploy, taking dispatch dark again with no signal:
 
 ```sh
-sudo $EDITOR /opt/werft/compose/compose.yaml
-#   under services.manager.environment, alongside the other WERFT_* keys:
-#     WERFT_QUOTA_CEILING_SECONDS: "18000"    # 5h of agent wall-clock per window
+sudo $EDITOR /opt/werft/compose/.env
+#     QUOTA_CEILING_SECONDS=18000     # 5h of agent wall-clock per window
 ```
 
-Expected: `docker compose config` shows the key on the `manager` service.
-Choose the number deliberately — it is the ceiling the orchestrator refuses
-to dispatch past, not a hint.
+Expected: `docker compose config` shows
+`WERFT_QUOTA_CEILING_SECONDS: "18000"` on the `manager` service. Choose the
+number deliberately — it is the ceiling the orchestrator refuses to dispatch
+past, not a hint.
 
 Validate, then bring the stack up:
 
@@ -269,8 +277,10 @@ container, behind the real squid proxy, produces the evidence itself.
 **Preconditions** (all from Stage 3 — check them before starting, a miss
 here shows up as "nothing ever dispatches"):
 
-- `WERFT_QUOTA_CEILING_SECONDS` is set to a non-zero value on the `manager`
-  service. At the `0` default the dispatch plane never claims a run and the
+- `QUOTA_CEILING_SECONDS` is set to a non-zero value in
+  `/opt/werft/compose/.env` (Stage 3) — check the rendered result with
+  `docker compose config | grep WERFT_QUOTA_CEILING_SECONDS`, and re-check it
+  after any Stage 2 re-stage. At the `0` default the dispatch plane never claims a run and the
   manager logs `app.dispatch_disabled_no_quota_ceiling` once at boot —
   `docker compose logs manager | grep dispatch_disabled` is the fastest way
   to catch it.
@@ -492,8 +502,13 @@ bugs to file:
    and the guard resolves nothing at all. It is still not an egress hole —
    dnsmasq speaks only DNS, and every name outside the allowlist is
    `NXDOMAIN` via the `address=/#/` catch-all.
-8. `WERFT_QUOTA_CEILING_SECONDS` is not set by `compose.yaml` and defaults
-   to `0`, at which the dispatch plane never claims a run (SPEC §7: no
-   ceiling, no reservation). Stage 3 sets it explicitly. A manager that
-   boots with it unset logs `app.dispatch_disabled_no_quota_ceiling` once
-   and then looks perfectly healthy while never dispatching anything.
+8. `WERFT_QUOTA_CEILING_SECONDS` comes from `.env`'s
+   `QUOTA_CEILING_SECONDS` and defaults to `0`, at which the dispatch plane
+   never claims a run (SPEC §7: no ceiling, no reservation). Stage 3 sets it
+   explicitly. A manager that boots with it unset logs
+   `app.dispatch_disabled_no_quota_ceiling` once and then looks perfectly
+   healthy while never dispatching anything. It lives in `.env` rather than
+   in `compose.yaml` because Stage 2's `rsync --delete` re-stage of
+   `/opt/werft/compose` on every deploy would revert a compose edit — the
+   same `--exclude .env` that protects the ceiling protects `TS_IP`, the
+   image digests and the rest of `.env` from being deleted outright.
