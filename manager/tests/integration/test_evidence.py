@@ -17,7 +17,8 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from werft.db.models import Artifact, Project, RunEvent
-from werft.orchestrator.evidence import collect_run_evidence
+from werft.orchestrator.evidence import _event_payload, collect_run_evidence
+from werft.runner.collect import CollectionReport, DroppedEntry
 from werft.runner.create_body import RunPlacement
 
 # -- seeding ------------------------------------------------------------------
@@ -154,6 +155,47 @@ async def test_collects_writes_rows_and_event(tmp_path, migrated_db, db_session,
     assert ev.payload["truncated"] is False
     assert ev.payload["dropped"] == []
     assert "dropped_elided" not in ev.payload
+
+
+async def test_zero_artifacts_still_writes_event(tmp_path, migrated_db, db_session, factory):
+    # The container died before writing anything: the placement dirs exist
+    # (as `lifecycle.py` would have created them) but hold nothing. The D5
+    # binding rule is "one event per collection pass, always" — the
+    # `if report.artifacts:` guard around the upsert must not also skip the
+    # event.
+    project = await seed_project(db_session)
+    run_id = await seed_run(db_session, project)
+
+    run_dir = tmp_path / "run"
+    (run_dir / "workspace").mkdir(parents=True)
+    (run_dir / "outputs").mkdir(parents=True)
+
+    placement = make_placement(run_id, run_dir)
+    store = tmp_path / "store"
+
+    report = await collect_run_evidence(
+        factory,
+        run_id=run_id,
+        placement=placement,
+        artifacts_root=str(store),
+        subnets=[],
+        squid_access_log="",
+        dns_guard_query_log="",
+    )
+
+    assert report is not None
+    assert report.artifacts == []
+
+    rows = (
+        (await db_session.execute(select(Artifact).where(Artifact.run_id == run_id)))
+        .scalars()
+        .all()
+    )
+    assert rows == []
+
+    ev = await dispatch_event(db_session, run_id)
+    assert ev.payload["phase"] == "artifacts"
+    assert ev.payload["collected"] == 0
 
 
 async def test_recollection_upserts_not_duplicates(tmp_path, migrated_db, db_session, factory):
@@ -382,3 +424,34 @@ async def test_failure_is_swallowed(tmp_path, migrated_db, db_session, factory):
         .all()
     )
     assert rows == []
+
+    # `trg_runs_created` (0001_spine.py) fires a `created` event on every run
+    # insert regardless of this module — the assertion is that the swallowed
+    # failure never got as far as writing *its own* `dispatch` event, not
+    # that the run has no events at all.
+    events = (
+        (
+            await db_session.execute(
+                select(RunEvent)
+                .where(RunEvent.run_id == run_id)
+                .where(RunEvent.event_type == "dispatch")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert events == []
+
+
+# -- _event_payload (pure) -----------------------------------------------
+
+
+def test_event_payload_elides_dropped_past_100():
+    dropped = [DroppedEntry(f"outputs/f{i}.bin", "total_cap", 1) for i in range(101)]
+    report = CollectionReport(artifacts=[], dropped=dropped, bytes_total=0, truncated=True)
+
+    payload = _event_payload(report)
+
+    assert len(payload["dropped"]) == 100
+    assert payload["dropped_elided"] == 1
+    assert payload["dropped"][0] == {"path": "outputs/f0.bin", "reason": "total_cap", "bytes": 1}
