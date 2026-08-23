@@ -99,11 +99,29 @@ Expected: Docker CE installs, `/etc/docker/daemon.json` gains
 `"selinux-enabled": true`, `/opt/werft/{compose,config,secrets,backups}`
 and `/srv/werft/{runs,egress/{allow,log/{squid,dnsguard}}}` are created,
 `/srv/werft/egress/allow/manager.txt` is seeded with the four GitHub
-hosts plus `.ntfy.example.com`, `/opt/werft/config/dns-allow.conf` exists,
+hosts plus `.ntfy.example.com`,
+`/opt/werft/config/dnsmasq.d/dns-allow.conf` exists,
 firewalld's default zone is `drop` with `tailscale0` in the `trusted`
 zone, the backup/restore-drill systemd timers are enabled, and the
 script's last action — `run_all_floors` — exits 0 with no `FLOOR FAIL`
 lines. A non-zero exit here means a floor is still unmet; do not proceed.
+
+**SELinux labelling happens here**, inside `create_layout`: `install.sh`
+sets the persistent default type on the two bind-mounted trees
+(`semanage fcontext -a -t container_file_t "/srv/werft(/.*)?"` and the same
+for `/opt/werft/config(/.*)?`) and then `restorecon -R`s them. Confirm it
+landed rather than warning:
+
+```sh
+sudo semanage fcontext -l | grep -E '/srv/werft|/opt/werft/config'
+ls -Zd /srv/werft /srv/werft/runs /opt/werft/config/dnsmasq.d
+```
+
+Expected: two `container_file_t` rules listed, and `ls -Z` shows
+`container_file_t` on each path. A `WARN: semanage not found` line in the
+install output means `policycoreutils-python-utils` is missing — install it
+and re-run `install.sh`; under Enforcing, unlabelled bind mounts are
+`permission denied` to every container in the stack.
 
 **Demonstrate a floor failing loudly** (the floor-violation drill), then
 restore it:
@@ -166,12 +184,34 @@ Deploy the dispatch config and generate the DNS allowlist from it:
 ```sh
 sudo $EDITOR /opt/werft/config/dispatch.json   # per-project registries/extra_hosts (SPEC §4.5)
 sudo /opt/werft/compose/dns-guard/gen-dns-allow.sh \
-    /opt/werft/config/dispatch.json /opt/werft/config/dns-allow.conf
+    /opt/werft/config/dispatch.json \
+    /opt/werft/config/dnsmasq.d/dns-allow.conf
 ```
 
 Expected: `dns-allow.conf` now has one `server=/<host>/1.1.1.1` line per
 allowed host (base GitHub hosts + `api.anthropic.com` + every configured
-project's expanded registries/extra_hosts).
+project's expanded registries/extra_hosts). Note the output path: it is
+inside `dnsmasq.d/`, the **directory** compose bind-mounts at
+`/etc/dnsmasq.d` — never a bare `/opt/werft/config/dns-allow.conf` (see
+`deploy/README.md`, "Rolling out an egress allowlist change", for why the
+mount is a directory and why a regeneration needs a `restart`, not a HUP).
+
+**Set the dispatch quota ceiling.** `WERFT_QUOTA_CEILING_SECONDS` defaults
+to `0`, and at `0` the manager refuses to dispatch anything — Stage 5 below
+cannot produce a run until it is set. `compose.yaml` deliberately does not
+pick a value (it is the operator's SPEC §7 knob, not a deploy-stack fact —
+see `deploy/README.md`'s "Not set in `compose.yaml`" paragraph). Add it to
+the `manager` service's `environment:` block before the first `up`:
+
+```sh
+sudo $EDITOR /opt/werft/compose/compose.yaml
+#   under services.manager.environment, alongside the other WERFT_* keys:
+#     WERFT_QUOTA_CEILING_SECONDS: "18000"    # 5h of agent wall-clock per window
+```
+
+Expected: `docker compose config` shows the key on the `manager` service.
+Choose the number deliberately — it is the ceiling the orchestrator refuses
+to dispatch past, not a hint.
 
 Validate, then bring the stack up:
 
@@ -226,6 +266,19 @@ test exercised `extract_egress_lines` against a seeded, synthetic
 squid/dnsmasq log — this stage is the first run where a real agent
 container, behind the real squid proxy, produces the evidence itself.
 
+**Preconditions** (all from Stage 3 — check them before starting, a miss
+here shows up as "nothing ever dispatches"):
+
+- `WERFT_QUOTA_CEILING_SECONDS` is set to a non-zero value on the `manager`
+  service. At the `0` default the dispatch plane never claims a run and the
+  manager logs `app.dispatch_disabled_no_quota_ceiling` once at boot —
+  `docker compose logs manager | grep dispatch_disabled` is the fastest way
+  to catch it.
+- `GITHUB_APP_CLIENT_ID` and `/opt/werft/secrets/github_app_key` are set
+  (otherwise onboarding 503s below).
+- `/opt/werft/config/dnsmasq.d/dns-allow.conf` was generated from the same
+  `dispatch.json` the project uses, and `dns-guard` was restarted after it.
+
 Onboard a project:
 
 ```sh
@@ -277,15 +330,42 @@ curl -fsS -H "Authorization: Bearer $(cat /opt/werft/secrets/api_token)" \
     -o dns-guard.log
 
 grep -E 'CONNECT|GET' squid-access.log      # the agent's real fetch(es)
-grep -E 'query\[' dns-guard.log             # the agent's real DNS lookup(s)
+grep -E 'query\[' dns-guard.log             # the agent asked
+grep -E '^.*forwarded ' dns-guard.log       # dns-guard reached its upstream
+grep -E '^.*reply .* is ' dns-guard.log     # and got an answer back
 ```
 
 Expected: `squid-access.log` contains at least one line for a host the
 run's `egress_hosts()` allowlist covers (e.g. `github.com` or
-`api.anthropic.com`), and `dns-guard.log` contains at least one `query[A]`
-line for the same host, both timestamped inside the run's `claimed`..
-terminal window — proof the run reached the network only through squid/
-dns-guard, and that the evidence pipeline captured it live.
+`api.anthropic.com`), timestamped inside the run's `claimed`..terminal
+window.
+
+For `dns-guard.log`, `query[...]` alone is **not** sufficient to pass this
+stage — dnsmasq logs the query it received even when it has no route to its
+upstream and answers nothing. `dnsmasq.conf` sets `log-queries=extra`, so a
+resolver that actually worked writes all three shapes for the same name:
+
+```
+query[A] github.com from 10.90.0.5
+forwarded github.com to 1.1.1.1
+reply github.com is 140.82.121.4
+```
+
+Both the `forwarded … to <upstream>` line and the `reply … is <addr>` line
+must be present for an allowlisted host. Queries with no matching
+`forwarded`/`reply` pair mean dns-guard is inert — the usual cause is the
+container missing the `internet` network (`server=/<host>/1.1.1.1` is
+unreachable from an `internal: true` network alone); check
+`docker inspect werft-dns-guard --format '{{json .NetworkSettings.Networks}}'`
+lists both `werft_mgr_egress` and `werft_internet`. A name that is *not*
+allowlisted shows a `query[...]` with **no** `forwarded` line and a
+`config <name> is NXDOMAIN` line instead (the `address=/#/` catch-all
+answering locally) — that is the guard working, and it is worth
+spot-checking one such name to prove the deny arm too:
+
+```sh
+grep -E 'config .* is NXDOMAIN' dns-guard.log
+```
 
 ---
 
@@ -300,6 +380,11 @@ echo "<your restic repository URL>" | sudo tee /opt/werft/secrets/restic_repo >/
 openssl rand -base64 32 | sudo tee /opt/werft/secrets/restic_password >/dev/null
 sudo chmod 0600 /opt/werft/secrets/restic_repo /opt/werft/secrets/restic_password
 restic -r "$(cat /opt/werft/secrets/restic_repo)" init   # first time only
+
+# ntfy_url — optional, read directly by both backup scripts for failure
+# alerts (this is NOT compose's WERFT_NTFY_URL; without it they stay silent)
+echo "https://ntfy.example.com/werft-backup" | sudo tee /opt/werft/secrets/ntfy_url >/dev/null
+sudo chmod 0600 /opt/werft/secrets/ntfy_url
 ```
 
 Trigger the backup once by hand:
@@ -313,7 +398,18 @@ restic -r "$(cat /opt/werft/secrets/restic_repo)" snapshots
 Expected: `status` shows `Active: inactive (dead)` with the last run
 exiting `0`; `snapshots` lists a new snapshot covering
 `/opt/werft/backups/dumps`, `/opt/werft/compose`, `/opt/werft/config`,
-`/srv/werft/runs` (the GitHub App key is deliberately excluded — D9).
+`/srv/werft/runs`. Three things are deliberately excluded (D9 and its T9
+amendment): `/opt/werft/secrets/github_app_key` (re-creatable from GitHub
+in minutes), `/srv/werft/runs/*/secrets` and `/srv/werft/runs/*/task.json`
+— a run that is *live* at 03:30 still has its GitHub installation token and
+`CLAUDE_CODE_OAUTH_TOKEN` in plaintext there (the scrub only happens at
+teardown), and neither belongs offsite. Confirm with:
+
+```sh
+restic -r "$(cat /opt/werft/secrets/restic_repo)" ls latest | grep -E 'runs/.*/(secrets|task\.json)'
+```
+
+Expected: no output.
 
 Run the restore drill once by hand:
 
@@ -363,18 +459,41 @@ bugs to file:
    hard boundary for runner containers, whose per-run networks are
    `Internal: true` — a tool that ignores proxy env inside a runner has
    no route at all.
-5. `/srv/werft/egress/log/squid` must be writable by uid 23 (the squid
-   image's in-container `squid` user) and `/srv/werft/egress/log/dnsguard`
-   by uid 999 (`install.sh`'s `create_layout` does this via `chown`). If
-   `access.log`/`queries.log` stay empty after `up`, check ownership on
-   those two directories first before suspecting a config bug.
-6. A missing `/opt/werft/config/dns-allow.conf` at the very first
-   `docker compose up` makes Docker create an empty **directory** at that
-   bind-mount path instead of mounting a file, and `dns-guard` then fails
-   to start (`dnsmasq` can't load a directory as its config).
-   `install.sh`'s `ensure_dns_allow_conf` creates the file first, so a
-   normal Stage 2 install never hits this — but if the file is ever
-   deleted afterward, re-create it with
-   `deploy/dns-guard/gen-dns-allow.sh /opt/werft/config/dispatch.json /opt/werft/config/dns-allow.conf`
-   before the next `up`, not by hand-creating an empty file (which would
-   also work but loses the generated allowlist content).
+5. **Permission denied on a bind mount: suspect the SELinux label first,
+   ownership second.** The host runs Enforcing with dockerd
+   `selinux-enabled: true`, so an unlabelled host path is denied outright
+   regardless of its uid/mode. `install.sh` sets `container_file_t` on
+   `/srv/werft` and `/opt/werft/config` (`semanage fcontext` +
+   `restorecon -R`) and `compose.yaml` carries `:z` on the small shared
+   mounts — check `ls -Zd <path>` and `sudo ausearch -m avc -ts recent`
+   before anything else. *Then* check ownership: `/srv/werft/egress/log/
+   squid` must be writable by uid 23 (the squid image's in-container
+   `squid` user) and `/srv/werft/egress/log/dnsguard` by uid 999
+   (`create_layout` does this via `chown`). Empty `access.log`/`queries.log`
+   after `up` is usually one of these two, in that order.
+6. `/opt/werft/config/dnsmasq.d` is bind-mounted into `dns-guard` as a
+   **directory** (`/etc/dnsmasq.d`), not as a single file: `gen-dns-allow.sh`
+   publishes `dns-allow.conf` with an atomic `mv`, so the file gets a new
+   inode every regeneration and a single-file mount would pin the old one
+   forever. Two consequences: if the directory is missing at the first
+   `docker compose up`, Docker creates an empty one and `dns-guard` fails on
+   its missing `conf-file` (`install.sh`'s `create_layout` +
+   `ensure_dns_allow_conf` create both, so a normal Stage 2 install never
+   hits this); and a regenerated allowlist takes effect only after
+   `docker compose -f /opt/werft/compose/compose.yaml restart dns-guard` —
+   dnsmasq does **not** re-read its config on `SIGHUP`. Re-create a deleted
+   file with
+   `deploy/dns-guard/gen-dns-allow.sh /opt/werft/config/dispatch.json /opt/werft/config/dnsmasq.d/dns-allow.conf`,
+   not by hand (an empty file starts, but resolves nothing).
+7. `dns-guard` is on the `internet` network as well as `mgr_egress`. That is
+   load-bearing, not incidental: the allowlist is a set of
+   `server=/<host>/<upstream>` forwards, and `mgr_egress` is
+   `internal: true`, so on that network alone the upstream is unreachable
+   and the guard resolves nothing at all. It is still not an egress hole —
+   dnsmasq speaks only DNS, and every name outside the allowlist is
+   `NXDOMAIN` via the `address=/#/` catch-all.
+8. `WERFT_QUOTA_CEILING_SECONDS` is not set by `compose.yaml` and defaults
+   to `0`, at which the dispatch plane never claims a run (SPEC §7: no
+   ceiling, no reservation). Stage 3 sets it explicitly. A manager that
+   boots with it unset logs `app.dispatch_disabled_no_quota_ceiling` once
+   and then looks perfectly healthy while never dispatching anything.
