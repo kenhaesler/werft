@@ -17,7 +17,7 @@ notify() {
 trap 'notify "werft-restore-drill FAILED on $(hostname): line $LINENO"' ERR
 
 [ -r "$ENV_FILE" ] || { notify "werft-restore-drill: $ENV_FILE unreadable"; exit 1; }
-POSTGRES_IMAGE=$(grep -m1 '^POSTGRES_IMAGE=' "$ENV_FILE" | cut -d= -f2-)
+POSTGRES_IMAGE=$(grep -m1 '^POSTGRES_IMAGE=' "$ENV_FILE" | cut -d= -f2- || true)
 [ -n "$POSTGRES_IMAGE" ] || { notify "werft-restore-drill: POSTGRES_IMAGE not set in $ENV_FILE"; exit 1; }
 
 DUMP=$(ls -1t "$DUMPS"/werft-*.dump 2>/dev/null | head -1 || true)
@@ -29,6 +29,10 @@ PASSWORD=$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)
 # From here on the throwaway container may exist, so the ERR trap widens to
 # also clean it up; EXIT covers the success path (docker run --rm already
 # self-removes on stop, this trap makes stop-then-remove unconditional).
+# On an error exit, both the ERR trap and the EXIT trap fire (bash runs ERR,
+# then still runs EXIT on the way out) — cleanup() double-fires by design.
+# That's fine: `docker rm -f` is idempotent against an already-removed
+# container (second call just fails quietly into the `|| true`).
 cleanup() {
     docker rm -f "$NAME" >/dev/null 2>&1 || true
 }

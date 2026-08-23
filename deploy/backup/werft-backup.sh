@@ -21,9 +21,13 @@ trap 'notify "werft-backup FAILED on $(hostname): line $LINENO"' ERR
 
 mkdir -p "$DUMPS"
 if docker compose -f "$COMPOSE" exec -T postgres pg_isready -U werft -d werft >/dev/null 2>&1; then
+    # Computed once: date +%F evaluated separately at redirect time and mv
+    # time could straddle midnight and orphan a .tmp file that neither the
+    # retention glob nor the drill's newest-dump glob would ever see.
+    STAMP=$(date +%F)
     docker compose -f "$COMPOSE" exec -T postgres \
-        pg_dump -Fc -U werft werft > "$DUMPS/werft-$(date +%F).dump.tmp"
-    mv "$DUMPS/werft-$(date +%F).dump.tmp" "$DUMPS/werft-$(date +%F).dump"
+        pg_dump -Fc -U werft werft > "$DUMPS/werft-$STAMP.dump.tmp"
+    mv "$DUMPS/werft-$STAMP.dump.tmp" "$DUMPS/werft-$STAMP.dump"
     ls -1t "$DUMPS"/werft-*.dump | tail -n +15 | xargs -r rm --   # local dumps: keep 14
 else
     notify "werft-backup: postgres down; pushing previous dumps only"
@@ -59,3 +63,8 @@ if docker kill -s USR1 werft-egress-proxy >/dev/null 2>&1; then
 else
     notify "werft-backup: werft-egress-proxy not running; squid log not rotated"
 fi
+
+# Guard the script's exit status against any future appends after this point
+# (an appended non-critical step must not accidentally fail the whole run
+# via its own trailing command's status) — explicit success here.
+exit 0
