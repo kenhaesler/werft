@@ -1,0 +1,7 @@
+**/__pycache__
+**/.pytest_cache
+dashboard/node_modules
+.git
+docs
+.claude
+.superpowers
