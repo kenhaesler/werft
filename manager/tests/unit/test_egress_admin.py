@@ -9,6 +9,7 @@ from werft.runner.egress_admin import (
     allowlist_path,
     clear_allowlist,
     slot_dns_ip,
+    slot_from_subnets,
     slot_squid_ip,
     slot_subnet,
     write_allowlist,
@@ -222,3 +223,43 @@ def test_clear_allowlist_no_tmp_remnant(tmp_path):
     clear_allowlist(allow_dir, 4)
     path = os.path.join(allow_dir, "slot4.txt")
     assert not os.path.exists(path + ".tmp")
+
+
+# --- slot_from_subnets ---
+
+
+def test_slot_from_subnets_reads_the_slot_back():
+    assert slot_from_subnets([slot_subnet(7)]) == 7
+
+
+def test_slot_from_subnets_ignores_foreign_subnets():
+    assert slot_from_subnets(["172.30.0.0/24", "10.90.2.0/24"]) == 2
+
+
+def test_slot_from_subnets_honours_the_prefix():
+    assert slot_from_subnets(["10.90.2.0/24"], prefix="10.91") is None
+    assert slot_from_subnets(["10.91.2.0/24"], prefix="10.91") == 2
+
+
+def test_slot_from_subnets_empty_is_none():
+    assert slot_from_subnets([]) is None
+
+
+@pytest.mark.parametrize(
+    "subnet",
+    [
+        "10.90.2.0/16",  # not a /24
+        "10.90.2.1/24",  # not the network address
+        "10.90.02.0/24",  # not the canonical form this module writes
+        "10.90.256.0/24",  # out of range
+        "10.90.x.0/24",
+        "nonsense",
+        "",
+    ],
+)
+def test_slot_from_subnets_rejects_malformed(subnet):
+    assert slot_from_subnets([subnet]) is None
+
+
+def test_slot_from_subnets_tolerates_non_strings():
+    assert slot_from_subnets([None, 5, {"Subnet": "10.90.1.0/24"}, "10.90.1.0/24"]) == 1

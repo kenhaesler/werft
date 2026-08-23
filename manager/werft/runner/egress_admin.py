@@ -60,6 +60,38 @@ def slot_dns_ip(slot: int, *, prefix: str = "10.90") -> str:
     return f"{prefix}.{slot}.3"
 
 
+def slot_from_subnets(subnets: list[str], *, prefix: str = "10.90") -> int | None:
+    """Recover a run's slot from its network's IPAM subnets, or `None`.
+
+    The inverse of `slot_subnet`, and the **only** place slot derivation
+    happens: the driver's re-adoption path and both teardown paths (driver and
+    sweeps) all need "which slot was this network?" from nothing but the
+    daemon's answer, and two copies of this parse would be two chances to
+    disagree about which allowlist file to clear.
+
+    Deliberately exact rather than tolerant: only the canonical form this
+    module writes (`{prefix}.K.0/24`, `0 <= K <= 255`, no leading zeros)
+    counts. Anything else — a foreign subnet, a different prefix, a malformed
+    or non-string entry from a degenerate inspect body — is "not a slot",
+    because acting on a *wrongly* derived slot would clear another run's
+    allowlist. Callers sit on never-raises teardown paths, so this never
+    raises either.
+    """
+    for subnet in subnets:
+        if not isinstance(subnet, str):
+            continue
+        head, _, tail = subnet.rpartition(".")
+        if tail != "0/24":
+            continue
+        base, _, octet = head.rpartition(".")
+        if base != prefix or not (octet.isascii() and octet.isdigit()):
+            continue
+        slot = int(octet)
+        if 0 <= slot <= 255 and slot_subnet(slot, prefix=prefix) == subnet:
+            return slot
+    return None
+
+
 def allowlist_path(allow_dir: str, slot: int) -> str:
     """Return the path to `slot`'s squid `dstdomain` include file."""
     _validate_slot(slot)

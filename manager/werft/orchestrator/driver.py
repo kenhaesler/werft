@@ -49,6 +49,12 @@ from werft.github.ops import RepoOps
 from werft.observe.alerts import AlertSink
 from werft.orchestrator.credentials import RunCredentials
 from werft.orchestrator.dispatch import runner_config_for
+from werft.orchestrator.egress_net import (
+    attach_egress,
+    detach_egress,
+    placement_with_slot,
+    slot_of,
+)
 from werft.orchestrator.evidence import collect_run_evidence
 from werft.orchestrator.finalize import advance_failed, finalize_attempt
 from werft.providers.base import Classification, ProviderSpec
@@ -259,11 +265,16 @@ class _Driver:
             return
 
         entry = dispatch_for(self._deps.config.current(), loaded.project.slug)
+        # The egress-*off* placement, and only that: the box's resolver and
+        # proxy are facts about the network, which does not exist yet. Both
+        # paths below rebuild it once the slot is known — the launch path from
+        # the slot it claims, the re-adoption path from the slot the surviving
+        # network's subnet still names. When egress is off both rebuilds are
+        # identities and this is the placement the container gets.
         self._placement = placement_for(
             self._run_id,
             runs_root=self._settings.runs_root,
             dns_ip=self._settings.runner_dns_ip,
-            proxy_url="",  # Task 6 wires the real value
         )
         self._lifecycle = RunnerLifecycle(
             self._deps.docker,
@@ -275,6 +286,15 @@ class _Driver:
             # die event that already happened is replayed rather than missed
             # (`_first_die` falls back to `inspect` if it is older still).
             os.makedirs(self._placement.secrets_dir, exist_ok=True)
+            # The slot is not remembered in a column on purpose: the network
+            # the dead manager left behind still carries it in its IPAM pool,
+            # which is the one record a crash cannot desynchronise. No
+            # allowlist rewrite here — the file is already this run's.
+            self._placement = placement_with_slot(
+                self._placement,
+                self._settings,
+                slot_of(self._settings, await self._capture_network_subnets()),
+            )
             await self._mint(loaded)
             self._container_id = loaded.container_id
             base_sha = loaded.base_sha
@@ -424,7 +444,18 @@ class _Driver:
         # and the events stream being established emits its die event into the
         # gap (`DockerClient.watch_die_events`).
         since = now_epoch_seconds()
-        await self._lifecycle.prepare(placement)
+        # The network create *is* the egress slot claim (SPEC §4.5), so the
+        # placement the container is built from is only final here: `Dns` and
+        # the proxy env name addresses inside the slot that was just won.
+        placement = await attach_egress(
+            docker=self._deps.docker,
+            lifecycle=self._lifecycle,
+            settings=self._settings,
+            placement=placement,
+            hosts=entry.egress_hosts(),
+            run_id=str(self._run_id),
+        )
+        self._placement = placement
         container_id = await self._lifecycle.launch(
             placement,
             runner_config_for(entry),
@@ -783,7 +814,22 @@ class _Driver:
         subnets = await self._capture_network_subnets()
         if self._lifecycle is not None:
             try:
-                await self._lifecycle.teardown(self._placement, self._container_id)
+                await self._lifecycle.teardown(
+                    self._placement,
+                    self._container_id,
+                    # Between the container going and the network going: the
+                    # slot's squid/dns-guard endpoints have to be detached in
+                    # exactly that window, or the network removal fails with
+                    # active endpoints. `sweeps.reap_run_containers` owes the
+                    # identical sequence and calls the identical helper.
+                    before_network_remove=lambda: detach_egress(
+                        self._deps.docker,
+                        self._settings,
+                        network_name=self._placement.network_name,
+                        subnets=subnets,
+                        run_id=str(self._run_id),
+                    ),
+                )
             except Exception as exc:  # noqa: BLE001 - a daemon outage is the orphan sweep's job
                 logger.warning("driver.teardown_failed", run_id=str(self._run_id), error=str(exc))
         try:

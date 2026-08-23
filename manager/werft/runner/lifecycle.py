@@ -12,6 +12,7 @@ because a root agent can kill or patch the in-container adapter (SPEC §4.3).
 import asyncio
 import contextlib
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -56,8 +57,13 @@ class RunnerLifecycle:
         self._client = client
         self._ceiling_seconds = ceiling_seconds
 
-    async def prepare(self, placement: RunPlacement) -> None:
-        await self._client.create_network(placement.network_name)
+    async def prepare(self, placement: RunPlacement, *, subnet: str | None = None) -> None:
+        """Create the run's network. `subnet` pins its IPAM pool to one egress
+        slot's /24 — the daemon's pool-overlap refusal is then the slot lock
+        (`docker_api.is_pool_overlap`), which is why the caller, not this
+        method, decides which slot to try next. `None` (the default) is the
+        egress-off shape: an unpinned Internal-only network, exactly as before."""
+        await self._client.create_network(placement.network_name, subnet=subnet)
 
     async def launch(
         self,
@@ -128,17 +134,35 @@ class RunnerLifecycle:
             return -1
         return int(state.get("ExitCode", -1))
 
-    async def teardown(self, placement: RunPlacement, container_id: str | None) -> None:
+    async def teardown(
+        self,
+        placement: RunPlacement,
+        container_id: str | None,
+        *,
+        before_network_remove: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         """Always runs, including after a failed launch.
 
         The network removal sits in a `finally` so a failing container removal
         cannot strand it — otherwise the "no leaked networks" promise holds only
         on the happy path.
+
+        `before_network_remove` is the one seam between "the run's container is
+        gone" and "the run's network is gone": the egress slot's service
+        containers must be detached in exactly that window, or the removal
+        fails with active endpoints. It is called at most once and its failure
+        is swallowed — a hook that raised must not be the reason a network
+        leaks.
         """
         try:
             if container_id:
                 await self._client.remove_container(container_id, force=True)
         finally:
+            if before_network_remove is not None:
+                # Suppressed, not logged: the hook owns its own logging, and
+                # nothing it could raise is worth stranding the network for.
+                with contextlib.suppress(Exception):
+                    await before_network_remove()
             await self._client.remove_network(placement.network_name)
 
     async def _safe_remove_container(self, container_id: str) -> None:
