@@ -296,6 +296,7 @@ async def test_a_claimed_run_reaches_awaiting_review_against_a_real_daemon(
 
     settings = Settings(
         runs_root=str(tmp_path / "runs"),
+        artifacts_root=str(tmp_path / "runs"),
         claude_credential_file=str(credential),
         dispatch_config_file=str(config_file),
         lease_seconds=120,

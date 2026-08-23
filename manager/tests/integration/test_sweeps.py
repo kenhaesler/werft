@@ -142,6 +142,7 @@ async def sweeps_fixture(migrated_db, db_session, tmp_path):
         )
         settings = Settings(
             runs_root=str(tmp_path / "runs"),
+            artifacts_root=str(tmp_path / "runs"),
             dispatch_config_file=str(config_file),
             lease_seconds=120,
             max_concurrent_runs=8,

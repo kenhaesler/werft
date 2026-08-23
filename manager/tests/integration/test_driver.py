@@ -121,6 +121,7 @@ async def deps_fixture(migrated_db, db_session, tmp_path, monkeypatch, origin):
 
     settings = Settings(
         runs_root=str(tmp_path / "runs"),
+        artifacts_root=str(tmp_path / "runs"),
         claude_credential_file=str(credential),
         dispatch_config_file=str(config_file),
         lease_seconds=120,
