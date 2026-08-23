@@ -175,6 +175,7 @@ async def reap_run_containers(deps: SweepDeps, run_id: UUID, container_id: str |
         run_id,
         runs_root=deps.settings.runs_root,
         dns_ip=deps.settings.runner_dns_ip,
+        proxy_url="",  # Task 6 wires the real value
     )
     subnets = await _capture_network_subnets(deps, run_id, placement.network_name)
     found_ids, ok = await _container_ids_for(deps, run_id, container_id)

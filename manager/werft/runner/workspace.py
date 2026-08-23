@@ -64,7 +64,9 @@ _CREDENTIAL_ENV_MARKERS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
 _UNREADABLE_TASK_JSON = (OSError, ValueError)
 
 
-def placement_for(run_id: UUID | str, *, runs_root: str, dns_ip: str) -> RunPlacement:
+def placement_for(
+    run_id: UUID | str, *, runs_root: str, dns_ip: str, proxy_url: str = ""
+) -> RunPlacement:
     run_dir = os.path.join(runs_root, str(run_id))
     return RunPlacement(
         run_id=str(run_id),
@@ -76,6 +78,7 @@ def placement_for(run_id: UUID | str, *, runs_root: str, dns_ip: str) -> RunPlac
         outputs_dir=os.path.join(run_dir, "outputs"),
         task_json_path=os.path.join(run_dir, "task.json"),
         secrets_dir=os.path.join(run_dir, "secrets"),
+        proxy_url=proxy_url,
     )
 
 

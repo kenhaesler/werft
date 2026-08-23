@@ -72,6 +72,7 @@ def placement(tmp_path):
         outputs_dir=str(run_dir / "outputs"),
         task_json_path=str(run_dir / "task.json"),
         secrets_dir=str(run_dir / "secrets"),
+        proxy_url="",
     )
 
 

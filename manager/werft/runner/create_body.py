@@ -50,7 +50,9 @@ BASE_HOST_CONFIG: dict[str, Any] = {
 #: The per-run computed component. No other key may ever appear here (SPEC §4.2).
 #: The container name is a query parameter on POST /containers/create, not a body
 #: key, so it is not listed: lifecycle.py passes RunPlacement.container_name there.
-PER_RUN_KEYS: frozenset[str] = frozenset({"NetworkMode", "Dns", "Binds", "Labels"})
+#: `Env` is present only when `RunPlacement.proxy_url` is non-empty — the off
+#: state omits the key entirely rather than emitting an empty list.
+PER_RUN_KEYS: frozenset[str] = frozenset({"NetworkMode", "Dns", "Binds", "Labels", "Env"})
 
 #: The closed typed per-project delta — columns, not rows; ranges, not free values.
 DELTA_KEYS: frozenset[str] = frozenset({"Memory", "NanoCpus"})
@@ -92,6 +94,7 @@ class RunPlacement:
     outputs_dir: str
     task_json_path: str
     secrets_dir: str
+    proxy_url: str
 
 
 def _contained(path: str, run_root: str) -> str:
@@ -143,7 +146,7 @@ def build_create_body(
         f"{secrets}:/run/secrets:ro",  # a DIRECTORY, so token re-mint by rename is seen
     ]
 
-    return {
+    body: dict[str, Any] = {
         "Image": config.image_digest,
         "Entrypoint": list(entrypoint),
         "Cmd": [],
@@ -151,3 +154,13 @@ def build_create_body(
         "Labels": {"werft.run_id": placement.run_id},
         "HostConfig": host_config,
     }
+    if placement.proxy_url:
+        body["Env"] = [
+            f"HTTP_PROXY={placement.proxy_url}",
+            f"HTTPS_PROXY={placement.proxy_url}",
+            f"http_proxy={placement.proxy_url}",
+            f"https_proxy={placement.proxy_url}",
+            "NO_PROXY=localhost,127.0.0.1",
+            "no_proxy=localhost,127.0.0.1",
+        ]
+    return body

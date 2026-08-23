@@ -74,6 +74,7 @@ def make_placement(run_id: uuid.UUID, run_dir) -> RunPlacement:
         outputs_dir=os.path.join(run_dir_s, "outputs"),
         task_json_path=os.path.join(run_dir_s, "task.json"),
         secrets_dir=os.path.join(run_dir_s, "secrets"),
+        proxy_url="",
     )
 
 

@@ -263,6 +263,7 @@ class _Driver:
             self._run_id,
             runs_root=self._settings.runs_root,
             dns_ip=self._settings.runner_dns_ip,
+            proxy_url="",  # Task 6 wires the real value
         )
         self._lifecycle = RunnerLifecycle(
             self._deps.docker,
