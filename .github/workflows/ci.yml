@@ -79,6 +79,130 @@ jobs:
       - run: npx vitest run
       - run: npm run build
 
+  deploy:
+    name: deploy
+    runs-on: ubuntu-24.04 # never preview runners (SPEC §2)
+    timeout-minutes: 10
+    permissions:
+      contents: read # checkout only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.32"
+          # setup-uv v9.0.0's bundled checksum table stops at uv 0.11.30 —
+          # without this input the 0.11.32 download would go unverified.
+          checksum: "aab924fd522efd06f1c5f3b93a243864fc453132c94b2dc49f1371b528a4b967"
+          enable-cache: true
+          cache-dependency-glob: manager/uv.lock
+      - name: bash -n every deploy script
+        run: |
+          set -euo pipefail
+          status=0
+          while IFS= read -r -d '' f; do
+            echo "bash -n $f"
+            bash -n "$f" || status=1
+          done < <(find deploy -name '*.sh' -print0)
+          exit "$status"
+      - name: shellcheck version
+        run: shellcheck --version
+      - name: shellcheck every deploy script
+        run: |
+          set -euo pipefail
+          status=0
+          while IFS= read -r -d '' f; do
+            echo "shellcheck $f"
+            shellcheck "$f" || status=1
+          done < <(find deploy -name '*.sh' -print0)
+          exit "$status"
+      - name: docker compose config with a stub .env
+        run: |
+          set -euo pipefail
+          # 64 hex chars — syntactically valid but not a real digest (CI stub only).
+          DIGEST="deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+          cat > deploy/.env <<EOF
+          TS_IP=100.64.0.1
+          POSTGRES_IMAGE=postgres@sha256:${DIGEST}
+          SOCKET_PROXY_IMAGE=tecnativa/docker-socket-proxy@sha256:${DIGEST}
+          GITHUB_APP_CLIENT_ID=dummy
+          NTFY_URL=https://ntfy.example.com/werft
+          EOF
+          docker compose -f deploy/compose.yaml config -q
+          rm -f deploy/.env
+      - name: dns-guard preset-drift check
+        run: |
+          set -euo pipefail
+          FIXTURE="$RUNNER_TEMP/dispatch-fixture.json"
+          GENERATED="$RUNNER_TEMP/dns-allow.conf"
+          cat > "$FIXTURE" <<'EOF'
+          {
+            "projects": {
+              "alpha": {
+                "image_digest": "example/alpha@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "model": "test-model",
+                "registries": ["npm", "pypi"],
+                "extra_hosts": ["example.com"]
+              },
+              "beta": {
+                "image_digest": "example/beta@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "model": "test-model",
+                "registries": ["go", "crates", "dnf-rocky"],
+                "extra_hosts": ["storage.example.org"]
+              }
+            }
+          }
+          EOF
+          bash deploy/dns-guard/gen-dns-allow.sh "$FIXTURE" "$GENERATED"
+          cat "$GENERATED"
+          uv run --directory manager python - "$FIXTURE" "$GENERATED" <<'PYEOF'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          from werft.config.dispatch import REGISTRY_PRESETS
+
+          fixture_path, generated_conf = sys.argv[1], sys.argv[2]
+
+          BASE_HOSTS = {
+              "github.com",
+              "api.github.com",
+              "codeload.github.com",
+              "objects.githubusercontent.com",
+              "api.anthropic.com",
+          }
+
+          fixture = json.loads(Path(fixture_path).read_text())
+          expected = set(BASE_HOSTS)
+          for project in fixture.get("projects", {}).values():
+              for preset in project.get("registries", []):
+                  expected.update(REGISTRY_PRESETS[preset])
+              expected.update(h.lower() for h in project.get("extra_hosts", []))
+
+          line_re = re.compile(r"^server=/([^/]+)/")
+          actual = set()
+          for line in Path(generated_conf).read_text().splitlines():
+              m = line_re.match(line)
+              if m:
+                  actual.add(m.group(1))
+
+          if actual != expected:
+              only_actual = sorted(actual - expected)
+              only_expected = sorted(expected - actual)
+              print(
+                  "DNS allowlist preset drift between dispatch.py REGISTRY_PRESETS "
+                  "and gen-dns-allow.sh's PRESETS table",
+                  file=sys.stderr,
+              )
+              print(f"  only in generated conf: {only_actual}", file=sys.stderr)
+              print(f"  only in expected (dispatch.py-derived): {only_expected}", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"OK: {len(actual)} hosts match ({len(REGISTRY_PRESETS)} presets exercised)")
+          PYEOF
+
   zizmor:
     name: zizmor
     runs-on: ubuntu-24.04
