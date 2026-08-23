@@ -97,6 +97,72 @@ def test_a_runs_root_that_diverges_from_artifacts_root_warns() -> None:
     assert any(entry.get("event") == "app.runs_root_diverges_from_artifacts_root" for entry in logs)
 
 
+def test_concurrency_above_egress_slot_count_fails_boot_loudly() -> None:
+    """A claim that can never find a free egress slot would otherwise retry
+    forever, unattended, at 03:00 — the same D3 rationale as the malformed
+    dispatch config above. The message names both settings so the operator
+    knows exactly which knob to turn."""
+    with pytest.raises(
+        PermanentError,
+        match="egress_slot_count.*max_concurrent_runs|max_concurrent_runs.*egress_slot_count",
+    ):
+        create_app(Settings(egress_slot_count=1, max_concurrent_runs=2))
+
+
+def test_concurrency_at_or_below_egress_slot_count_boots_clean() -> None:
+    """The boundary: equal counts are fine, every claim can find a slot."""
+    create_app(Settings(egress_slot_count=2, max_concurrent_runs=2))
+
+
+def test_egress_slots_off_ignores_concurrency_entirely() -> None:
+    """`egress_slot_count == 0` means the egress plumbing is off (SPEC
+    §4.5): no slots to run out of, so an arbitrarily high concurrency is
+    not a boot-time contradiction."""
+    create_app(Settings(egress_slot_count=0, max_concurrent_runs=100))
+
+
+def test_egress_active_with_empty_evidence_logs_warns() -> None:
+    """SPEC §8: egress active but the evidence seam (squid/dns-guard logs)
+    still dormant is legal — T9 provisions the services and sets these
+    paths later — but the operator should know at a glance."""
+    with capture_logs() as logs:
+        create_app(
+            Settings(
+                egress_slot_count=1,
+                max_concurrent_runs=1,
+                squid_access_log="",
+                dns_guard_query_log="",
+            )
+        )
+
+    assert any(entry.get("event") == "app.egress_active_evidence_seam_dormant" for entry in logs)
+
+
+def test_egress_active_with_both_evidence_logs_configured_stays_quiet() -> None:
+    with capture_logs() as logs:
+        create_app(
+            Settings(
+                egress_slot_count=1,
+                max_concurrent_runs=1,
+                squid_access_log="/srv/werft/egress/squid/access.log",
+                dns_guard_query_log="/srv/werft/egress/dns-guard/queries.log",
+            )
+        )
+
+    assert not any(
+        entry.get("event") == "app.egress_active_evidence_seam_dormant" for entry in logs
+    )
+
+
+def test_egress_slots_off_never_warns_about_evidence_logs() -> None:
+    with capture_logs() as logs:
+        create_app(Settings(egress_slot_count=0, squid_access_log="", dns_guard_query_log=""))
+
+    assert not any(
+        entry.get("event") == "app.egress_active_evidence_seam_dormant" for entry in logs
+    )
+
+
 async def test_the_provider_account_is_upserted_when_a_ceiling_is_configured(
     migrated_pg_url: str, tmp_path: Path
 ) -> None:

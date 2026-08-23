@@ -64,6 +64,7 @@ from werft.config.dispatch import DispatchConfigCache, load_dispatch_config
 from werft.config.settings import Settings
 from werft.db.engine import create_engine_from_url
 from werft.db.models import Project
+from werft.domain.errors import PermanentError
 from werft.github.auth import ADMIN_PERMISSIONS, MANAGER_PERMISSIONS, AppAuth
 from werft.github.client import GitHubClient
 from werft.github.ops import RepoOps
@@ -260,6 +261,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "app.runs_root_diverges_from_artifacts_root",
             runs_root=resolved.runs_root,
             artifacts_root=resolved.artifacts_root,
+        )
+
+    # T9 boot guard (SPEC §4.5/§10): with egress plumbing on
+    # (`egress_slot_count > 0`), a claim that can never find a free slot
+    # would otherwise retry forever, unattended, at 03:00 — the same D3
+    # "operator is watching at startup" rationale as the dispatch-config
+    # check above. `egress_slot_count == 0` means the plumbing is off
+    # entirely (today's Internal-only network), so `max_concurrent_runs`
+    # is unconstrained by it.
+    if resolved.egress_slot_count > 0 and resolved.max_concurrent_runs > resolved.egress_slot_count:
+        raise PermanentError(
+            "max_concurrent_runs "
+            f"({resolved.max_concurrent_runs}) exceeds egress_slot_count "
+            f"({resolved.egress_slot_count}): claims above the slot count "
+            "could never find a free slot and would retry forever. Raise "
+            "egress_slot_count or lower max_concurrent_runs."
+        )
+    # SPEC §8: egress active but the evidence seam (squid/dns-guard query
+    # logs) still dormant is legal — T9 provisions the services and sets
+    # these paths later (plan D7: empty means "not deployed", collection is
+    # a silent no-op) — but the operator should know at a glance rather than
+    # discover it during an incident review.
+    if resolved.egress_slot_count > 0 and (
+        not resolved.squid_access_log or not resolved.dns_guard_query_log
+    ):
+        logger.warning(
+            "app.egress_active_evidence_seam_dormant",
+            egress_slot_count=resolved.egress_slot_count,
+            squid_access_log=resolved.squid_access_log,
+            dns_guard_query_log=resolved.dns_guard_query_log,
         )
 
     require_token = make_require_token(_read_token_file(resolved.api_token_file))
