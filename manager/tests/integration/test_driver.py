@@ -31,7 +31,7 @@ from tests.fakes import (
 )
 from werft.config.dispatch import DispatchConfigCache
 from werft.config.settings import Settings
-from werft.db.models import ProviderAccount, QuotaLedgerEntry, Run, RunAttempt, RunEvent
+from werft.db.models import Artifact, ProviderAccount, QuotaLedgerEntry, Run, RunAttempt, RunEvent
 from werft.domain.runs import run_branch_name
 from werft.github.client import GitHubUnavailable
 from werft.observe.alerts import NullAlertSink
@@ -260,6 +260,15 @@ async def dispatch_phases(fakes, run_id) -> list[str]:
     return [row.payload["phase"] for row in rows]
 
 
+async def artifacts_of(fakes, run_id) -> list[Artifact]:
+    async with fakes.factory() as session:
+        return (
+            (await session.execute(select(Artifact).where(Artifact.run_id == run_id)))
+            .scalars()
+            .all()
+        )
+
+
 async def fetch_account(fakes) -> ProviderAccount:
     async with fakes.factory() as session:
         return (
@@ -436,7 +445,14 @@ async def test_a_pushed_success_finalizes_to_awaiting_review_and_trues_up(deps_f
     assert (await ledger_entry(fakes, run_id)).actual_wallclock_s is not None
     assert fakes.auth.revoked  # SPEC §4.4
     assert f"remove_network:{network_of(run_id)}" in fakes.docker.calls
-    assert (await dispatch_phases(fakes, run_id))[-1] == "container_died"
+    phases = await dispatch_phases(fakes, run_id)
+    assert "container_died" in phases
+
+    # T8: evidence collection ran during teardown, ahead of the secrets scrub,
+    # and after `_finalize`'s own event.
+    assert phases[-1] == "artifacts"
+    artifacts = await artifacts_of(fakes, run_id)
+    assert any(a.path.startswith("outputs/") for a in artifacts)
 
 
 async def test_a_success_that_pushed_nothing_is_not_a_success(deps_fixture):
@@ -855,6 +871,31 @@ async def test_teardown_scrubs_the_credential_out_of_task_json(deps_fixture):
     assert payload["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "<redacted>"
     assert payload["argv"][0] == "claude"  # still readable evidence
     assert CREDENTIAL not in (run_dir_of(fakes, run_id) / "task.json").read_text(encoding="utf-8")
+
+
+async def test_an_evidence_collection_blowup_still_lets_the_secrets_scrub_run(
+    deps_fixture, monkeypatch
+):
+    """`collect_run_evidence` carries its own D11 wrapper and should never raise
+    on its own, but this pins the *driver's* side of the contract too: even if
+    it somehow did, teardown must not raise and the secrets scrub — the
+    last-resort-guaranteed half — must still have run."""
+    from werft.orchestrator import driver as driver_module
+
+    driver_deps, run_id, fakes = deps_fixture
+    fakes.on_started = lambda p: write_outputs(p, status="success")
+
+    async def blows_up(*_args, **_kwargs):
+        raise RuntimeError("evidence collection exploded")
+
+    monkeypatch.setattr(driver_module, "collect_run_evidence", blows_up)
+
+    await attend_run(driver_deps, run_id)  # must not raise
+
+    payload = json.loads((run_dir_of(fakes, run_id) / "task.json").read_text(encoding="utf-8"))
+    assert payload["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "<redacted>"
+    assert fakes.auth.revoked
+    assert not (secrets_of(fakes, run_id) / "git_token").exists()
 
 
 async def test_a_run_that_is_no_longer_attendable_is_left_alone(deps_fixture):

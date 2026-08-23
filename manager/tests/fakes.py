@@ -58,6 +58,11 @@ class FakeDocker:
         self.placement: RunPlacement | None = None
         self.fakes: SimpleNamespace | None = None
         self._die = asyncio.Event()
+        #: `network inspect` body a test can shape; `None` mimics a 404 (the
+        #: network already gone). Defaults to a realistic single-subnet body so
+        #: T8's evidence collection has something to stage without every test
+        #: having to set it up.
+        self.network_body: dict | None = {"IPAM": {"Config": [{"Subnet": "172.30.0.0/24"}]}}
 
     def release_die(self, exit_code: int = 0) -> None:
         self.exit_code = exit_code
@@ -80,6 +85,11 @@ class FakeDocker:
     async def remove_network(self, name: str) -> None:
         self.calls.append(f"remove_network:{name}")
         self._fail_if_configured("remove_network")
+
+    async def inspect_network(self, name: str) -> dict | None:
+        self.calls.append(f"inspect_network:{name}")
+        self._fail_if_configured("inspect_network")
+        return self.network_body
 
     async def create_container(self, name: str, body: dict) -> str:
         self._guard("create_container")

@@ -462,7 +462,9 @@ async def test_the_tick_reaps_a_canceled_runs_container(loop_fixture):
     await orchestrator.tick_once()
 
     assert "remove_container:c1" in fakes.docker.calls
-    assert await dispatch_phases(seeded, run_id) == ["reaped"]
+    # T8: evidence collection runs ahead of the `reaped` marker, inside the
+    # same reap.
+    assert await dispatch_phases(seeded, run_id) == ["artifacts", "reaped"]
 
 
 async def test_the_lease_sweep_acts_on_a_run_no_driver_owns(loop_fixture):

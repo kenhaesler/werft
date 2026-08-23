@@ -49,12 +49,13 @@ from werft.github.ops import RepoOps
 from werft.observe.alerts import AlertSink
 from werft.orchestrator.credentials import RunCredentials
 from werft.orchestrator.dispatch import runner_config_for
+from werft.orchestrator.evidence import collect_run_evidence
 from werft.orchestrator.finalize import advance_failed, finalize_attempt
 from werft.providers.base import Classification, ProviderSpec
 from werft.providers.claude import parse_stream
 from werft.quota.ledger import LedgerQuota
 from werft.runner.create_body import RunPlacement
-from werft.runner.docker_api import DockerClient
+from werft.runner.docker_api import DockerClient, subnets_of
 from werft.runner.git import clone_env, clone_workspace, remote_url, write_askpass
 from werft.runner.lifecycle import Completion, RunnerLifecycle, meaning_of, now_epoch_seconds
 from werft.runner.outputs import OutputsRead, read_log_tail, read_result
@@ -768,14 +769,36 @@ class _Driver:
     async def _teardown(self) -> None:
         """Best effort, and never raises: it runs while other failures may
         already be in flight. **The run directory is never deleted** — T8's
-        collector reads `outputs/` and `workspace/` afterwards."""
+        collector reads `outputs/` and `workspace/` afterwards.
+
+        Evidence collection sits between the container/network teardown and
+        the secrets scrub: it must run *before* `scrub_task_json`/
+        `remove_secrets` so the collected tree still has the live files to
+        read, but it can never be allowed to skip the scrub — `collect_run_evidence`
+        carries its own D11 wrapper, so a collection failure never raises here.
+        """
         if self._placement is None:
             return
+        subnets = await self._capture_network_subnets()
         if self._lifecycle is not None:
             try:
                 await self._lifecycle.teardown(self._placement, self._container_id)
             except Exception as exc:  # noqa: BLE001 - a daemon outage is the orphan sweep's job
                 logger.warning("driver.teardown_failed", run_id=str(self._run_id), error=str(exc))
+        try:
+            await collect_run_evidence(
+                self._deps.session_factory,
+                run_id=self._run_id,
+                placement=self._placement,
+                artifacts_root=self._settings.artifacts_root,
+                subnets=subnets,
+                squid_access_log=self._settings.squid_access_log,
+                dns_guard_query_log=self._settings.dns_guard_query_log,
+            )
+        except Exception as exc:  # noqa: BLE001 - belt and braces around D11's own wrapper
+            logger.warning(
+                "driver.evidence_collection_raised", run_id=str(self._run_id), error=str(exc)
+            )
         # The git token comes from this driver's own credential object; the
         # provider credential is read back out of `task.json` (see
         # `workspace.credential_values`), so the scrub is identical on the
@@ -792,6 +815,19 @@ class _Driver:
         if self._credentials is not None:
             await self._credentials.revoke()
         remove_secrets(self._placement)
+
+    async def _capture_network_subnets(self) -> list[str]:
+        """The run network's IPAM subnets, captured **before** teardown removes
+        it. `[]` on any error — including a daemon outage — because the network
+        may legitimately already be gone (a re-drive that never adopted a
+        network, or a sweep path racing an operator cancel); that is routine,
+        never worth more than debug."""
+        try:
+            network = await self._deps.docker.inspect_network(self._placement.network_name)
+        except Exception as exc:  # noqa: BLE001 - the network may already be gone
+            logger.debug("driver.inspect_network_failed", run_id=str(self._run_id), error=str(exc))
+            return []
+        return subnets_of(network)
 
     # -- helpers --------------------------------------------------------------
 

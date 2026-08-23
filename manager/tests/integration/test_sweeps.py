@@ -20,8 +20,9 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from tests.fakes import FakeDocker, SpyAlerts
 from werft.config.settings import Settings
-from werft.db.models import QuotaLedgerEntry, Run, RunAttempt, RunEvent
+from werft.db.models import Artifact, QuotaLedgerEntry, Run, RunAttempt, RunEvent
 from werft.observe.alerts import NullAlertSink
+from werft.orchestrator import sweeps as sweeps_module
 from werft.orchestrator.sweeps import (
     SweepDeps,
     sweep_canceled_containers,
@@ -282,6 +283,15 @@ def run_dir_of(fakes, run_id):
     return fakes.runs_root / str(run_id)
 
 
+async def artifacts_of(fakes, run_id) -> list[Artifact]:
+    async with fakes.factory() as session:
+        return (
+            (await session.execute(select(Artifact).where(Artifact.run_id == run_id)))
+            .scalars()
+            .all()
+        )
+
+
 # --- the tests ---------------------------------------------------------------
 
 
@@ -367,12 +377,42 @@ async def test_a_canceled_runs_container_is_killed_even_while_a_driver_waits(swe
     """D10: the driver is blocked in `await_completion` and only the die event
     will free it, so this sweep fires regardless of the registry."""
     deps, run_id, fakes = await sweeps_fixture(status="canceled", container_id="c1")
+    outputs = run_dir_of(fakes, run_id) / "outputs"
+    outputs.mkdir(parents=True, exist_ok=True)
+    (outputs / "result.json").write_text('{"status": "success"}', encoding="utf-8")
 
     assert await sweep_canceled_containers(deps) == 1
 
     assert any(c.startswith("kill:") for c in fakes.docker.calls)
     assert (await dispatch_phases(fakes, run_id))[-1] == "reaped"
     assert await sweep_canceled_containers(deps) == 0  # idempotent
+
+    # T8: evidence collection ran as part of the reap, ahead of the secrets
+    # scrub — the two-asserts contract shared with the driver's own teardown.
+    artifacts = await artifacts_of(fakes, run_id)
+    assert any(a.path.startswith("outputs/") for a in artifacts)
+    assert "artifacts" in await dispatch_phases(fakes, run_id)
+
+
+async def test_an_evidence_collection_blowup_still_lets_the_secrets_scrub_run(
+    sweeps_fixture, monkeypatch
+):
+    """Same failure-isolation contract as the driver's teardown: a
+    `collect_run_evidence` blow-up must not stop the secrets scrub or escape
+    `reap_run_containers`."""
+    deps, run_id, fakes = await sweeps_fixture(status="canceled", container_id="c1")
+    token = run_dir_of(fakes, run_id) / "secrets" / "git_token"
+    assert token.exists()
+
+    async def blows_up(*_args, **_kwargs):
+        raise RuntimeError("evidence collection exploded")
+
+    monkeypatch.setattr(sweeps_module, "collect_run_evidence", blows_up)
+
+    assert await sweep_canceled_containers(deps) == 1  # must not raise
+
+    assert not token.exists()
+    assert (await dispatch_phases(fakes, run_id))[-1] == "reaped"
 
 
 async def test_the_orphan_sweep_reaps_terminal_runs_that_still_have_a_container(sweeps_fixture):
