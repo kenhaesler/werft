@@ -136,5 +136,11 @@ class Settings(BaseSettings):
     # empty means "not deployed": collection is a silent no-op (plan D7).
     squid_access_log: str = ""
     dns_guard_query_log: str = ""
+
+    #: SPEC §10: secrets are file mounts, never env. When set, the ro-mounted
+    #: file's stripped contents replace the password in `database_url` at
+    #: `create_app` time (`werft.domain.db_url.apply_password_file`); empty
+    #: (the default) means `database_url` is used exactly as configured.
+    database_password_file: str = ""
     # SPEC §8: at this % usage of artifacts_root's volume, stop claiming new runs.
     disk_threshold_percent: float = 90.0

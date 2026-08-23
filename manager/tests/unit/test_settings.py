@@ -18,3 +18,8 @@ def test_t9_egress_activation_settings_defaults():
     assert s.egress_proxy_container == "werft-egress-proxy"
     assert s.dns_guard_container == "werft-dns-guard"
     assert s.egress_proxy_port == 3128
+
+
+def test_database_password_file_defaults_unset():
+    s = Settings(database_url="postgresql+asyncpg://x/x")
+    assert s.database_password_file == ""

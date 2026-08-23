@@ -163,6 +163,52 @@ def test_egress_slots_off_never_warns_about_evidence_logs() -> None:
     )
 
 
+def test_database_password_file_set_but_missing_fails_boot_loudly(tmp_path: Path) -> None:
+    """SPEC §10: a `WERFT_DATABASE_PASSWORD_FILE` mount that's set but
+    unreadable is a `PermanentError` at boot (D3), same taxonomy as the
+    malformed-dispatch-config and egress-slot guards above — not a
+    confusing failure the first time a route issues a query."""
+    missing = tmp_path / "does-not-exist"
+
+    with pytest.raises(PermanentError, match="WERFT_DATABASE_PASSWORD_FILE"):
+        create_app(
+            Settings(
+                database_url="postgresql+asyncpg://werft@postgres:5432/werft",
+                database_password_file=str(missing),
+            )
+        )
+
+
+async def test_database_password_file_unset_leaves_the_engine_url_unchanged() -> None:
+    app = create_app(Settings(database_url="postgresql+asyncpg://werft:werft@localhost:5432/werft"))
+
+    async with app.router.lifespan_context(app):
+        engine = app.state.session_factory.kw["bind"]
+        assert engine.url.render_as_string(hide_password=False) == (
+            "postgresql+asyncpg://werft:werft@localhost:5432/werft"
+        )
+
+
+async def test_database_password_file_set_splices_the_password_into_the_engine_url(
+    tmp_path: Path,
+) -> None:
+    secret = tmp_path / "pg_password"
+    secret.write_text("s3cret\n")
+    app = create_app(
+        Settings(
+            database_url="postgresql+asyncpg://werft@postgres:5432/werft",
+            database_password_file=str(secret),
+        )
+    )
+
+    async with app.router.lifespan_context(app):
+        engine = app.state.session_factory.kw["bind"]
+        assert engine.url.password == "s3cret"
+        assert engine.url.render_as_string(hide_password=False) == (
+            "postgresql+asyncpg://werft:s3cret@postgres:5432/werft"
+        )
+
+
 async def test_the_provider_account_is_upserted_when_a_ceiling_is_configured(
     migrated_pg_url: str, tmp_path: Path
 ) -> None:

@@ -64,6 +64,7 @@ from werft.config.dispatch import DispatchConfigCache, load_dispatch_config
 from werft.config.settings import Settings
 from werft.db.engine import create_engine_from_url
 from werft.db.models import Project
+from werft.domain.db_url import apply_password_file
 from werft.domain.errors import PermanentError
 from werft.github.auth import ADMIN_PERMISSIONS, MANAGER_PERMISSIONS, AppAuth
 from werft.github.client import GitHubClient
@@ -251,6 +252,13 @@ def _read_token_file(path: str) -> str | None:
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings or Settings()
 
+    # SPEC §10: secrets are file mounts, never env. Resolved synchronously,
+    # here, alongside the other boot-time guards below (D3: the operator is
+    # watching at startup) — a `WERFT_DATABASE_PASSWORD_FILE` that's set but
+    # unreadable is a `PermanentError` now, not a confusing failure on the
+    # engine's first query once the lifespan is already running.
+    database_url = apply_password_file(resolved.database_url, resolved.database_password_file)
+
     # Fail boot loudly on a broken dispatch config (plan decision D3): the
     # operator is watching at startup, and a manager that boots on a broken
     # file parks every run at 03:00. Mid-flight the rule is the opposite —
@@ -298,7 +306,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        engine = create_engine_from_url(resolved.database_url)
+        engine = create_engine_from_url(database_url)
         app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
         # `NtfyAlertSink` is independent of GitHub config — the API layer's

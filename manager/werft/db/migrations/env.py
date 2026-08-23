@@ -4,6 +4,8 @@ import os
 from alembic import context
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from werft.domain.db_url import apply_password_file
+
 config = context.config
 
 
@@ -11,7 +13,13 @@ def _url() -> str:
     url = os.environ.get("WERFT_TEST_DATABASE_URL") or os.environ.get("WERFT_DATABASE_URL")
     if not url:
         raise RuntimeError("set WERFT_DATABASE_URL (or WERFT_TEST_DATABASE_URL) to run migrations")
-    return url
+    # SPEC §10: secrets are file mounts, never env. This entrypoint reads
+    # `WERFT_DATABASE_URL` straight off the environment rather than through
+    # `Settings` (the `db` layer may not import `config` — see
+    # `werft.domain.db_url`'s docstring), so it applies the same file-mount
+    # splice `create_app` does, directly, so `manager-migrate` reaches the
+    # database with the real password exactly like the `manager` service does.
+    return apply_password_file(url, os.environ.get("WERFT_DATABASE_PASSWORD_FILE", ""))
 
 
 def run_migrations_offline() -> None:
