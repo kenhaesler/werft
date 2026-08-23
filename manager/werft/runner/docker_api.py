@@ -185,6 +185,12 @@ class DockerClient:
     async def connect_network(
         self, network: str, container: str, *, ipv4: str | None = None
     ) -> None:
+        """Hot-attach a container to a network, optionally at a static IPv4 address.
+
+        Used to attach the egress-proxy/dns-guard containers to a run's network
+        after both already exist (SPEC §4.2). `ipv4` is omitted from the wire
+        body entirely when unset, letting Docker assign an address from the pool.
+        """
         body: dict[str, Any] = {"Container": container}
         if ipv4 is not None:
             body["EndpointConfig"] = {"IPAMConfig": {"IPv4Address": ipv4}}
@@ -194,6 +200,12 @@ class DockerClient:
         self._check(response)
 
     async def disconnect_network(self, network: str, container: str, *, force: bool = True) -> None:
+        """Detach a container from a network. Idempotent like `remove_network`.
+
+        Tolerates 404 (network already gone) and a 500 whose message says the
+        container is already not connected — both mean "already in the state
+        we wanted", so teardown paths can call this without checking first.
+        """
         response = await self._client.post(
             self._path(f"/networks/{quote(network, safe='')}/disconnect"),
             json={"Container": container, "Force": force},

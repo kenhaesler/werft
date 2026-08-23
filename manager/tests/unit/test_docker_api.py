@@ -230,11 +230,25 @@ async def test_disconnect_network_sends_force_by_default():
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content)
         return httpx.Response(200)
 
     async with client_with(handler) as client:
         await client.disconnect_network("net123", "container1")
     assert seen["url"].endswith(f"/{API_VERSION}/networks/net123/disconnect")
+    assert seen["body"] == {"Container": "container1", "Force": True}
+
+
+async def test_disconnect_network_force_false_is_sent_verbatim():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200)
+
+    async with client_with(handler) as client:
+        await client.disconnect_network("net123", "container1", force=False)
+    assert seen["body"] == {"Container": "container1", "Force": False}
 
 
 def test_is_pool_overlap_true_on_403():
