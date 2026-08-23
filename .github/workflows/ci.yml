@@ -114,7 +114,9 @@ jobs:
           status=0
           while IFS= read -r -d '' f; do
             echo "shellcheck $f"
-            shellcheck "$f" || status=1
+            # -x: follow `# shellcheck source=` directives (install.sh sources
+            # floors.sh); without it every sourced file is an SC1091 failure.
+            shellcheck -x "$f" || status=1
           done < <(find deploy -name '*.sh' -print0)
           exit "$status"
       - name: docker compose config with a stub .env
@@ -131,6 +133,77 @@ jobs:
           EOF
           docker compose -f deploy/compose.yaml config -q
           rm -f deploy/.env
+      - name: egress slot-count / subnet-prefix drift check
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          """compose.yaml is the single source of truth for the egress slot
+          layout; squid.conf, the egress-proxy Dockerfile's seed loop and
+          install.sh's seed loop all hard-code the same numbers. Nothing at
+          runtime would notice them drifting apart — a slot whose `slotK_src`
+          ACL is missing simply has no allow rule, so every request from it
+          falls through to `http_access deny all` and the run's egress dies
+          silently. This step is the only thing that notices."""
+          import re
+          import sys
+          from pathlib import Path
+
+          compose = Path("deploy/compose.yaml").read_text()
+          squid = Path("deploy/egress-proxy/squid.conf").read_text()
+          proxy_dockerfile = Path("deploy/egress-proxy/Dockerfile").read_text()
+          install_sh = Path("deploy/install/install.sh").read_text()
+
+          def one(pattern, text, what):
+              found = re.findall(pattern, text)
+              if len(found) != 1:
+                  sys.exit(f"expected exactly one {what}, found {found}")
+              return found[0]
+
+          count = int(one(r'WERFT_EGRESS_SLOT_COUNT:\s*"(\d+)"', compose, "slot count in compose"))
+          prefix = one(r'WERFT_EGRESS_SUBNET_PREFIX:\s*"([\d.]+)"', compose, "subnet prefix in compose")
+          mgr_subnet = one(r"ipam:\s*\{config:\s*\[\{subnet:\s*([\d./]+)\}\]\}", compose, "mgr_egress subnet in compose")
+
+          failures = []
+
+          # (i) one src/dst ACL pair per slot, on compose's prefix.
+          for k in range(count):
+              if f"acl slot{k}_src src {prefix}.{k}.0/24" not in squid:
+                  failures.append(f"squid.conf: missing `acl slot{k}_src src {prefix}.{k}.0/24`")
+              if f'acl slot{k}_dst dstdomain "/etc/squid/allow/slot{k}.txt"' not in squid:
+                  failures.append(f"squid.conf: missing slot{k}_dst dstdomain file ACL")
+              if f"http_access allow slot{k}_src slot{k}_dst" not in squid:
+                  failures.append(f"squid.conf: missing `http_access allow slot{k}_src slot{k}_dst`")
+          declared = {int(m) for m in re.findall(r"acl slot(\d+)_src src ", squid)}
+          stray = sorted(s for s in declared if s >= count)
+          if stray:
+              failures.append(f"squid.conf declares slots {stray} above compose's slot count {count}")
+          wrong_prefix = sorted(set(re.findall(r"acl slot\d+_src src ([\d.]+)\.\d+\.0/24", squid)) - {prefix})
+          if wrong_prefix:
+              failures.append(f"squid.conf slot ACLs use prefix(es) {wrong_prefix}, compose says {prefix}")
+
+          # (ii) mgr_src ACL == compose's pinned mgr_egress subnet.
+          mgr_acl = one(r"acl mgr_src src ([\d./]+)", squid, "mgr_src ACL in squid.conf")
+          if mgr_acl != mgr_subnet:
+              failures.append(f"squid.conf mgr_src is {mgr_acl}, compose's mgr_egress ipam subnet is {mgr_subnet}")
+
+          # The two seed loops that must create a file per slot.
+          expected_seed = " ".join(str(k) for k in range(count))
+          for name, text in (("deploy/egress-proxy/Dockerfile", proxy_dockerfile), ("deploy/install/install.sh", install_sh)):
+              seeds = re.findall(r"for (?:k|i) in ([\d ]+?); do", text)
+              if not seeds:
+                  failures.append(f"{name}: no slot seed loop found")
+              for seed in seeds:
+                  if seed.strip() != expected_seed:
+                      failures.append(f"{name}: seed loop covers slots `{seed.strip()}`, compose's slot count is {count} (expected `{expected_seed}`)")
+
+          if failures:
+              print("egress slot layout drift:", file=sys.stderr)
+              for f in failures:
+                  print(f"  {f}", file=sys.stderr)
+              sys.exit(1)
+          print(f"OK: {count} slots on {prefix}.K.0/24, mgr_egress {mgr_subnet}, seed loops in step")
+          PYEOF
+
       - name: dns-guard preset-drift check
         run: |
           set -euo pipefail
@@ -166,16 +239,13 @@ jobs:
 
           fixture_path, generated_conf = sys.argv[1], sys.argv[2]
 
-          BASE_HOSTS = {
-              "github.com",
-              "api.github.com",
-              "codeload.github.com",
-              "objects.githubusercontent.com",
-              "api.anthropic.com",
-          }
+          from werft.runner.egress_admin import BASE_ALLOW
 
+          # Imported, never re-declared: a third hand-written copy of the base
+          # host set would let a BASE_ALLOW change in Python drift straight
+          # past this check — which is the one thing the check exists to stop.
           fixture = json.loads(Path(fixture_path).read_text())
-          expected = set(BASE_HOSTS)
+          expected = set(BASE_ALLOW)
           for project in fixture.get("projects", {}).values():
               for preset in project.get("registries", []):
                   expected.update(REGISTRY_PRESETS[preset])
@@ -192,8 +262,10 @@ jobs:
               only_actual = sorted(actual - expected)
               only_expected = sorted(expected - actual)
               print(
-                  "DNS allowlist preset drift between dispatch.py REGISTRY_PRESETS "
-                  "and gen-dns-allow.sh's PRESETS table",
+                  "DNS allowlist drift between the Python source of truth "
+                  "(config/dispatch.py's REGISTRY_PRESETS + "
+                  "runner/egress_admin.py's BASE_ALLOW) and gen-dns-allow.sh's "
+                  "own PRESETS table / base host set",
                   file=sys.stderr,
               )
               print(f"  only in generated conf: {only_actual}", file=sys.stderr)

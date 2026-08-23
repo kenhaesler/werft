@@ -23,6 +23,10 @@ DOCKER_REFUSED="29.4.2"
 CONTAINERD_FLOOR="2.2.6"       # D13: containerd bundled with Docker CE 29.6.2 (see header)
 KERNEL_FLOOR="6.12.0-124.55.1.el10_1"  # D13: RHSA-2026:13566 fix for CVE-2026-31431 (see header)
 
+# Always `{ _fail ...; return 1; }`, never `return $(_fail ...)`: the latter
+# happens to work (the capture is empty, so bare `return` inherits `_fail`'s
+# status) but it is a word-splitting hazard shellcheck flags (SC2046) and it
+# breaks the moment `_fail` ever writes to stdout.
 _fail() { echo "FLOOR FAIL $1: $2" >&2; return 1; }
 _vergte() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
 
@@ -37,8 +41,8 @@ assert_x86_64_v3() {
 assert_docker_version() {
     local v
     v=$(docker version --format '{{.Server.Version}}' 2>/dev/null) \
-        || return $(_fail docker_version "docker daemon unreachable")
-    [ "$v" = "$DOCKER_REFUSED" ] && return $(_fail docker_version "$v is refused (C1 trap release)")
+        || { _fail docker_version "docker daemon unreachable"; return 1; }
+    [ "$v" = "$DOCKER_REFUSED" ] && { _fail docker_version "$v is refused (C1 trap release)"; return 1; }
     _vergte "$v" "$DOCKER_FLOOR" || _fail docker_version "$v < floor $DOCKER_FLOOR"
 }
 
@@ -47,7 +51,7 @@ assert_containerd_version() {
     # command -v gate first: the pipeline below always exits 0 (its status is
     # `tr`'s), so a missing containerd would otherwise fall through to
     # `_vergte "" ...` and print a misleading `"" < floor` message.
-    command -v containerd >/dev/null 2>&1 || return $(_fail containerd "containerd not found")
+    command -v containerd >/dev/null 2>&1 || { _fail containerd "containerd not found"; return 1; }
     v=$(containerd --version 2>/dev/null | awk '{print $3}' | tr -d v)
     _vergte "$v" "$CONTAINERD_FLOOR" || _fail containerd "$v < floor $CONTAINERD_FLOOR"
 }
@@ -69,19 +73,19 @@ assert_docker_selinux_enabled() {
 assert_workspace_mount() {
     local opts fstype
     fstype=$(findmnt -no FSTYPE --target /srv/werft 2>/dev/null) \
-        || return $(_fail workspace_mount "/srv/werft not on a mount")
-    [ "$fstype" = "xfs" ] || return $(_fail workspace_mount "fstype $fstype != xfs")
+        || { _fail workspace_mount "/srv/werft not on a mount"; return 1; }
+    [ "$fstype" = "xfs" ] || { _fail workspace_mount "fstype $fstype != xfs"; return 1; }
     opts=$(findmnt -no OPTIONS --target /srv/werft)
-    case "$opts" in *prjquota*|*pquota*) : ;; *) return $(_fail workspace_mount "no pquota in [$opts]") ;; esac
-    case "$opts" in *nosuid*) : ;; *) return $(_fail workspace_mount "no nosuid") ;; esac
-    case "$opts" in *nodev*)  : ;; *) return $(_fail workspace_mount "no nodev")  ;; esac
+    case "$opts" in *prjquota*|*pquota*) : ;; *) _fail workspace_mount "no pquota in [$opts]"; return 1 ;; esac
+    case "$opts" in *nosuid*) : ;; *) _fail workspace_mount "no nosuid"; return 1 ;; esac
+    case "$opts" in *nodev*)  : ;; *) _fail workspace_mount "no nodev"; return 1 ;; esac
 }
 
 assert_firewalld_posture() {
     [ "$(firewall-cmd --state 2>/dev/null)" = "running" ] \
-        || return $(_fail firewalld "firewalld not running")
+        || { _fail firewalld "firewalld not running"; return 1; }
     local dz; dz=$(firewall-cmd --get-default-zone)
-    [ "$dz" = "drop" ] || return $(_fail firewalld "default zone $dz != drop")
+    [ "$dz" = "drop" ] || { _fail firewalld "default zone $dz != drop"; return 1; }
     firewall-cmd --zone=trusted --list-interfaces | grep -qw tailscale0 \
         || _fail firewalld "tailscale0 not in trusted zone"
 }
