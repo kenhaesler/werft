@@ -55,9 +55,10 @@ from werft.db.transitions import transition_run
 from werft.domain.attempts import AttemptOutcome
 from werft.domain.runs import RunStatus
 from werft.observe.alerts import AlertSink
+from werft.orchestrator.evidence import collect_run_evidence
 from werft.orchestrator.finalize import advance_failed
 from werft.quota.ledger import LedgerQuota
-from werft.runner.docker_api import DockerClient
+from werft.runner.docker_api import DockerClient, subnets_of
 from werft.runner.workspace import (
     credential_values,
     placement_for,
@@ -134,6 +135,24 @@ async def _container_ids_for(
     return ids, scanned
 
 
+async def _capture_network_subnets(deps: SweepDeps, run_id: UUID, network_name: str) -> list[str]:
+    """The run network's IPAM subnets, captured **before** this function's
+    caller removes it. `[]` on any error — including a daemon outage —
+    because the network may legitimately already be gone (a run whose driver
+    never got far enough to create one, or a second sweep tick racing the
+    first's cleanup); that is routine, never worth more than debug.
+
+    `subnets_of` is inside the `try` on purpose: a malformed IPAM body must
+    degrade to `[]` like a daemon outage does, never raise out of a reap that
+    still has the network removal and `remove_secrets` left to run."""
+    try:
+        network = await deps.docker.inspect_network(network_name)
+        return subnets_of(network)
+    except Exception as exc:  # noqa: BLE001 - the network may already be gone
+        logger.debug("sweep.inspect_network_failed", run_id=str(run_id), error=str(exc))
+        return []
+
+
 async def reap_run_containers(deps: SweepDeps, run_id: UUID, container_id: str | None) -> bool:
     """Force-remove every container labelled `werft.run_id=<id>`, remove the
     run's network, scrub the retained `task.json` and delete the mounted secret
@@ -157,6 +176,7 @@ async def reap_run_containers(deps: SweepDeps, run_id: UUID, container_id: str |
         runs_root=deps.settings.runs_root,
         dns_ip=deps.settings.runner_dns_ip,
     )
+    subnets = await _capture_network_subnets(deps, run_id, placement.network_name)
     found_ids, ok = await _container_ids_for(deps, run_id, container_id)
     for found in found_ids:
         try:
@@ -177,6 +197,22 @@ async def reap_run_containers(deps: SweepDeps, run_id: UUID, container_id: str |
             error=str(exc),
         )
         ok = False
+    # Evidence collection precedes the secrets scrub in program order, exactly
+    # as the driver's own teardown orders it, but `collect_run_evidence`
+    # carries its own D11 wrapper — never raises — so it can never delay or
+    # skip the scrub below, whatever `ok` is.
+    try:
+        await collect_run_evidence(
+            deps.session_factory,
+            run_id=run_id,
+            placement=placement,
+            artifacts_root=deps.settings.artifacts_root,
+            subnets=subnets,
+            squid_access_log=deps.settings.squid_access_log,
+            dns_guard_query_log=deps.settings.dns_guard_query_log,
+        )
+    except Exception as exc:  # noqa: BLE001 - belt and braces around D11's own wrapper
+        logger.warning("sweep.evidence_collection_raised", run_id=str(run_id), error=str(exc))
     # Unconditionally, and *after* the daemon work either way: D7's "the
     # retained run dir carries no live credential" is a property of the tree,
     # not of the daemon being reachable, so neither the scrub nor the secret

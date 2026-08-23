@@ -35,6 +35,26 @@ def _as_tuple(version: str) -> tuple[int, ...]:
     return tuple(int(part) for part in version.strip().lstrip("v").split("."))
 
 
+def subnets_of(network: dict[str, Any] | None) -> list[str]:
+    """Extract the IPAM subnets from a `network inspect` body.
+
+    Tolerates every degenerate shape (None network, missing IPAM/Config, a
+    null Config, a non-dict Config entry, or a Config entry without a Subnet
+    key) by returning []. The callers sit on never-raises teardown paths, so
+    "malformed body" must degrade to "no subnets", never to a `TypeError` that
+    skips the rest of the teardown.
+    """
+    if not isinstance(network, dict):
+        return []
+    ipam = network.get("IPAM")
+    configs = (ipam if isinstance(ipam, dict) else {}).get("Config")
+    if not isinstance(configs, list):
+        return []
+    return [
+        config["Subnet"] for config in configs if isinstance(config, dict) and "Subnet" in config
+    ]
+
+
 class DockerApiError(Exception):
     """A daemon call failed. Carries the status and the daemon's own message."""
 
@@ -140,6 +160,13 @@ class DockerClient:
 
     async def list_networks(self) -> list[dict[str, Any]]:
         response = await self._client.get(self._path("/networks"))
+        self._check(response)
+        return response.json()
+
+    async def inspect_network(self, name_or_id: str) -> dict[str, Any] | None:
+        response = await self._client.get(self._path(f"/networks/{quote(name_or_id, safe='')}"))
+        if response.status_code == 404:
+            return None
         self._check(response)
         return response.json()
 

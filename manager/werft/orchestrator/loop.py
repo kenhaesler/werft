@@ -99,6 +99,7 @@ large) candidate list first.
 
 import asyncio
 import contextlib
+import shutil
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -145,6 +146,18 @@ _CLEANUP_CANDIDATE_STATUSES = (RunStatus.CANCELED.value, RunStatus.MERGED.value)
 #: `_sweep_attend`'s candidate statuses: the two that mean "an attempt is in
 #: flight and somebody has to be attending it" (mirrored from `sweeps._IN_FLIGHT`).
 _ATTENDABLE_STATUSES = (RunStatus.CLAIMED.value, RunStatus.RUNNING.value)
+
+
+def _disk_percent_used(path: str) -> float | None:
+    """The `artifacts_root` volume's usage as a percentage, or `None` on any
+    probe failure (missing/unmounted path, permission error, `total == 0`) —
+    `_sweep_disk_threshold` fails open on `None` (plan decision D9): a
+    probe that cannot answer must never be the reason claims stop."""
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        return None
+    return (usage.used / usage.total) * 100.0 if usage.total else None
 
 
 @dataclass(frozen=True)
@@ -212,6 +225,15 @@ class Orchestrator:
         #: (plan decision D1), which is what makes crash recovery the normal
         #: path rather than a second code path that can rot.
         self._drivers: dict[UUID, asyncio.Task[None]] = {}
+        #: `_sweep_disk_threshold`'s rising-edge state (D9): `True` only while
+        #: the last probe read at-or-over `disk_threshold_percent`. Starts
+        #: `False` so a fresh manager never gates dispatch before its first
+        #: tick has actually looked at the disk.
+        self._disk_over = False
+        #: The same rising-edge idiom for the *probe itself*: a permanently
+        #: unreadable `artifacts_root` would otherwise log a warning every
+        #: 15 s forever, which is how a real alert gets tuned out.
+        self._disk_probe_failed = False
         #: Built once, not per sweep and not per driver: both are frozen
         #: bundles of collaborators this orchestrator already owns, and
         #: `driver.py`/`sweeps.py` both say the same thing — one instance,
@@ -371,12 +393,18 @@ class Orchestrator:
         """The 15 s reconciliation tick (SPEC §3.3 item 5: the tick is
         correctness, NOTIFY would only be latency).
 
-        Order is load-bearing (plan decision D13). The wakes run first, so a
-        run that just became eligible is claimable in the *same* tick rather
-        than the next one. The sweeps run before dispatch, so headroom a dead
-        manager was holding is visible to this tick's admission. Dispatch runs
-        before attend, so a run claimed here starts attending immediately.
+        Order is load-bearing (plan decision D13). The disk-threshold probe
+        runs first of all (SPEC §8, plan decision D9): it only ever gates
+        `_sweep_dispatch`, so nothing else in the tick needs to run before it,
+        and putting it first keeps `_disk_over` current for dispatch even if
+        an earlier sweep were ever reordered. The wakes run first among the
+        rest, so a run that just became eligible is claimable in the *same*
+        tick rather than the next one. The sweeps run before dispatch, so
+        headroom a dead manager was holding is visible to this tick's
+        admission. Dispatch runs before attend, so a run claimed here starts
+        attending immediately.
         """
+        await self._sweep_disk_threshold(stop)
         await self._sweep_failed_wake(stop)
         await self._sweep_blocked_quota_wake(stop)
         await self._sweep_lease(stop)
@@ -446,6 +474,36 @@ class Orchestrator:
             return
         await sweep_canceled_containers(self._sweep_bundle, stop=stop)
 
+    async def _sweep_disk_threshold(self, stop: asyncio.Event | None = None) -> None:
+        """SPEC §8: past `disk_threshold_percent` usage of `artifacts_root`'s
+        volume, stop claiming new runs (plan decision D9). Gate-only — a run
+        already `queued` just waits, no state change and no park.
+
+        Fail-open on any probe error: a `None` read means "no evidence of
+        trouble", not "assume the worst", so it clears `_disk_over` rather
+        than leaving dispatch gated on a probe that cannot even run.
+
+        The alert fires on the rising edge only (`over and not self._disk_over`)
+        and re-arms the moment usage drops back under threshold, so an
+        operator gets exactly one page per incident rather than one per tick
+        for as long as the disk stays full. The probe-failure warning is
+        edge-triggered the same way, for the same reason.
+        """
+        percent = _disk_percent_used(self._settings.artifacts_root)
+        if percent is None:
+            if self._disk_probe_failed:
+                logger.debug("disk_probe_failed", path=self._settings.artifacts_root)
+            else:
+                logger.warning("disk_probe_failed", path=self._settings.artifacts_root)
+            self._disk_probe_failed = True
+            self._disk_over = False
+            return
+        self._disk_probe_failed = False
+        over = percent >= self._settings.disk_threshold_percent
+        if over and not self._disk_over:
+            await self._alerts.disk_threshold(percent)
+        self._disk_over = over
+
     async def _sweep_dispatch(self, stop: asyncio.Event | None = None) -> None:
         """SPEC §3.2's `queued -> claimed`, folded into the 15 s tick rather
         than given a loop of its own (plan decision D13): a run that starts
@@ -471,6 +529,8 @@ class Orchestrator:
         on a VM sized for `max_concurrent_runs`.
         """
         if self._dispatch is None:
+            return
+        if self._disk_over:  # SPEC §8/D9: gate-only, a queued row just waits
             return
         dispatch = self._dispatch
         config = dispatch.config.current()  # last-good on a bad edit (D3)

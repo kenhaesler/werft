@@ -49,14 +49,31 @@ async def orchestrator_session_factory(migrated_db: str):
         await engine.dispose()
 
 
-def make_orchestrator(session_factory, *, ops_for, admin_ops_for=None, alerts=None) -> Orchestrator:
+def make_orchestrator(
+    session_factory,
+    *,
+    ops_for,
+    admin_ops_for=None,
+    alerts=None,
+    disk_threshold_percent: float = 100.0,
+) -> Orchestrator:
+    """`disk_threshold_percent` defaults to 100.0, not the production 90.0: the
+    tick's disk sweep runs unconditionally against the *real* filesystem, so a
+    CI box that happens to be 90 % full would fire `disk_threshold` into every
+    `SpyAlertSink` in this module and fail assertions that have nothing to do
+    with the disk. The two disk tests pass the real threshold themselves."""
     return Orchestrator(
         session_factory,
         ops_for,
         admin_ops_for or (lambda project: FakeRepoOps()),
         alerts=alerts or NullAlertSink(),
         quota=NullQuota(),
-        settings=Settings(tick_seconds=15, issue_poll_seconds=60, check_poll_seconds=30),
+        settings=Settings(
+            tick_seconds=15,
+            issue_poll_seconds=60,
+            check_poll_seconds=30,
+            disk_threshold_percent=disk_threshold_percent,
+        ),
     )
 
 
@@ -1029,3 +1046,55 @@ async def test_run_executes_loops_and_stops_promptly_after_the_stop_event(
     await asyncio.sleep(0.05)
     stop.set()
     await asyncio.wait_for(task, timeout=5)
+
+
+# -- disk threshold: edge-triggered alert (T8, plan decision D9) -----------------
+#
+# The dispatch-blocking half of the gate — that `_sweep_dispatch` actually
+# claims nothing over threshold, and that it proceeds again once the probe
+# recovers — needs a real `DispatchServices` (queued row + capacity), which
+# lives in `test_dispatch_loop.py`'s `loop_fixture`; see
+# `test_disk_over_threshold_blocks_dispatch_and_fires_alert_once` and
+# `test_disk_probe_failure_fails_open_and_dispatch_proceeds` there. These
+# cases only pin the alert's rising-edge/re-arm bookkeeping, using
+# `make_orchestrator`'s plain (dispatch-less) construction.
+
+
+async def test_disk_alert_does_not_refire_on_a_second_over_threshold_tick(
+    orchestrator_session_factory, monkeypatch
+) -> None:
+    monkeypatch.setattr(loop_module, "_disk_percent_used", lambda path: 95.0)
+    alerts = SpyAlertSink()
+    orchestrator = make_orchestrator(
+        orchestrator_session_factory,
+        ops_for=lambda p: FakeRepoOps(),
+        alerts=alerts,
+        disk_threshold_percent=90.0,  # the real default; this test is the disk one
+    )
+
+    await orchestrator.tick_once()
+    await orchestrator.tick_once()
+
+    assert alerts.disk_threshold_calls == [95.0]
+
+
+async def test_disk_alert_rearms_after_dropping_below_threshold(
+    orchestrator_session_factory, monkeypatch
+) -> None:
+    percent = {"value": 95.0}
+    monkeypatch.setattr(loop_module, "_disk_percent_used", lambda path: percent["value"])
+    alerts = SpyAlertSink()
+    orchestrator = make_orchestrator(
+        orchestrator_session_factory,
+        ops_for=lambda p: FakeRepoOps(),
+        alerts=alerts,
+        disk_threshold_percent=90.0,  # the real default; this test is the disk one
+    )
+
+    await orchestrator.tick_once()  # over: fires
+    percent["value"] = 50.0
+    await orchestrator.tick_once()  # under: re-arms, no fire
+    percent["value"] = 95.0
+    await orchestrator.tick_once()  # over again: fires
+
+    assert alerts.disk_threshold_calls == [95.0, 95.0]

@@ -53,6 +53,47 @@ function post(path: string): Promise<void> {
   return api<void>(path, { method: 'POST' });
 }
 
+/**
+ * Downloads a single artifact through the bearer-attaching fetch path (the
+ * server route requires Authorization, so a plain `<a href>` can't work and
+ * would otherwise mean putting the token in a URL). Fetches the bytes,
+ * builds an object URL, and clicks a synthetic `<a download>` to trigger the
+ * browser's save flow, then revokes the object URL once done.
+ */
+export async function downloadArtifact(runId: string, path: string): Promise<void> {
+  const token = getToken();
+  const headers = new Headers();
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+
+  const encodedPath = path
+    .split('/')
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+  const response = await fetch(`${API_PREFIX}/runs/${runId}/artifacts/${encodedPath}`, {
+    headers,
+  });
+
+  if (!response.ok) {
+    throw new ApiError(response.status);
+  }
+
+  const blob = await response.blob();
+  const filename = path.split('/').pop() || path;
+  const objectUrl = URL.createObjectURL(blob);
+  try {
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
 export const actions = {
   accept: (id: string): Promise<void> => post(`/runs/${id}/review/accept`),
   reject: (id: string): Promise<void> => post(`/runs/${id}/review/reject`),

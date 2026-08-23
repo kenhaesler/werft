@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { api, ApiError } from './api';
+  import { SvelteSet } from 'svelte/reactivity';
+  import { api, downloadArtifact, ApiError } from './api';
   import type { Artifact, ArtifactsResponse, RunSummary } from './types';
 
   interface Props {
@@ -25,6 +26,13 @@
   let artifactsError = $state<string | null>(null);
   let artifactsLoading = $state(false);
 
+  // Per-item download state, keyed by artifact path. Downloading an artifact
+  // is the same "authorized fetch, not a bare href" story as the listing
+  // above (B4/B7), so it gets its own loading/error tracking per row item
+  // rather than one shared flag for the whole list.
+  const downloadingPaths = new SvelteSet<string>();
+  let downloadErrors = $state<Record<string, string>>({});
+
   async function loadArtifacts(): Promise<void> {
     artifactsLoading = true;
     artifactsError = null;
@@ -36,6 +44,25 @@
       artifactsError = err instanceof ApiError ? `failed to load (${err.status})` : 'failed to load';
     } finally {
       artifactsLoading = false;
+    }
+  }
+
+  async function handleDownload(path: string): Promise<void> {
+    downloadingPaths.add(path);
+    if (path in downloadErrors) {
+      const next = { ...downloadErrors };
+      delete next[path];
+      downloadErrors = next;
+    }
+    try {
+      await downloadArtifact(run.id, path);
+    } catch (err) {
+      downloadErrors = {
+        ...downloadErrors,
+        [path]: err instanceof ApiError ? `download failed (${err.status})` : 'download failed',
+      };
+    } finally {
+      downloadingPaths.delete(path);
     }
   }
 </script>
@@ -68,7 +95,23 @@
       {:else}
         <ul class="run-row__artifacts-list">
           {#each artifacts as artifact (artifact.path)}
-            <li>{artifact.path} ({artifact.bytes}b)</li>
+            <li>
+              <button
+                type="button"
+                title={`Download ${artifact.path}`}
+                aria-label={`Download ${artifact.path}`}
+                disabled={downloadingPaths.has(artifact.path)}
+                onclick={() => handleDownload(artifact.path)}
+              >
+                {artifact.path}
+              </button>
+              ({artifact.bytes}b)
+              {#if downloadingPaths.has(artifact.path)}
+                <span class="run-row__artifacts-status">downloading…</span>
+              {:else if downloadErrors[artifact.path]}
+                <span class="run-row__artifacts-status">{downloadErrors[artifact.path]}</span>
+              {/if}
+            </li>
           {/each}
         </ul>
       {/if}

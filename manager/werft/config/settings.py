@@ -118,3 +118,10 @@ class Settings(BaseSettings):
     #: The reservation `earliest_headroom_at` asks about when no specific
     #: project is in hand (the `advance_failed` wake path).
     typical_reservation_seconds: int = 5400
+
+    # SPEC §8 egress evidence — T9 provisions the services and sets these paths;
+    # empty means "not deployed": collection is a silent no-op (plan D7).
+    squid_access_log: str = ""
+    dns_guard_query_log: str = ""
+    # SPEC §8: at this % usage of artifacts_root's volume, stop claiming new runs.
+    disk_threshold_percent: float = 90.0

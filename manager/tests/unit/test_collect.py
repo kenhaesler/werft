@@ -4,7 +4,8 @@ import os
 
 import pytest
 
-from werft.runner.collect import collect_outputs
+from werft.runner import collect as collect_module
+from werft.runner.collect import TreeSource, collect_outputs, collect_trees
 
 
 @pytest.fixture
@@ -186,3 +187,180 @@ def test_empty_tree_is_fine(trees):
     assert report.artifacts == []
     assert report.bytes_total == 0
     assert report.truncated is False
+
+
+def test_collect_trees_prefixes_and_merges(tmp_path):
+    a = tmp_path / "a"
+    a.mkdir()
+    (a / "x.txt").write_bytes(b"aaaa")
+    b = tmp_path / "b" / "nested"
+    b.mkdir(parents=True)
+    (b / "y.txt").write_bytes(b"bb")
+    dest = tmp_path / "dest"
+    report = collect_trees(
+        [TreeSource(str(a), "outputs"), TreeSource(str(tmp_path / "b"), "test-results")],
+        str(dest),
+    )
+    assert {c.rel_path for c in report.artifacts} == {"outputs/x.txt", "test-results/nested/y.txt"}
+    assert (dest / "outputs" / "x.txt").read_bytes() == b"aaaa"
+    assert report.bytes_total == 6 and not report.truncated
+
+
+def test_collect_trees_missing_source_is_silent(tmp_path):
+    dest = tmp_path / "dest"
+    report = collect_trees([TreeSource(str(tmp_path / "absent"), "outputs")], str(dest))
+    assert report.artifacts == [] and report.dropped == [] and not report.truncated
+
+
+def test_collect_trees_budget_spans_sources_largest_first(tmp_path):
+    a = tmp_path / "a"
+    a.mkdir()
+    (a / "big.bin").write_bytes(b"x" * 60)
+    b = tmp_path / "b"
+    b.mkdir()
+    (b / "small.bin").write_bytes(b"x" * 30)
+    report = collect_trees(
+        [TreeSource(str(a), "s1"), TreeSource(str(b), "s2")],
+        str(tmp_path / "dest"),
+        max_total_bytes=80,
+    )
+    # global largest-first drop: the 60-byte file loses regardless of source order
+    assert [c.rel_path for c in report.artifacts] == ["s2/small.bin"]
+    assert [(d.rel_path, d.reason) for d in report.dropped] == [("s1/big.bin", "total_cap")]
+    assert report.truncated
+
+
+def test_collect_trees_overwrite_is_charged_only_its_delta(tmp_path):
+    # D4: a retry re-collection of the same files must never be dropped as total_cap
+    a = tmp_path / "a"
+    a.mkdir()
+    (a / "same.bin").write_bytes(b"x" * 70)
+    dest = tmp_path / "dest"
+    first = collect_trees([TreeSource(str(a), "s1")], str(dest), max_total_bytes=80)
+    assert not first.truncated
+    again = collect_trees(
+        [TreeSource(str(a), "s1")],
+        str(dest),
+        max_total_bytes=80,
+        existing={"s1/same.bin": 70},
+    )
+    assert [c.rel_path for c in again.artifacts] == ["s1/same.bin"]
+    assert again.dropped == [] and not again.truncated
+
+
+def test_collect_trees_dropped_entries_are_prefixed_too(tmp_path):
+    """DroppedEntry rel_paths must carry the source prefix, same as artifacts."""
+    a = tmp_path / "a"
+    a.mkdir()
+    (a / "huge.bin").write_bytes(b"x" * 100)
+    dest = tmp_path / "dest"
+    report = collect_trees([TreeSource(str(a), "outputs")], str(dest), max_file_bytes=10)
+    assert report.artifacts == []
+    assert [d.rel_path for d in report.dropped] == ["outputs/huge.bin"]
+    assert [d.reason for d in report.dropped] == ["too_large"]
+
+
+def test_collect_trees_symlinked_source_root_is_dropped_not_followed(tmp_path):
+    """Three of `EVIDENCE_SOURCES`' roots are *agent-created* directories inside
+    the rw workspace, so `ln -s ../secrets .werft-artifacts` would redirect the
+    whole walk into the manager's own secrets — collected before
+    `remove_secrets` runs, into an HTTP-served store. The root is `lstat`ed
+    (never resolved), so a link is a bounded no-op that leaves a drop behind.
+    """
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    (secrets / "git_token.txt").write_bytes(b"ghp_supersecret")
+
+    root = tmp_path / "workspace" / ".werft-artifacts"
+    root.parent.mkdir(parents=True)
+    symlink_or_skip(root, secrets, directory=True)
+
+    dest = tmp_path / "dest"
+    report = collect_trees([TreeSource(str(root), "werft-artifacts")], str(dest))
+
+    assert report.artifacts == []
+    assert report.bytes_total == 0
+    assert [(d.rel_path, d.reason) for d in report.dropped] == [("werft-artifacts", "not_regular")]
+    assert not any(dest.rglob("*"))
+
+
+def test_collect_trees_source_root_that_is_a_regular_file_is_dropped(tmp_path):
+    root = tmp_path / "outputs"
+    root.write_bytes(b"not a directory")
+    dest = tmp_path / "dest"
+
+    report = collect_trees([TreeSource(str(root), "outputs")], str(dest))
+
+    assert report.artifacts == []
+    assert [(d.rel_path, d.reason) for d in report.dropped] == [("outputs", "not_regular")]
+
+
+def test_collect_trees_a_dropped_root_does_not_stop_its_siblings(tmp_path):
+    good = tmp_path / "outputs"
+    good.mkdir()
+    (good / "log.jsonl").write_bytes(b"ab")
+    bad = tmp_path / "test-results"
+    bad.write_bytes(b"x")
+
+    report = collect_trees(
+        [TreeSource(str(bad), "test-results"), TreeSource(str(good), "outputs")],
+        str(tmp_path / "dest"),
+    )
+
+    assert [c.rel_path for c in report.artifacts] == ["outputs/log.jsonl"]
+    assert [(d.rel_path, d.reason) for d in report.dropped] == [("test-results", "not_regular")]
+
+
+def test_collect_trees_hardens_every_directory_level_it_creates(tmp_path, monkeypatch):
+    """The platform-independent half of the 0700 guarantee: which paths get
+    hardened. Runs on Windows too — `_harden_dir` is where the no-op lives —
+    so the level walk this pins is not a Linux-only claim.
+    """
+    hardened: list[str] = []
+    monkeypatch.setattr(collect_module, "_harden_dir", hardened.append)
+
+    src = tmp_path / "a"
+    src.mkdir()
+    (src / "nested" / "deeper").mkdir(parents=True)
+    (src / "nested" / "deeper" / "x.txt").write_bytes(b"x")
+    dest = tmp_path / "dest"
+
+    collect_trees([TreeSource(str(src), "outputs")], str(dest))
+
+    assert sorted({os.path.relpath(p, tmp_path).replace(os.sep, "/") for p in hardened}) == [
+        "dest",
+        "dest/outputs",
+        "dest/outputs/nested",
+        "dest/outputs/nested/deeper",
+    ]
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="POSIX modes are not real on Windows (only the read-only bit)"
+)
+def test_collect_trees_creates_the_destination_0700(tmp_path):
+    """*Every* level, not just the leaf. `os.makedirs(mode=...)` passes the mode
+    to the leaf only — CPython recurses for the intermediate levels without it,
+    so `dest/outputs` (an intermediate on the way to `dest/outputs/nested`)
+    came out 0755 while `dest/outputs/nested` was correctly 0700. One
+    world-traversable step is all it takes to reach the evidence below it.
+    """
+    src = tmp_path / "a"
+    src.mkdir()
+    (src / "nested" / "deeper").mkdir(parents=True)
+    (src / "nested" / "deeper" / "x.txt").write_bytes(b"x")
+    dest = tmp_path / "dest"
+
+    collect_trees([TreeSource(str(src), "outputs")], str(dest))
+
+    assert (dest / "outputs" / "nested" / "deeper" / "x.txt").read_bytes() == b"x"
+
+    levels = [dest, *sorted(p for p in dest.rglob("*") if p.is_dir())]
+    assert [p.relative_to(tmp_path).as_posix() for p in levels] == [
+        "dest",
+        "dest/outputs",
+        "dest/outputs/nested",
+        "dest/outputs/nested/deeper",
+    ]
+    for level in levels:
+        assert level.stat().st_mode & 0o777 == 0o700, f"{level} is not 0700"

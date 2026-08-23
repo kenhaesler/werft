@@ -190,6 +190,7 @@ async def e2e(migrated_db, tmp_path, monkeypatch):
         )
         settings = Settings(
             runs_root=str(tmp_path / "runs" / tag),
+            artifacts_root=str(tmp_path / "runs" / tag),
             claude_credential_file=str(credential),
             dispatch_config_file=str(config_file),
             api_token_file=str(api_token_file),
