@@ -66,9 +66,18 @@ services:
       WERFT_EGRESS_ALLOWLIST_DIR: /srv/werft/egress/allow
       WERFT_SQUID_ACCESS_LOG: /srv/werft/egress/log/squid/access.log
       WERFT_DNS_GUARD_QUERY_LOG: /srv/werft/egress/log/dnsguard/queries.log
+    # SELinux labelling (:z) is applied ONLY to the small, shared, operator-owned
+    # mounts below and on egress-proxy/dns-guard. `/srv/werft:/srv/werft` is
+    # deliberately UNLABELLED here: `:z`/`:Z` triggers a *recursive* relabel of the
+    # whole tree at every manager start, which would stomp the per-run workspace
+    # `:Z` (private) labels the runner create-bodies apply under
+    # `/srv/werft/runs/<id>/`. install.sh instead sets a persistent default type
+    # for that tree (`semanage fcontext -t container_file_t "/srv/werft(/.*)?"` +
+    # `restorecon`), which covers the manager's access without touching per-run
+    # labels. The docker.sock mount is likewise never labelled.
     volumes:
       - /srv/werft:/srv/werft           # same-path (D7): create-body mount sources are host paths
-      - /opt/werft/config:/opt/werft/config:ro
+      - /opt/werft/config:/opt/werft/config:ro,z
     secrets: [pg_password, api_token, github_app_key, claude_credential, ntfy_token]
     depends_on:
       manager-migrate: {condition: service_completed_successfully}
@@ -104,19 +113,28 @@ services:
     image: werft-egress-proxy:local
     container_name: werft-egress-proxy   # the manager HUPs/attaches it by this name
     networks: [mgr_egress, internet]     # per-run networks attach at dispatch (D1)
-    volumes:
-      - /srv/werft/egress/allow:/etc/squid/allow:ro
-      - /srv/werft/egress/log/squid:/var/log/squid
+    volumes:                             # :z — shared SELinux label (see manager's note)
+      - /srv/werft/egress/allow:/etc/squid/allow:ro,z
+      - /srv/werft/egress/log/squid:/var/log/squid:z
     restart: unless-stopped
 
   dns-guard:
     build: {context: dns-guard}
     image: werft-dns-guard:local
     container_name: werft-dns-guard
-    networks: [mgr_egress]               # a home network; per-run networks attach at dispatch
-    volumes:
-      - /opt/werft/config/dns-allow.conf:/etc/dnsmasq.d/dns-allow.conf:ro
-      - /srv/werft/egress/log/dnsguard:/var/log/dnsguard
+    # `internet` is not optional: dnsmasq forwards allowlisted names to the
+    # upstream resolver named in dns-allow.conf (`server=/<host>/1.1.1.1`), and
+    # on `mgr_egress` alone (internal: true) that upstream is unreachable — the
+    # resolver would answer nothing but SERVFAIL/NXDOMAIN. Per-run networks
+    # attach at dispatch on top of these two.
+    networks: [mgr_egress, internet]
+    volumes:                             # :z — shared SELinux label (see manager's note)
+      # A DIRECTORY, not a single file: dnsmasq re-reads its config only on
+      # restart, and gen-dns-allow.sh replaces dns-allow.conf by `mv` (new
+      # inode) — a single-FILE bind mount pins the old inode forever. See
+      # deploy/README.md "Rolling out an egress allowlist change".
+      - /opt/werft/config/dnsmasq.d:/etc/dnsmasq.d:ro,z
+      - /srv/werft/egress/log/dnsguard:/var/log/dnsguard:z
     restart: unless-stopped
 
 networks:

@@ -1,6 +1,12 @@
 #!/bin/sh
 # Generate dns-allow.conf: one server=/domain/<upstream> line per allowed host.
 # Usage: gen-dns-allow.sh <dispatch-config.json> <out-file> [upstream]
+# The deployed <out-file> is /opt/werft/config/dnsmasq.d/dns-allow.conf — the
+# directory (not the file) is what compose bind-mounts into dns-guard at
+# /etc/dnsmasq.d, because the atomic `mv` below replaces the file's inode and a
+# single-FILE bind mount would pin the old one. After regenerating, RESTART
+# dns-guard (`docker compose ... restart dns-guard`): dnsmasq does NOT re-read
+# its config on SIGHUP (HUP only re-reads /etc/hosts and clears the cache).
 # Union across projects (per-slot DNS views are post-milestone — T9 scope note).
 set -eu
 CONF="$1"; OUT="$2"; UP="${3:-1.1.1.1}"

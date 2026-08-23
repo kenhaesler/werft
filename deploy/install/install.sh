@@ -7,14 +7,18 @@
 # (x86-64-v3, selinux enforcing, tailscale up, workspace mount) -> install
 # Docker CE (repo + docker-ce + compose plugin + container-selinux) -> write
 # /etc/docker/daemon.json {"selinux-enabled": true} (merge-preserving) and
-# restart docker -> create werft user + directories -> seed the egress
-# allowlist -> ensure /opt/werft/config/dns-allow.conf exists -> firewalld
+# restart docker -> create werft user + directories (+ SELinux fcontext and
+# restorecon on the bind-mounted trees) -> seed the egress allowlist -> ensure
+# /opt/werft/config/dnsmasq.d/dns-allow.conf exists -> firewalld
 # posture (default zone drop, tailscale0 trusted) -> install the backup /
 # restore-drill systemd units (deploy/backup/, Task 14) -> re-run the full
 # floor sweep and exit with its status (the installer's last word).
 set -u
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+# SCRIPTDIR so `shellcheck -x` resolves the source relative to this file rather
+# than to whatever directory the check happens to run from.
+# shellcheck source-path=SCRIPTDIR
 # shellcheck source=./floors.sh
 . "${SCRIPT_DIR}/floors.sh"
 
@@ -71,7 +75,10 @@ install_docker() {
     # python3 is required later by write_daemon_json's JSON merge and by
     # ensure_dns_allow_conf's call into gen-dns-allow.sh — a minimal Rocky 10
     # install does not guarantee it, so pull it in alongside Docker CE here.
-    dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin container-selinux python3
+    # policycoreutils-python-utils provides `semanage`, which apply_selinux_labels
+    # needs to set container_file_t on the bind-mounted trees.
+    dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin \
+        container-selinux python3 policycoreutils-python-utils
     systemctl enable --now docker
 }
 
@@ -104,6 +111,10 @@ create_layout() {
     fi
 
     install -d -m 0755 /opt/werft/compose /opt/werft/config /opt/werft/backups
+    # dnsmasq.d is bind-mounted into dns-guard as a DIRECTORY (compose.yaml):
+    # gen-dns-allow.sh replaces dns-allow.conf via `mv` (new inode), which a
+    # single-file bind mount would never see.
+    install -d -m 0755 /opt/werft/config/dnsmasq.d
     install -d -m 0700 /opt/werft/secrets
     install -d -m 0755 /srv/werft/runs
     install -d -m 0755 /srv/werft/egress/allow
@@ -115,6 +126,41 @@ create_layout() {
     # mounts as their in-image uid, not as the werft host user.
     chown "${SQUID_UID}:${SQUID_GID}" /srv/werft/egress/log/squid
     chown "${DNSGUARD_UID}:${DNSGUARD_GID}" /srv/werft/egress/log/dnsguard
+
+    apply_selinux_labels
+}
+
+# SELinux file labels for the bind-mounted trees. The floors mandate Enforcing
+# plus dockerd `selinux-enabled: true`, which means an unlabelled host directory
+# is simply invisible (EACCES) to a confined container — so labelling is part of
+# creating the layout, not an afterthought.
+#
+# `semanage fcontext` writes the *persistent* default type (survives relabels
+# and new files); `restorecon` applies it to what already exists. Compose's `:z`
+# on the small shared mounts covers the runtime shared-label bit; this covers
+# /srv/werft, which is deliberately NOT `:z`-mounted (a recursive relabel at
+# every manager start would stomp the per-run workspace `:Z` labels).
+apply_selinux_labels() {
+    if ! command -v semanage >/dev/null 2>&1; then
+        echo "WARN: semanage not found (policycoreutils-python-utils) — SELinux" \
+             "file contexts NOT set for /srv/werft and /opt/werft/config." \
+             "Containers WILL fail with permission-denied on their bind mounts" \
+             "under Enforcing. Install policycoreutils-python-utils and re-run." >&2
+        return 0
+    fi
+    local tree
+    for tree in "/srv/werft(/.*)?" "/opt/werft/config(/.*)?"; do
+        # -a fails when the rule already exists (idempotency): fall back to -m.
+        semanage fcontext -a -t container_file_t "$tree" 2>/dev/null \
+            || semanage fcontext -m -t container_file_t "$tree" \
+            || { echo "WARN: semanage fcontext failed for $tree" >&2; continue; }
+    done
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon -R /srv/werft /opt/werft/config \
+            || echo "WARN: restorecon failed for /srv/werft /opt/werft/config" >&2
+    else
+        echo "WARN: restorecon not found — labels written but not applied" >&2
+    fi
 }
 
 seed_egress_allow() {
@@ -146,7 +192,10 @@ ensure_dns_allow_conf() {
     command -v python3 >/dev/null 2>&1 \
         || { echo "install.sh: python3 not found — cannot generate dns-allow.conf" >&2; exit 1; }
     local gen="${SCRIPT_DIR}/../dns-guard/gen-dns-allow.sh"
-    local out="/opt/werft/config/dns-allow.conf"
+    # Inside the DIRECTORY compose bind-mounts at /etc/dnsmasq.d (see
+    # create_layout) — never a bare /opt/werft/config/dns-allow.conf, which a
+    # single-file mount would pin to a stale inode across regeneration.
+    local out="/opt/werft/config/dnsmasq.d/dns-allow.conf"
     local dispatch="/opt/werft/config/dispatch.json"
     # gen-dns-allow.sh tolerates a missing config path and emits the
     # base-only allowlist — used here to guarantee $out exists even before
