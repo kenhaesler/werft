@@ -1,4 +1,5 @@
 import asyncio
+import os
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -6,19 +7,40 @@ from typing import Any
 
 import httpx
 import pytest
+from alembic import command
+from alembic.config import Config
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import make_transient_to_detached
 from sqlalchemy.orm.attributes import instance_state
 from sqlalchemy.orm.exc import DetachedInstanceError
+from structlog.testing import capture_logs
 
 from werft.app import TransientAdminOps, _ops_factory, create_app
 from werft.config.settings import Settings
-from werft.db.models import Project
+from werft.db.models import Project, ProviderAccount
+from werft.domain.errors import PermanentError
 from werft.github.auth import ADMIN_PERMISSIONS, MANAGER_PERMISSIONS, AppAuth, InstallationToken
 from werft.github.client import GitHubUnavailable
 from werft.observe.alerts import NtfyAlertSink, NullAlertSink
+from werft.orchestrator.finalize import NullQuota
 from werft.orchestrator.loop import Orchestrator
+from werft.quota.ledger import LedgerQuota
+
+
+@pytest.fixture
+def migrated_pg_url(pg_url: str) -> str:
+    """Same migration-once-per-container recipe as
+    `tests/integration/conftest.py::migrated_db`, duplicated locally: that
+    fixture lives in `tests/integration/`'s own conftest, out of reach for
+    `tests/unit/`. `command.upgrade` is idempotent, so a second call here
+    (or from the integration suite, whichever runs first against the same
+    session-scoped `pg_url`) is a no-op."""
+    os.environ["WERFT_TEST_DATABASE_URL"] = pg_url
+    command.upgrade(Config("alembic.ini"), "head")
+    return pg_url
 
 
 async def test_healthz_reports_ok() -> None:
@@ -49,6 +71,88 @@ async def test_create_app_without_creds_boots_clean_and_healthz_still_answers() 
             resp = await client.get("/healthz")
         assert resp.status_code == 200
         assert resp.json() == {"status": "ok"}
+        assert isinstance(app.state.quota, NullQuota)
+
+
+def test_a_malformed_dispatch_config_fails_boot_loudly(tmp_path: Path) -> None:
+    """D3: at startup the operator is watching. A manager that boots on a
+    broken config parks every run at 03:00. `create_app` now parses the
+    dispatch config before the app is even constructed, so this raises
+    synchronously rather than only once the lifespan runs."""
+    broken_file = tmp_path / "dispatch.json"
+    broken_file.write_text("{not valid json")
+
+    with pytest.raises(PermanentError):
+        create_app(Settings(dispatch_config_file=str(broken_file)))
+
+
+def test_a_runs_root_that_diverges_from_artifacts_root_warns() -> None:
+    """Carried note 5: that divergence would silently send T8's collector to
+    the wrong tree. `structlog` here is unconfigured (no `ProcessorFormatter`
+    routing into stdlib `logging`), so `capture_logs` — not `caplog` — is
+    the fixture that actually observes the event."""
+    with capture_logs() as logs:
+        create_app(Settings(runs_root="/srv/a", artifacts_root="/srv/b"))
+
+    assert any(entry.get("event") == "app.runs_root_diverges_from_artifacts_root" for entry in logs)
+
+
+async def test_the_provider_account_is_upserted_when_a_ceiling_is_configured(
+    migrated_pg_url: str, tmp_path: Path
+) -> None:
+    """SPEC §7's one knob, reconciled at boot (plan decision D4): with GitHub
+    creds configured and a ceiling set, the lifespan upserts a
+    `provider_accounts` row and `app.state.quota` is a real `LedgerQuota`."""
+    key_file = tmp_path / "app-key.pem"
+    key_file.write_text(_generate_private_key_pem())
+    label = f"acct-{uuid.uuid4().hex}"
+
+    settings = Settings(
+        database_url=migrated_pg_url,
+        github_app_client_id="Iv1.test1234",
+        github_app_private_key_file=str(key_file),
+        github_api_url="https://github-api.invalid.test",
+        quota_ceiling_seconds=18000,
+        quota_account_label=label,
+    )
+    app = create_app(settings)
+
+    async with app.router.lifespan_context(app):
+        assert isinstance(app.state.quota, LedgerQuota)
+
+    engine = create_async_engine(migrated_pg_url)
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            account = (
+                await session.execute(select(ProviderAccount).where(ProviderAccount.label == label))
+            ).scalar_one()
+    finally:
+        await engine.dispose()
+
+    assert account.ceiling_seconds == 18000
+
+
+async def test_no_ceiling_means_no_account_row_at_all(migrated_pg_url: str) -> None:
+    """No invented ceilings (D4): `quota_ceiling_seconds` unset (the
+    default) means no `provider_accounts` row is ever written for this
+    label, and `app.state.quota` stays the `NullQuota` no-op."""
+    label = f"no-ceiling-{uuid.uuid4().hex}"
+    settings = Settings(database_url=migrated_pg_url, quota_account_label=label)
+    app = create_app(settings)
+
+    async with app.router.lifespan_context(app):
+        assert isinstance(app.state.quota, NullQuota)
+
+    engine = create_async_engine(migrated_pg_url)
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            rows = (
+                await session.execute(select(ProviderAccount).where(ProviderAccount.label == label))
+            ).all()
+    finally:
+        await engine.dispose()
+
+    assert rows == []
 
 
 def _generate_private_key_pem() -> str:
@@ -144,6 +248,110 @@ async def test_lifespan_publishes_the_orchestrators_own_merging_lock_on_app_stat
         assert app.state.merging_lock is built[0].merging_lock
     finally:
         await asyncio.wait_for(lifespan_cm.__aexit__(None, None, None), timeout=5)
+
+
+# -- Task 17 fix round 1 -------------------------------------------------
+
+
+async def test_dispatch_stays_dark_with_no_quota_ceiling_even_with_creds_and_config(
+    tmp_path: Path, pg_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding 1: the brief's literal three-way dispatch gate (GitHub
+    creds + `dispatch_config_file` + `claude_credential_file`) omits the
+    quota ceiling. With `quota_ceiling_seconds` at its 0 default, `quota` is
+    `NullQuota()` — and `NullQuota` implements none of
+    `lock_and_resolve`/`next_attempt_no`/`reserve`, so a dispatch plane
+    built anyway would die with `AttributeError` on its first
+    `_sweep_dispatch` tick (SPEC §7: no reservation, no claim). The ceiling
+    being unset must instead leave `dispatch=None` and log loudly — boot
+    must not fail, since an operator may simply be staging the other three
+    settings ahead of the ceiling."""
+    key_file = tmp_path / "app-key.pem"
+    key_file.write_text(_generate_private_key_pem())
+    config_file = tmp_path / "dispatch.json"
+    config_file.write_text(
+        '{"projects": {}}',
+        encoding="utf-8",
+    )
+
+    built: list[Orchestrator] = []
+    original_init = Orchestrator.__init__
+
+    def capturing_init(self: Orchestrator, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        built.append(self)
+
+    monkeypatch.setattr(Orchestrator, "__init__", capturing_init)
+
+    settings = Settings(
+        database_url=pg_url,
+        github_app_client_id="Iv1.test1234",
+        github_app_private_key_file=str(key_file),
+        github_api_url="https://github-api.invalid.test",
+        dispatch_config_file=str(config_file),
+        claude_credential_file=str(tmp_path / "claude-cred"),
+        quota_ceiling_seconds=0,
+    )
+    app = create_app(settings)
+
+    with capture_logs() as logs:
+        async with app.router.lifespan_context(app):
+            assert len(built) == 1
+            assert built[0]._dispatch is None
+
+    assert any(entry.get("event") == "app.dispatch_disabled_no_quota_ceiling" for entry in logs)
+
+
+async def test_a_negotiate_failure_still_disposes_the_engine_and_closes_http(
+    tmp_path: Path, migrated_pg_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding 2: `ensure_provider_account` and `docker.negotiate()`
+    both run before the lifespan's `try: yield`, so — pre-fix — a failure
+    there propagated straight out of `lifespan` without ever reaching the
+    `finally` chain that disposes `engine` and closes `http`/`ntfy_http`.
+    `DockerClient.negotiate` is patched to raise; the fix wraps that whole
+    startup section in its own `try/except` that closes what is already
+    open before re-raising."""
+    from sqlalchemy.ext.asyncio import AsyncEngine
+
+    from werft.runner.docker_api import DockerClient
+
+    key_file = tmp_path / "app-key.pem"
+    key_file.write_text(_generate_private_key_pem())
+    config_file = tmp_path / "dispatch.json"
+    config_file.write_text('{"projects": {}}', encoding="utf-8")
+
+    async def failing_negotiate(self: DockerClient) -> str:
+        raise RuntimeError("no docker daemon reachable")
+
+    monkeypatch.setattr(DockerClient, "negotiate", failing_negotiate)
+
+    disposed: list[bool] = []
+    original_dispose = AsyncEngine.dispose
+
+    async def spying_dispose(self: AsyncEngine, *args: Any, **kwargs: Any) -> None:
+        disposed.append(True)
+        await original_dispose(self, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncEngine, "dispose", spying_dispose)
+
+    settings = Settings(
+        database_url=migrated_pg_url,
+        github_app_client_id="Iv1.test1234",
+        github_app_private_key_file=str(key_file),
+        github_api_url="https://github-api.invalid.test",
+        dispatch_config_file=str(config_file),
+        claude_credential_file=str(tmp_path / "claude-cred"),
+        quota_ceiling_seconds=18000,
+        quota_account_label=f"acct-{uuid.uuid4().hex}",
+    )
+    app = create_app(settings)
+
+    with pytest.raises(RuntimeError, match="no docker daemon reachable"):
+        async with app.router.lifespan_context(app):
+            pass  # pragma: no cover - startup fails before `yield`
+
+    assert disposed == [True]
 
 
 async def test_default_docs_routes_are_not_served(tmp_path: Path) -> None:

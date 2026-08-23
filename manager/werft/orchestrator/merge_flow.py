@@ -366,6 +366,19 @@ async def advance_merging(
     decisions 5-6; SPEC §3.2 edges). See the module docstring for the full
     decision table and the `GitHubUnavailable` containment boundary.
     """
+    if run.status != RunStatus.MERGING.value:
+        # The durable half of the N1 race guard. Every caller (the tick sweep,
+        # the 30 s check poll, the accept route's inline kick) re-reads the row
+        # and checks it, but each of those checks is a call-site convention one
+        # future caller can forget. A run that left `merging` under a rival
+        # sweep must never be re-driven here: `_land_merged` would CAS
+        # `merged -> merged` (the trigger only validates legality on an actual
+        # status change) and blank a real `merge_commit_sha`, and the
+        # oracle-gated sha-mismatch path would attempt a merge on a run that
+        # has yet to re-earn green.
+        logger.info("merge_flow.not_merging", run_id=str(run.id), status=run.status)
+        return
+
     try:
         pr = await ops.get_pr(run.pr_number)
     except GitHubUnavailable as exc:

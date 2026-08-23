@@ -782,7 +782,9 @@ async def test_merge_success_racing_an_out_of_band_cancel_returns_cleanly_withou
     project = await seed_project(db_session, lifecycle="oracle_gated")
     item = await seed_backlog_item(db_session, project, 1)
     run = await seed_run(db_session, project, item, pr_number=101)
-    stale_view = SimpleNamespace(id=run.id, version=run.version, pr_number=run.pr_number)
+    stale_view = SimpleNamespace(
+        id=run.id, version=run.version, pr_number=run.pr_number, status=run.status
+    )
 
     canceled = await transition_run(
         db_session, run_id=run.id, expected_version=run.version, new_status=RunStatus.CANCELED
@@ -888,3 +890,34 @@ async def test_cleanup_github_unavailable_writes_no_event_so_a_later_sweep_retri
 
     assert ops.close_pr_calls == [101]  # attempted before the failing delete
     assert await cleanup_events(db_session, run.id) == []  # nothing written — safe to retry
+
+
+# -- advance_merging: durable status guard --------------------------------------
+
+
+async def test_advance_merging_is_a_noop_for_a_run_that_left_merging(db_session) -> None:
+    """Carried note 1: the N1 race class dies at the top of the handler, not at
+    three call sites. `tick_once`, `poll_checks_once` and the accept route all
+    discover `merging` rows independently; between discovery and this call the
+    row can legally leave `merging` (cancel is an edge from every non-terminal
+    status, and a rival sweep may already have merged it). Every branch below
+    assumes `merging`: the merged-out-of-band path would CAS `merged -> merged`
+    — which *wins*, because the trigger only validates legality when the status
+    actually changes — and overwrite a real `merge_commit_sha` with NULL."""
+    project = await seed_project(db_session, lifecycle="oracle_gated")
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item, status="merging")
+    await db_session.execute(
+        text("UPDATE runs SET status = 'merged', version = version + 1 WHERE id = :i"),
+        {"i": run.id},
+    )
+    await db_session.commit()
+    run = await db_session.get(Run, run.id, populate_existing=True)
+
+    ops = FakeRepoOps(prs=[make_pr(101)])
+    await advance_merging(db_session, ops, run, project, alerts=SpyAlertSink())
+
+    assert ops.get_pr_calls == []  # zero GitHub calls
+    refreshed = await fresh_run(db_session, run.id)
+    assert refreshed.status == "merged"
+    assert refreshed.merge_commit_sha is None

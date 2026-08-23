@@ -56,6 +56,17 @@ def test_task_rejects_unknown_keys():
         a_task(sneaky_flag=True)
 
 
+def test_task_argv_and_env_default_empty():
+    task = a_task()
+    assert task.argv == []
+    assert task.env == {}
+
+
+def test_task_still_rejects_unknown_keys_after_argv_and_env():
+    with pytest.raises(ValidationError):
+        a_task(argv=["claude"], env={"CI": "true"}, sneaky_flag=True)
+
+
 def test_result_rejects_unknown_keys():
     with pytest.raises(ValidationError):
         a_result(privileged=True)

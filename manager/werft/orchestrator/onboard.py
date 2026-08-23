@@ -43,6 +43,7 @@ actually keeps the row unique.
 """
 
 from sqlalchemy import and_, func, insert, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from werft.db.models import Project, ProjectEvent
@@ -67,6 +68,38 @@ def duplicate_project_message(slug: str, owner: str, repo: str) -> str:
     same 409 with the same body — one race, one answer, whichever way it is
     detected."""
     return f"project already onboarded: slug={slug!r} owner={owner!r} repo={repo!r}"
+
+
+class DuplicateProjectError(PermanentError):
+    """This slug or (owner, repo) is already onboarded.
+
+    A distinct *type* rather than a distinguishable message: the API layer's
+    409-vs-422 split used to sniff for the substring "already onboarded",
+    which made `duplicate_project_message`'s wording load-bearing for HTTP
+    semantics — one copy-edit away from turning every duplicate into a 422.
+    """
+
+
+#: The two `projects` constraints that mean "already onboarded" (Postgres
+#: default names for `slug TEXT NOT NULL UNIQUE` and `UNIQUE (github_owner,
+#: github_repo)` in `0001_spine.py`). Every *other* integrity failure on this
+#: table — `projects_slug_check`'s slug pattern, a NOT NULL — is a bad
+#: request, and answering it 409 sends the operator hunting for a project
+#: that was never created.
+_DUPLICATE_PROJECT_CONSTRAINTS: frozenset[str] = frozenset(
+    {"projects_slug_key", "projects_github_owner_github_repo_key"}
+)
+
+
+def is_duplicate_project_violation(exc: IntegrityError) -> bool:
+    """asyncpg's error carries `.sqlstate` and `.constraint_name`; SQLAlchemy
+    wraps it in `.orig` (and, depending on the driver path, one more
+    `__cause__` deep)."""
+    orig = getattr(exc, "orig", None)
+    cause = getattr(orig, "__cause__", None) or orig
+    if getattr(cause, "sqlstate", None) != "23505":
+        return False
+    return getattr(cause, "constraint_name", None) in _DUPLICATE_PROJECT_CONSTRAINTS
 
 
 async def onboard_project(
@@ -94,7 +127,7 @@ async def onboard_project(
         )
     )
     if duplicate.scalar_one_or_none() is not None:
-        raise PermanentError(duplicate_project_message(slug, owner, repo))
+        raise DuplicateProjectError(duplicate_project_message(slug, owner, repo))
 
     main_sha = await ops.get_ref_sha(main_branch)
     if main_sha is None:

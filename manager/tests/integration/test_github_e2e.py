@@ -762,6 +762,7 @@ async def test_idempotence_sweep_kill_minus_9_equivalence_at_each_github_stage(d
         pr_number=run.pr_number,
         branch_name=None,
         backlog_item_id=run.backlog_item_id,
+        status=RunStatus.MERGING.value,
     )
 
     await advance_merging(db_session, ops, stale_merging, project, alerts=alerts)
