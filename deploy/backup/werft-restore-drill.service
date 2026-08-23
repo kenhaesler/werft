@@ -1,0 +1,8 @@
+[Unit]
+Description=Werft monthly restore drill
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/werft/compose/backup/werft-restore-drill.sh

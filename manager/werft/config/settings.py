@@ -119,9 +119,28 @@ class Settings(BaseSettings):
     #: project is in hand (the `advance_failed` wake path).
     typical_reservation_seconds: int = 5400
 
+    # --- T9 egress activation (SPEC §4.5/§10) -------------------------------
+    #: 0 (default) = egress plumbing off: today's Internal-only network, no
+    #: attach, no allowlist, no proxy env — dev boxes and CI need no squid.
+    egress_slot_count: int = 0
+    #: First two /24 octets of the slot subnets (M6): slot K = {prefix}.K.0/24.
+    egress_subnet_prefix: str = "10.90"
+    #: Directory of per-slot squid dstdomain include files, shared with the
+    #: egress-proxy container by bind mount.
+    egress_allowlist_dir: str = "/srv/werft/egress/allow"
+    egress_proxy_container: str = "werft-egress-proxy"
+    dns_guard_container: str = "werft-dns-guard"
+    egress_proxy_port: int = 3128
+
     # SPEC §8 egress evidence — T9 provisions the services and sets these paths;
     # empty means "not deployed": collection is a silent no-op (plan D7).
     squid_access_log: str = ""
     dns_guard_query_log: str = ""
+
+    #: SPEC §10: secrets are file mounts, never env. When set, the ro-mounted
+    #: file's stripped contents replace the password in `database_url` at
+    #: `create_app` time (`werft.domain.db_url.apply_password_file`); empty
+    #: (the default) means `database_url` is used exactly as configured.
+    database_password_file: str = ""
     # SPEC §8: at this % usage of artifacts_root's volume, stop claiming new runs.
     disk_threshold_percent: float = 90.0

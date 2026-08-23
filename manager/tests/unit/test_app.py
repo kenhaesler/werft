@@ -97,6 +97,132 @@ def test_a_runs_root_that_diverges_from_artifacts_root_warns() -> None:
     assert any(entry.get("event") == "app.runs_root_diverges_from_artifacts_root" for entry in logs)
 
 
+def test_concurrency_above_egress_slot_count_fails_boot_loudly() -> None:
+    """A claim that can never find a free egress slot would otherwise retry
+    forever, unattended, at 03:00 — the same D3 rationale as the malformed
+    dispatch config above. The message names both settings so the operator
+    knows exactly which knob to turn."""
+    with pytest.raises(
+        PermanentError,
+        match="egress_slot_count.*max_concurrent_runs|max_concurrent_runs.*egress_slot_count",
+    ):
+        create_app(Settings(egress_slot_count=1, max_concurrent_runs=2))
+
+
+def test_concurrency_at_or_below_egress_slot_count_boots_clean() -> None:
+    """The boundary: equal counts are fine, every claim can find a slot."""
+    create_app(Settings(egress_slot_count=2, max_concurrent_runs=2))
+
+
+def test_egress_slot_count_above_the_octet_ceiling_fails_boot_loudly() -> None:
+    """A slot's subnet is `<prefix>.<slot>.0/24`, so the slot number is one
+    octet and 256 is the whole table. Past it, `_claim_slot` would walk off the
+    end and die on `egress_admin._validate_slot`'s `ValueError` mid-dispatch,
+    at 03:00 — the guard moves that to boot, where the operator is watching."""
+    with pytest.raises(PermanentError, match="egress_slot_count.*256"):
+        create_app(Settings(egress_slot_count=257, max_concurrent_runs=1))
+
+
+def test_egress_slot_count_at_the_ceiling_boots_clean() -> None:
+    """The boundary: 256 slots is exactly what 0..255 expresses."""
+    create_app(Settings(egress_slot_count=256, max_concurrent_runs=1))
+
+
+def test_egress_slots_off_ignores_concurrency_entirely() -> None:
+    """`egress_slot_count == 0` means the egress plumbing is off (SPEC
+    §4.5): no slots to run out of, so an arbitrarily high concurrency is
+    not a boot-time contradiction."""
+    create_app(Settings(egress_slot_count=0, max_concurrent_runs=100))
+
+
+def test_egress_active_with_empty_evidence_logs_warns() -> None:
+    """SPEC §8: egress active but the evidence seam (squid/dns-guard logs)
+    still dormant is legal — T9 provisions the services and sets these
+    paths later — but the operator should know at a glance."""
+    with capture_logs() as logs:
+        create_app(
+            Settings(
+                egress_slot_count=1,
+                max_concurrent_runs=1,
+                squid_access_log="",
+                dns_guard_query_log="",
+            )
+        )
+
+    assert any(entry.get("event") == "app.egress_active_evidence_seam_dormant" for entry in logs)
+
+
+def test_egress_active_with_both_evidence_logs_configured_stays_quiet() -> None:
+    with capture_logs() as logs:
+        create_app(
+            Settings(
+                egress_slot_count=1,
+                max_concurrent_runs=1,
+                squid_access_log="/srv/werft/egress/squid/access.log",
+                dns_guard_query_log="/srv/werft/egress/dns-guard/queries.log",
+            )
+        )
+
+    assert not any(
+        entry.get("event") == "app.egress_active_evidence_seam_dormant" for entry in logs
+    )
+
+
+def test_egress_slots_off_never_warns_about_evidence_logs() -> None:
+    with capture_logs() as logs:
+        create_app(Settings(egress_slot_count=0, squid_access_log="", dns_guard_query_log=""))
+
+    assert not any(
+        entry.get("event") == "app.egress_active_evidence_seam_dormant" for entry in logs
+    )
+
+
+def test_database_password_file_set_but_missing_fails_boot_loudly(tmp_path: Path) -> None:
+    """SPEC §10: a `WERFT_DATABASE_PASSWORD_FILE` mount that's set but
+    unreadable is a `PermanentError` at boot (D3), same taxonomy as the
+    malformed-dispatch-config and egress-slot guards above — not a
+    confusing failure the first time a route issues a query."""
+    missing = tmp_path / "does-not-exist"
+
+    with pytest.raises(PermanentError, match="WERFT_DATABASE_PASSWORD_FILE"):
+        create_app(
+            Settings(
+                database_url="postgresql+asyncpg://werft@postgres:5432/werft",
+                database_password_file=str(missing),
+            )
+        )
+
+
+async def test_database_password_file_unset_leaves_the_engine_url_unchanged() -> None:
+    app = create_app(Settings(database_url="postgresql+asyncpg://werft:werft@localhost:5432/werft"))
+
+    async with app.router.lifespan_context(app):
+        engine = app.state.session_factory.kw["bind"]
+        assert engine.url.render_as_string(hide_password=False) == (
+            "postgresql+asyncpg://werft:werft@localhost:5432/werft"
+        )
+
+
+async def test_database_password_file_set_splices_the_password_into_the_engine_url(
+    tmp_path: Path,
+) -> None:
+    secret = tmp_path / "pg_password"
+    secret.write_text("s3cret\n")
+    app = create_app(
+        Settings(
+            database_url="postgresql+asyncpg://werft@postgres:5432/werft",
+            database_password_file=str(secret),
+        )
+    )
+
+    async with app.router.lifespan_context(app):
+        engine = app.state.session_factory.kw["bind"]
+        assert engine.url.password == "s3cret"
+        assert engine.url.render_as_string(hide_password=False) == (
+            "postgresql+asyncpg://werft:s3cret@postgres:5432/werft"
+        )
+
+
 async def test_the_provider_account_is_upserted_when_a_ceiling_is_configured(
     migrated_pg_url: str, tmp_path: Path
 ) -> None:

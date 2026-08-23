@@ -77,7 +77,25 @@ class DieEvent:
 def _build_transport(url: str) -> tuple[httpx.AsyncBaseTransport, str]:
     if url.startswith("unix://"):
         return httpx.AsyncHTTPTransport(uds=url.removeprefix("unix://")), "http://docker"
+    if url.startswith("tcp://"):
+        return httpx.AsyncHTTPTransport(), "http://" + url.removeprefix("tcp://").rstrip("/")
     return httpx.AsyncHTTPTransport(), url.rstrip("/")
+
+
+def is_pool_overlap(exc: DockerApiError) -> bool:
+    """True when the daemon refused a network create for address-pool overlap.
+
+    Docker's own refusal is the slot lock (SPEC intent): callers claim a run
+    network by attempting create-with-subnet and treating this as "taken".
+    The daemon has been observed to answer with both `403` and `500` for this,
+    so the **status code is not the discriminator — the message is**. A bare
+    403 must not count: `docker-socket-proxy` answers 403 for every endpoint
+    its permission set denies, and treating that as "slot taken" would walk the
+    whole slot table and report "all egress slots are in use" when the real
+    fault is a misconfigured proxy — a permissions problem wearing a capacity
+    problem's clothes, at 03:00, unattended.
+    """
+    return "pool overlaps" in exc.message.lower()
 
 
 class DockerClient:
@@ -143,12 +161,23 @@ class DockerClient:
 
     # --- networks ---------------------------------------------------------
 
-    async def create_network(self, name: str) -> str:
-        """Create the run's own internal network — no route to anywhere (SPEC §4.2)."""
-        response = await self._client.post(
-            self._path("/networks/create"),
-            json={"Name": name, "Driver": "bridge", "Internal": True, "CheckDuplicate": True},
-        )
+    async def create_network(self, name: str, *, subnet: str | None = None) -> str:
+        """Create the run's own internal network — no route to anywhere (SPEC §4.2).
+
+        `Internal: True` never varies. When `subnet` is given, it is passed as
+        an explicit IPAM pool — Docker's pool-overlap refusal (`is_pool_overlap`)
+        is then the slot lock a later task's driver relies on to claim a
+        per-slot run network.
+        """
+        body: dict[str, Any] = {
+            "Name": name,
+            "Driver": "bridge",
+            "Internal": True,
+            "CheckDuplicate": True,
+        }
+        if subnet is not None:
+            body["IPAM"] = {"Driver": "default", "Config": [{"Subnet": subnet}]}
+        response = await self._client.post(self._path("/networks/create"), json=body)
         self._check(response)
         return response.json()["Id"]
 
@@ -156,6 +185,45 @@ class DockerClient:
         response = await self._client.delete(self._path(f"/networks/{quote(name_or_id, safe='')}"))
         if response.status_code == 404:
             return
+        self._check(response)
+
+    async def connect_network(
+        self, network: str, container: str, *, ipv4: str | None = None
+    ) -> None:
+        """Hot-attach a container to a network, optionally at a static IPv4 address.
+
+        Used to attach the egress-proxy/dns-guard containers to a run's network
+        after both already exist (SPEC §4.2). `ipv4` is omitted from the wire
+        body entirely when unset, letting Docker assign an address from the pool.
+        """
+        body: dict[str, Any] = {"Container": container}
+        if ipv4 is not None:
+            body["EndpointConfig"] = {"IPAMConfig": {"IPv4Address": ipv4}}
+        response = await self._client.post(
+            self._path(f"/networks/{quote(network, safe='')}/connect"), json=body
+        )
+        self._check(response)
+
+    async def disconnect_network(self, network: str, container: str, *, force: bool = True) -> None:
+        """Detach a container from a network. Idempotent like `remove_network`.
+
+        Tolerates 404 (network already gone) and a 500 whose message says the
+        container is already not connected — both mean "already in the state
+        we wanted", so teardown paths can call this without checking first.
+        """
+        response = await self._client.post(
+            self._path(f"/networks/{quote(network, safe='')}/disconnect"),
+            json={"Container": container, "Force": force},
+        )
+        if response.status_code == 404:
+            return
+        if response.status_code == 500:
+            try:
+                message = response.json().get("message", "")
+            except ValueError:
+                message = response.text
+            if "is not connected" in message.lower():
+                return
         self._check(response)
 
     async def list_networks(self) -> list[dict[str, Any]]:

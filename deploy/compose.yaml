@@ -1,0 +1,164 @@
+name: werft
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE}          # postgres:18.x-alpine@sha256:… — digest-pinned (.env)
+    networks: [internal]
+    # PG18 volume path — NEVER the pre-18 /data path (SPEC §2)
+    volumes: ["pgdata:/var/lib/postgresql"]
+    environment:
+      POSTGRES_USER: werft
+      POSTGRES_DB: werft
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+    secrets: [pg_password]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U werft -d werft"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    cpus: "2"
+    mem_limit: "4g"
+    restart: unless-stopped
+
+  manager-migrate:
+    build: {context: .., dockerfile: deploy/manager/Dockerfile}
+    image: werft-manager:local
+    command: ["uv", "run", "--no-sync", "alembic", "upgrade", "head"]
+    networks: [internal]
+    environment: &mgr_env
+      WERFT_DATABASE_URL: postgresql+asyncpg://werft@postgres:5432/werft
+      # SPEC §10: secrets are file mounts, never env — this URL template
+      # carries no password. `WERFT_DATABASE_PASSWORD_FILE` names the
+      # ro-mounted file; `manager/werft/domain/db_url.py`'s
+      # `apply_password_file` splices its stripped contents into the URL
+      # (manager: at `create_app` time; this service's `alembic` entrypoint:
+      # `werft/db/migrations/env.py`'s `_url()`) — see deploy/README.md.
+      WERFT_DATABASE_PASSWORD_FILE: /run/secrets/pg_password
+    secrets: [pg_password]
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: "no"
+
+  manager:
+    build: {context: .., dockerfile: deploy/manager/Dockerfile}
+    image: werft-manager:local
+    networks: [internal, docker-proxy-net, mgr_egress, ingress]
+    # Required-var form (SPEC §10: zero public listeners): an empty/unset
+    # TS_IP must fail loudly here — the bare-interpolation form silently
+    # collapses to `:8420:8420`, which Docker publishes on ALL interfaces.
+    ports: ["${TS_IP:?TS_IP must be set — see deploy/README.md}:8420:8420"]
+    environment:
+      <<: *mgr_env
+      HTTPS_PROXY: http://egress-proxy:3128
+      HTTP_PROXY: http://egress-proxy:3128
+      NO_PROXY: postgres,docker-socket-proxy,egress-proxy
+      WERFT_DOCKER_URL: tcp://docker-socket-proxy:2375
+      WERFT_RUNS_ROOT: /srv/werft/runs
+      WERFT_DISPATCH_CONFIG_FILE: /opt/werft/config/dispatch.json
+      WERFT_API_TOKEN_FILE: /run/secrets/api_token
+      WERFT_GITHUB_APP_CLIENT_ID: ${GITHUB_APP_CLIENT_ID}
+      WERFT_GITHUB_APP_PRIVATE_KEY_FILE: /run/secrets/github_app_key
+      WERFT_CLAUDE_CREDENTIAL_FILE: /run/secrets/claude_credential
+      WERFT_NTFY_URL: ${NTFY_URL}
+      WERFT_NTFY_TOKEN_FILE: /run/secrets/ntfy_token
+      # SPEC §7: the operator's dispatch quota ceiling, from .env so it
+      # survives Stage 2's `rsync --delete` re-stage of this tree (a value
+      # edited into this file would be reverted on the next deploy, silently
+      # taking dispatch dark again). The `:-0` default is the safe one and is
+      # deliberate: 0 means the dispatch plane never claims a run, so an
+      # unconfigured host stays dark rather than inventing a ceiling.
+      WERFT_QUOTA_CEILING_SECONDS: ${QUOTA_CEILING_SECONDS:-0}
+      WERFT_EGRESS_SLOT_COUNT: "4"
+      WERFT_EGRESS_SUBNET_PREFIX: "10.90"
+      WERFT_EGRESS_ALLOWLIST_DIR: /srv/werft/egress/allow
+      WERFT_SQUID_ACCESS_LOG: /srv/werft/egress/log/squid/access.log
+      WERFT_DNS_GUARD_QUERY_LOG: /srv/werft/egress/log/dnsguard/queries.log
+    # SELinux labelling (:z) is applied ONLY to the small, shared, operator-owned
+    # mounts below and on egress-proxy/dns-guard. `/srv/werft:/srv/werft` is
+    # deliberately UNLABELLED here: `:z`/`:Z` triggers a *recursive* relabel of the
+    # whole tree at every manager start, which would stomp the per-run workspace
+    # `:Z` (private) labels the runner create-bodies apply under
+    # `/srv/werft/runs/<id>/`. install.sh instead sets a persistent default type
+    # for that tree (`semanage fcontext -t container_file_t "/srv/werft(/.*)?"` +
+    # `restorecon`), which covers the manager's access without touching per-run
+    # labels. The docker.sock mount is likewise never labelled.
+    volumes:
+      - /srv/werft:/srv/werft           # same-path (D7): create-body mount sources are host paths
+      - /opt/werft/config:/opt/werft/config:ro,z
+    secrets: [pg_password, api_token, github_app_key, claude_credential, ntfy_token]
+    depends_on:
+      manager-migrate: {condition: service_completed_successfully}
+      docker-socket-proxy: {condition: service_started}
+      egress-proxy: {condition: service_started}
+      dns-guard: {condition: service_started}
+    cpus: "1"
+    mem_limit: "2g"
+    restart: unless-stopped
+
+  docker-socket-proxy:
+    image: ${SOCKET_PROXY_IMAGE}      # tecnativa/docker-socket-proxy@sha256:… (.env)
+    networks: [docker-proxy-net]
+    volumes: ["/var/run/docker.sock:/var/run/docker.sock:ro"]
+    environment:                       # lineage §10.1 exact set
+      CONTAINERS: "1"
+      IMAGES: "1"
+      NETWORKS: "1"
+      EVENTS: "1"
+      POST: "1"
+      DELETE: "1"
+      ALLOW_START: "1"
+      ALLOW_STOP: "1"
+      ALLOW_RESTARTS: "1"
+      EXEC: "0"
+      VOLUMES: "0"
+      BUILD: "0"
+      SYSTEM: "0"
+    restart: unless-stopped
+
+  egress-proxy:
+    build: {context: egress-proxy}
+    image: werft-egress-proxy:local
+    container_name: werft-egress-proxy   # the manager HUPs/attaches it by this name
+    networks: [mgr_egress, internet]     # per-run networks attach at dispatch (D1)
+    volumes:                             # :z — shared SELinux label (see manager's note)
+      - /srv/werft/egress/allow:/etc/squid/allow:ro,z
+      - /srv/werft/egress/log/squid:/var/log/squid:z
+    restart: unless-stopped
+
+  dns-guard:
+    build: {context: dns-guard}
+    image: werft-dns-guard:local
+    container_name: werft-dns-guard
+    # `internet` is not optional: dnsmasq forwards allowlisted names to the
+    # upstream resolver named in dns-allow.conf (`server=/<host>/1.1.1.1`), and
+    # on `mgr_egress` alone (internal: true) that upstream is unreachable — the
+    # resolver would answer nothing but SERVFAIL/NXDOMAIN. Per-run networks
+    # attach at dispatch on top of these two.
+    networks: [mgr_egress, internet]
+    volumes:                             # :z — shared SELinux label (see manager's note)
+      # A DIRECTORY, not a single file: dnsmasq re-reads its config only on
+      # restart, and gen-dns-allow.sh replaces dns-allow.conf by `mv` (new
+      # inode) — a single-FILE bind mount pins the old inode forever. See
+      # deploy/README.md "Rolling out an egress allowlist change".
+      - /opt/werft/config/dnsmasq.d:/etc/dnsmasq.d:ro,z
+      - /srv/werft/egress/log/dnsguard:/var/log/dnsguard:z
+    restart: unless-stopped
+
+networks:
+  internal: {internal: true}             # postgres ↔ manager
+  docker-proxy-net: {internal: true}     # manager ↔ socket proxy
+  mgr_egress:                            # manager ↔ egress-proxy; subnet pinned for squid's mgr_src ACL
+    internal: true
+    ipam: {config: [{subnet: 10.91.0.0/24}]}
+  ingress: {}                            # manager's published port, tailscale-IP-bound
+  internet: {}                           # egress-proxy's NAT leg
+
+volumes:
+  pgdata:
+
+secrets:
+  pg_password: {file: /opt/werft/secrets/pg_password}
+  api_token: {file: /opt/werft/secrets/api_token}
+  github_app_key: {file: /opt/werft/secrets/github_app_key}
+  claude_credential: {file: /opt/werft/secrets/claude_credential}
+  ntfy_token: {file: /opt/werft/secrets/ntfy_token}

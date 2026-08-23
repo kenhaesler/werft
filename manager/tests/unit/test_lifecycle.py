@@ -24,8 +24,8 @@ class FakeClient:
         self._stall = stall
         self._inspect_code = inspect_code
 
-    async def create_network(self, name):
-        self.calls.append(f"create_network:{name}")
+    async def create_network(self, name, *, subnet=None):
+        self.calls.append(f"create_network:{name}" + (f":{subnet}" if subnet else ""))
         return "net1"
 
     async def remove_network(self, name):
@@ -72,6 +72,7 @@ def placement(tmp_path):
         outputs_dir=str(run_dir / "outputs"),
         task_json_path=str(run_dir / "task.json"),
         secrets_dir=str(run_dir / "secrets"),
+        proxy_url="",
     )
 
 
@@ -124,10 +125,39 @@ async def test_ceiling_is_enforced_manager_side_by_killing(placement, config):
     assert "kill:c1:SIGKILL" in client.calls
 
 
+async def test_prepare_pins_the_pool_when_a_subnet_is_given(placement):
+    """The egress slot claim is a create-with-subnet; `None` is the off shape."""
+    client = FakeClient()
+    await RunnerLifecycle(client).prepare(placement, subnet="10.90.3.0/24")
+    assert client.calls == ["create_network:werft-run-1-net:10.90.3.0/24"]
+
+
 async def test_teardown_removes_container_and_network(placement):
     client = FakeClient()
     await RunnerLifecycle(client).teardown(placement, "c1")
     assert client.calls == ["remove_container:c1", "remove_network:werft-run-1-net"]
+
+
+async def test_teardown_runs_the_hook_between_the_container_and_the_network(placement):
+    """The egress detach has exactly one legal window: after the run's own
+    container is gone, before the network it is still attached to is."""
+    client = FakeClient()
+
+    async def hook() -> None:
+        client.calls.append("detach")
+
+    await RunnerLifecycle(client).teardown(placement, "c1", before_network_remove=hook)
+    assert client.calls == ["remove_container:c1", "detach", "remove_network:werft-run-1-net"]
+
+
+async def test_a_raising_hook_never_strands_the_network(placement):
+    client = FakeClient()
+
+    async def hook() -> None:
+        raise RuntimeError("the proxy container is gone")
+
+    await RunnerLifecycle(client).teardown(placement, "c1", before_network_remove=hook)
+    assert "remove_network:werft-run-1-net" in client.calls
 
 
 async def test_teardown_still_removes_the_network_when_launch_failed(placement):

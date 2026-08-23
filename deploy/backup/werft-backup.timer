@@ -1,0 +1,9 @@
+[Unit]
+Description=Nightly Werft backup timer
+
+[Timer]
+OnCalendar=*-*-* 03:30
+Persistent=true
+
+[Install]
+WantedBy=timers.target

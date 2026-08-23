@@ -55,6 +55,7 @@ from werft.db.transitions import transition_run
 from werft.domain.attempts import AttemptOutcome
 from werft.domain.runs import RunStatus
 from werft.observe.alerts import AlertSink
+from werft.orchestrator.egress_net import detach_egress
 from werft.orchestrator.evidence import collect_run_evidence
 from werft.orchestrator.finalize import advance_failed
 from werft.quota.ledger import LedgerQuota
@@ -171,6 +172,10 @@ async def reap_run_containers(deps: SweepDeps, run_id: UUID, container_id: str |
     them. `docker_api` already swallows 404/409, so anything that reaches the
     handlers here is a genuine outage.
     """
+    # The off-mode placement, deliberately: a sweep never creates a container,
+    # so the resolver and proxy this carries are never read by anything — the
+    # only egress fact this path needs is the slot, and that comes out of the
+    # surviving network's own subnets below.
     placement = placement_for(
         run_id,
         runs_root=deps.settings.runs_root,
@@ -187,6 +192,17 @@ async def reap_run_containers(deps: SweepDeps, run_id: UUID, container_id: str |
                 "sweep.cleanup_failed", run_id=str(run_id), container_id=found, error=str(exc)
             )
             ok = False
+    # Teardown parity with the driver's own `_teardown`, by construction: the
+    # same helper, in the same window — after the containers are gone, before
+    # the network is. `detach_egress` never raises and is a no-op when no slot
+    # is derivable, so the egress-off reap is unchanged.
+    await detach_egress(
+        deps.docker,
+        deps.settings,
+        network_name=placement.network_name,
+        subnets=subnets,
+        run_id=str(run_id),
+    )
     try:
         await deps.docker.remove_network(placement.network_name)
     except Exception as exc:  # noqa: BLE001 - see the docstring

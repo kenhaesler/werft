@@ -63,6 +63,21 @@ class FakeDocker:
         #: T8's evidence collection has something to stage without every test
         #: having to set it up.
         self.network_body: dict | None = {"IPAM": {"Config": [{"Subnet": "172.30.0.0/24"}]}}
+        #: Every `create_network` call as `(name, subnet)` — `subnet` is `None`
+        #: on the egress-off path, which is exactly what "unchanged when off"
+        #: means on the wire.
+        self.created_networks: list[tuple[str, str | None]] = []
+        #: Subnet -> the network holding it, so a second create of the same
+        #: subnet is refused the way a real daemon refuses it. Seed it directly
+        #: to stand in for a slot some *other* live run already holds.
+        self.held_subnets: dict[str, str] = {}
+        #: `(network, container, ipv4)` per attach/detach — the egress-proxy and
+        #: dns-guard plumbing a run's network gets and gives back.
+        self.connected: list[tuple[str, str, str | None]] = []
+        self.disconnected: list[tuple[str, str, bool]] = []
+        #: `(container, signal)` per kill, which is how the squid HUP reload is
+        #: distinguishable from the ceiling SIGKILL.
+        self.kill_signals: list[tuple[str, str]] = []
 
     def release_die(self, exit_code: int = 0) -> None:
         self.exit_code = exit_code
@@ -78,13 +93,34 @@ class FakeDocker:
         self.calls.append(name)
         self._fail_if_configured(name)
 
-    async def create_network(self, name: str) -> str:
+    async def create_network(self, name: str, *, subnet: str | None = None) -> str:
+        """Docker's own pool-overlap refusal is the slot lock, so the fake owns
+        the same rule: a subnet already held by a live network is a 403 whose
+        message the real daemon's wording matches (`is_pool_overlap`)."""
         self._guard("create_network")
+        self.created_networks.append((name, subnet))
+        if subnet is not None:
+            if subnet in self.held_subnets:
+                raise DockerApiError(403, "Pool overlaps with other one on this address space")
+            self.held_subnets[subnet] = name
         return "net-" + name
 
     async def remove_network(self, name: str) -> None:
         self.calls.append(f"remove_network:{name}")
         self._fail_if_configured("remove_network")
+        self.held_subnets = {
+            subnet: holder for subnet, holder in self.held_subnets.items() if holder != name
+        }
+
+    async def connect_network(self, network: str, container: str, *, ipv4: str | None = None):
+        self.calls.append(f"connect:{network}:{container}")
+        self._fail_if_configured("connect_network")
+        self.connected.append((network, container, ipv4))
+
+    async def disconnect_network(self, network: str, container: str, *, force: bool = True):
+        self.calls.append(f"disconnect:{network}:{container}")
+        self._fail_if_configured("disconnect_network")
+        self.disconnected.append((network, container, force))
 
     async def inspect_network(self, name: str) -> dict | None:
         self.calls.append(f"inspect_network:{name}")
@@ -120,6 +156,7 @@ class FakeDocker:
 
     async def kill_container(self, container_id: str, signal: str = "SIGKILL") -> None:
         self.calls.append(f"kill:{container_id}")
+        self.kill_signals.append((container_id, signal))
         self._fail_if_configured("kill_container")
 
     async def remove_container(self, container_id: str, *, force: bool = True) -> None:

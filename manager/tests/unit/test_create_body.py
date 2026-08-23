@@ -42,6 +42,7 @@ def placement(run_dir, **over):
         "outputs_dir": str(run_dir / "outputs"),
         "task_json_path": str(run_dir / "task.json"),
         "secrets_dir": str(run_dir / "secrets"),
+        "proxy_url": "",
     }
     return RunPlacement(**(base | over))
 
@@ -112,7 +113,7 @@ def test_cap_floor_is_the_empirically_locked_set(run_dir):
 
 def test_per_run_component_keys_are_exactly_enumerated():
     """SPEC Â§4.2: no other key may ever appear in the per-run component."""
-    assert frozenset({"NetworkMode", "Dns", "Binds", "Labels"}) == PER_RUN_KEYS
+    assert frozenset({"NetworkMode", "Dns", "Binds", "Labels", "Env"}) == PER_RUN_KEYS
 
 
 def test_delta_keys_are_exactly_enumerated():
@@ -155,6 +156,7 @@ def test_negative_assertions_on_the_final_body(run_dir):
     assert host["ReadonlyRootfs"] is False, "SPEC Â§4.2: capable box"
     assert host["NetworkMode"] != "host"
     assert all("docker.sock" not in bind for bind in host["Binds"])
+    assert "Env" not in b, "no proxy env in BASE: absent entirely when proxy_url is empty"
 
 
 def test_spec_resource_shape(run_dir):
@@ -190,6 +192,49 @@ def test_top_level_body_keys_are_exactly_enumerated(run_dir):
 
 def test_labels_carry_the_run_id_for_the_events_filter(run_dir):
     assert body(run_dir)["Labels"] == {"werft.run_id": "0198e1b2-0000-7000-8000-000000000001"}
+
+
+def test_no_proxy_url_means_no_env_key_and_base_is_untouched(run_dir):
+    """(a) proxy_url="" is the off state: `Env` is absent entirely (not an empty
+    list), and BASE byte-equality still holds."""
+    b = body(run_dir, proxy_url="")
+    assert "Env" not in b
+    host = b["HostConfig"]
+    for key, value in BASE_HOST_CONFIG.items():
+        assert host[key] == value
+
+
+def test_proxy_url_produces_exactly_the_six_env_entries(run_dir):
+    """(b) a non-empty proxy_url produces exactly the six proxy Env entries, in
+    order, and `Env` joins the per-run key enumeration."""
+    b = body(run_dir, proxy_url="http://10.90.2.2:3128")
+    assert b["Env"] == [
+        "HTTP_PROXY=http://10.90.2.2:3128",
+        "HTTPS_PROXY=http://10.90.2.2:3128",
+        "http_proxy=http://10.90.2.2:3128",
+        "https_proxy=http://10.90.2.2:3128",
+        "NO_PROXY=localhost,127.0.0.1",
+        "no_proxy=localhost,127.0.0.1",
+    ]
+    assert set(b) == {
+        "Image",
+        "Entrypoint",
+        "Cmd",
+        "WorkingDir",
+        "Labels",
+        "HostConfig",
+        "Env",
+    }
+
+
+def test_proxy_env_never_carries_a_credential_marker(run_dir):
+    """(c) mirrors `workspace._CREDENTIAL_ENV_MARKERS` intent: no proxy Env value
+    may ever contain a credential-shaped substring."""
+    b = body(run_dir, proxy_url="http://10.90.2.2:3128")
+    markers = ("TOKEN", "KEY", "SECRET", "PASSWORD")
+    for entry in b["Env"]:
+        _, _, value = entry.partition("=")
+        assert not any(marker in value.upper() for marker in markers)
 
 
 def test_image_must_be_digest_pinned(run_dir):

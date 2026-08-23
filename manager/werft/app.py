@@ -64,6 +64,8 @@ from werft.config.dispatch import DispatchConfigCache, load_dispatch_config
 from werft.config.settings import Settings
 from werft.db.engine import create_engine_from_url
 from werft.db.models import Project
+from werft.domain.db_url import apply_password_file
+from werft.domain.errors import PermanentError
 from werft.github.auth import ADMIN_PERMISSIONS, MANAGER_PERMISSIONS, AppAuth
 from werft.github.client import GitHubClient
 from werft.github.ops import RepoOps
@@ -76,6 +78,11 @@ from werft.quota.ledger import LedgerQuota
 from werft.runner.docker_api import DockerClient
 
 logger = structlog.get_logger(__name__)
+
+#: The most egress slots the addressing scheme can express: a slot's subnet is
+#: `<egress_subnet_prefix>.<slot>.0/24`, so the slot number is one octet
+#: (`egress_admin._validate_slot` accepts 0..255).
+EGRESS_SLOT_CEILING = 256
 
 #: Cap on `NtfyAlertSink.drain()` at shutdown. `NtfyAlertSink.drain()`
 #: already never raises from an individual spawned task's own exception
@@ -250,6 +257,13 @@ def _read_token_file(path: str) -> str | None:
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings or Settings()
 
+    # SPEC §10: secrets are file mounts, never env. Resolved synchronously,
+    # here, alongside the other boot-time guards below (D3: the operator is
+    # watching at startup) — a `WERFT_DATABASE_PASSWORD_FILE` that's set but
+    # unreadable is a `PermanentError` now, not a confusing failure on the
+    # engine's first query once the lifespan is already running.
+    database_url = apply_password_file(resolved.database_url, resolved.database_password_file)
+
     # Fail boot loudly on a broken dispatch config (plan decision D3): the
     # operator is watching at startup, and a manager that boots on a broken
     # file parks every run at 03:00. Mid-flight the rule is the opposite —
@@ -262,12 +276,55 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             artifacts_root=resolved.artifacts_root,
         )
 
+    # T9 boot guard (SPEC §4.5/§10): with egress plumbing on
+    # (`egress_slot_count > 0`), a claim that can never find a free slot
+    # would otherwise retry forever, unattended, at 03:00 — the same D3
+    # "operator is watching at startup" rationale as the dispatch-config
+    # check above. `egress_slot_count == 0` means the plumbing is off
+    # entirely (today's Internal-only network), so `max_concurrent_runs`
+    # is unconstrained by it.
+    # Upper bound, same D3 rationale: a slot's third octet is the slot number
+    # (`egress_admin.slot_subnet` -> `<prefix>.<slot>.0/24`, `_validate_slot`
+    # accepts 0..255), so 256 is the ceiling the addressing scheme can express.
+    # Above it, `_claim_slot` walks off the end of the octet and every claim
+    # past 255 dies on a `ValueError` mid-dispatch instead of at boot, where
+    # the operator is watching.
+    if resolved.egress_slot_count > EGRESS_SLOT_CEILING:
+        raise PermanentError(
+            f"egress_slot_count ({resolved.egress_slot_count}) exceeds the "
+            f"{EGRESS_SLOT_CEILING}-slot ceiling: a slot's subnet is "
+            "<egress_subnet_prefix>.<slot>.0/24, so slot numbers must fit in "
+            "one octet (0..255). Lower WERFT_EGRESS_SLOT_COUNT."
+        )
+    if resolved.egress_slot_count > 0 and resolved.max_concurrent_runs > resolved.egress_slot_count:
+        raise PermanentError(
+            "max_concurrent_runs "
+            f"({resolved.max_concurrent_runs}) exceeds egress_slot_count "
+            f"({resolved.egress_slot_count}): claims above the slot count "
+            "could never find a free slot and would retry forever. Raise "
+            "egress_slot_count or lower max_concurrent_runs."
+        )
+    # SPEC §8: egress active but the evidence seam (squid/dns-guard query
+    # logs) still dormant is legal — T9 provisions the services and sets
+    # these paths later (plan D7: empty means "not deployed", collection is
+    # a silent no-op) — but the operator should know at a glance rather than
+    # discover it during an incident review.
+    if resolved.egress_slot_count > 0 and (
+        not resolved.squid_access_log or not resolved.dns_guard_query_log
+    ):
+        logger.warning(
+            "app.egress_active_evidence_seam_dormant",
+            egress_slot_count=resolved.egress_slot_count,
+            squid_access_log=resolved.squid_access_log,
+            dns_guard_query_log=resolved.dns_guard_query_log,
+        )
+
     require_token = make_require_token(_read_token_file(resolved.api_token_file))
     ntfy_token = _read_token_file(resolved.ntfy_token_file)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        engine = create_engine_from_url(resolved.database_url)
+        engine = create_engine_from_url(database_url)
         app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
         # `NtfyAlertSink` is independent of GitHub config — the API layer's
