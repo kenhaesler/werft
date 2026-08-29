@@ -24,7 +24,7 @@ ledger never depends on it.
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 
 from werft.contracts.result import ResultStatus, UsageReport
 from werft.contracts.task import TaskSpec
@@ -42,13 +42,36 @@ SIGNAL_EXIT_CODES = frozenset({143, 137})
 #: Ordered: the first match wins, so the more specific patterns come first.
 STDERR_PATTERNS: tuple[tuple[str, AttemptOutcome, ResultStatus], ...] = (
     (
+        # "account" is the load-bearing noun: real-world messages route through
+        # it even when the subject is nominally the org ("organization's
+        # account has been disabled"). No account/organization/org alternation
+        # is needed — the `permission_error` branch below covers the 403 forms
+        # that phrase the refusal without ever saying "account".
         r"suspend|banned|account.*(disabled|terminated)",
         AttemptOutcome.POLICY_BLOCK,
         ResultStatus.POLICY_BLOCK,
     ),
     (
+        # An entitlement/permission refusal: the credential itself is fine but
+        # the plan or model access doesn't cover this request. Neither a retry
+        # nor a re-login fixes it — an administrator or a plan change does, the
+        # same remedy class as suspension. The API's own 403 `permission_error`
+        # type is this same refusal by another name. The prose fallback is
+        # deliberately narrow: "not authorized to use" only counts paired with
+        # a model/plan context ("not authorized to use this model: ..."), so a
+        # tool-level "not authorized to access <path>" stays agent_failure.
+        r"permission_error|not authorized to use\b.{0,40}(?:model|plan)",
+        AttemptOutcome.POLICY_BLOCK,
+        ResultStatus.POLICY_BLOCK,
+    ),
+    (
+        # `please run` is anchored to the Claude CLI's own re-auth prompt
+        # ("Please run /login" or "Please run claude login") so a *different*
+        # tool's login instructions — `please run docker login`, `gcloud auth
+        # login` — fall through to agent_failure instead of masquerading as an
+        # account credential problem.
         r"invalid api key|unauthoriz|authentication|not logged in"
-        r"|please run .?claude login|oauth token.*(expired|invalid)"
+        r"|please run\s+(?:/login|claude login)\b|oauth token.*(expired|invalid|revoked)"
         r"|credentials? (expired|invalid|not found)",
         AttemptOutcome.AUTH_FAILURE,
         ResultStatus.AUTH_FAILURE,
@@ -67,22 +90,34 @@ STDERR_PATTERNS: tuple[tuple[str, AttemptOutcome, ResultStatus], ...] = (
 #: A hard usage-limit stop delivered as envelope text. Both word orders occur in
 #: the wild — "You have hit your session limit, resets 3:45pm" and "Claude usage
 #: limit reached" — and matching only the verb-first form silently classified a
-#: quota stop as a successful run.
+#: quota stop as a successful run. The subject before the verb/noun form varies
+#: too — a product name, a window length ("5-hour limit reached"), or nothing
+#: named at all ("You've hit your limit") — so the subject is a generic short
+#: phrase rather than an enumerated word list.
 #: Anchored at the start on purpose. When the CLI stops on a limit its message
 #: *replaces* the result, so it always leads; whereas the `result` field
 #: otherwise holds the agent's own summary, and a run that legitimately worked on
 #: rate-limit handling ("added a test for when the usage limit is reached") must
-#: not park the account. Anchoring is what separates the two.
+#: not park the account. Anchoring is what separates the two — reinforced by the
+#: run-shape gate applied at the call site (see `_looks_like_a_stop`), because an
+#: agent's own summary can still happen to *open* with the same words.
 USAGE_LIMIT_TEXT = re.compile(
-    r"^(?:claude(?:\s+ai)?\s+|you\s+have\s+|you've\s+)?"
-    r"(?:(?:hit|reached|exceeded)\s+(?:your\s+)?(?:usage|session|weekly|rate)\s*limit"
-    r"|(?:usage|session|weekly|rate)\s*limit\s+(?:reached|exceeded|hit))",
+    r"^(?:[\w][\w'-]*\s+){0,3}"
+    r"(?:limit\s+(?:reached|exceeded|hit)"
+    r"|(?:hit|reached|exceeded)\s+(?:your\s+)?(?:[\w][\w'-]*\s+){0,2}limit)\b",
     re.IGNORECASE,
 )
 RESET_TEXT = re.compile(
     r"resets?\s+(?:at\s+)?(?P<when>[0-9]{1,2}:[0-9]{2}\s*(?:am|pm)?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[^\s\"]+)",
     re.IGNORECASE,
 )
+#: The CLI's pipe-and-epoch hard-stop form: "<message>|<unix timestamp>". Unlike
+#: a wall-clock hour or a naive ISO string, a unix timestamp is unambiguous —
+#: no zone to invent, no date to guess — so it is the one bare-number form that
+#: is trusted as a real instant. Accepts exactly seconds (10 digits) or
+#: milliseconds (13 digits) past the pipe — anything else (an 11- or 12-digit
+#: run) is not a shape the CLI emits and is rejected rather than guessed at.
+EPOCH_RESET = re.compile(r"\|\s*(?P<epoch>[0-9]{10}|[0-9]{13})\b")
 
 #: Envelope subtypes that are the CLI's own budget/turn caps, not provider quota.
 #: SPEC §5: "`error_max_budget_usd` maps to `agent_failure` (it is a CLI-side
@@ -126,10 +161,33 @@ def parse_stream(lines: list[str]) -> ParsedStream:
         elif (
             event.get("type") == "system"
             and event.get("subtype") == "api_retry"
-            and event.get("error") == "rate_limit"
+            and (
+                # Both spellings occur: the CLI's own shorthand and the API's
+                # error-type string passed through verbatim. And HTTP 429 is
+                # rate limiting by definition, whatever the free-text "error"
+                # says, so a bare status code is trusted on its own too.
+                event.get("error") in ("rate_limit", "rate_limit_error")
+                or event.get("error_status") == 429
+            )
         ):
             signals.append(event)
     return ParsedStream(result=result, rate_limit_signals=signals)
+
+
+def _looks_like_a_stop(envelope: dict) -> bool:
+    """Shape check for a hard limit stop, independent of the wording.
+
+    When the CLI stops on a limit, the message *replaces* the result before
+    any real work happens: the run is one or two turns and the "result" is the
+    stop notice itself, not a summary. An agent that did real work and merely
+    describes limits in its own summary runs many turns and produces a normal
+    amount of output — `num_turns` alone separates the two by a wide margin, so
+    a summary that happens to *open* with limit wording is not filed as a stop.
+    Turn count is trusted only when the CLI actually reported one; its absence
+    (e.g. a hand-built envelope in a test) must not block a real stop.
+    """
+    num_turns = envelope.get("num_turns")
+    return not (num_turns is not None and num_turns > 3)
 
 
 def _parse_reset(text: str) -> datetime | None:
@@ -139,7 +197,25 @@ def _parse_reset(text: str) -> datetime | None:
     TIMESTAMPTZ, and a value with no offset would be silently interpreted in some
     other zone — the same "invent a number" failure §7 forbids, just quieter.
     """
-    match = RESET_TEXT.search(text or "")
+    text = text or ""
+    epoch_match = EPOCH_RESET.search(text)
+    if epoch_match:
+        raw = epoch_match.group("epoch")
+        seconds = int(raw) / 1000 if len(raw) == 13 else int(raw)
+        try:
+            instant = datetime.fromtimestamp(seconds, tz=UTC)
+        except OverflowError, OSError, ValueError:
+            return None
+        # No now-relative "sane window" check here on purpose: the adapter has
+        # no clock of its own to judge one by, and admission already treats an
+        # exhausted_until that isn't in the future as non-binding
+        # (quota/admission.py: `limits.exhausted_until > now`). A stale epoch
+        # is therefore harmless — it just never gates anything — whereas
+        # inventing a window here would be a second, adapter-side clock
+        # disagreeing with the one that actually decides admission.
+        return instant
+
+    match = RESET_TEXT.search(text)
     if not match:
         return None
     try:
@@ -206,9 +282,25 @@ class ClaudeSpec:
         # 2. Account-level failures: plain stderr, no envelope. Checked BEFORE any
         #    parse handling, because filing these as parse errors silences the
         #    re-auth and quota alerts (SPEC §5).
-        for pattern, outcome, status in STDERR_PATTERNS:
-            if re.search(pattern, stderr, re.IGNORECASE):
-                return Classification(outcome, status, f"stderr match: {pattern}")
+        #    An account-level failure is defined (module docstring, rule 2) as
+        #    arriving with NO JSON envelope — so a run that actually produced a
+        #    clean, non-error success envelope contradicts that claim: the CLI
+        #    kept going, which a suspended/unauthenticated/exhausted account
+        #    cannot do. Only in that specific situation is a stderr match
+        #    treated as incidental chatter (a transient retry notice, a benign
+        #    warning) rather than a terminal account state. Any other exit —
+        #    no envelope at all, or the process actually failed (non-zero exit,
+        #    an error envelope) — keeps stderr authoritative, exactly as before.
+        clean_success = (
+            exit_code == 0
+            and envelope is not None
+            and str(envelope.get("subtype") or "") == "success"
+            and not envelope.get("is_error")
+        )
+        if not clean_success:
+            for pattern, outcome, status in STDERR_PATTERNS:
+                if re.search(pattern, stderr, re.IGNORECASE):
+                    return Classification(outcome, status, f"stderr match: {pattern}")
 
         # 3. No envelope and nothing recognisable on stderr.
         if envelope is None:
@@ -235,7 +327,7 @@ class ClaudeSpec:
         # 6. A hard usage-limit stop arrives as text in `result` (see the
         #    USAGE_LIMIT_TEXT comment for why the match is anchored).
         text = str(envelope.get("result") or "")
-        if USAGE_LIMIT_TEXT.search(text.strip()):
+        if USAGE_LIMIT_TEXT.search(text.strip()) and _looks_like_a_stop(envelope):
             return Classification(
                 AttemptOutcome.QUOTA_EXHAUSTED,
                 ResultStatus.QUOTA_EXHAUSTED,
