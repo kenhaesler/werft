@@ -24,11 +24,15 @@ from uuid import UUID, uuid4
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from sqlalchemy import func, select, update
+from fastapi.responses import StreamingResponse
+from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from werft.api.schemas import (
+    ActivityEvent,
+    ActivityResponse,
+    ActivityRun,
     ArtifactOut,
     ArtifactsResponse,
     ArtifactSummary,
@@ -163,6 +167,8 @@ def _row_to_run_summary(row) -> RunSummary:
 async def list_runs(
     status: str | None = None,
     project: str | None = None,
+    statuses: list[RunStatus] = Query(default=[]),  # noqa: B008 - FastAPI's DI pattern
+    q: str = Query(default="", max_length=200),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     session: AsyncSession = Depends(get_session),  # noqa: B008 - FastAPI's DI pattern
@@ -177,6 +183,14 @@ async def list_runs(
         base = base.where(Run.status == status)
     if project is not None:
         base = base.where(Project.slug == project)
+    if statuses:
+        base = base.where(Run.status.in_([item.value for item in statuses]))
+    if q.strip():
+        # Literal, case-insensitive search: user '%' and '_' are not SQL wildcards.
+        searchable = func.concat(
+            Project.slug, " #", BacklogItem.github_issue_number, " ", BacklogItem.title
+        )
+        base = base.where(searchable.icontains(q.strip(), autoescape=True))
 
     count_result = await session.execute(select(func.count()).select_from(base.subquery()))
     total = count_result.scalar_one()
@@ -192,6 +206,136 @@ async def list_runs(
 
     runs = [_row_to_run_summary(row) for row in rows]
     return RunsListResponse(runs=runs, total=total)
+
+
+@api_router.get("/activity", response_model=ActivityResponse)
+async def get_activity(
+    request: Request,
+    session: AsyncSession = Depends(get_session),  # noqa: B008 - FastAPI DI pattern
+) -> ActivityResponse:
+    """A compact snapshot of this manager's live work and durable run facts.
+
+    The manager portion is intentionally process-local: after a restart it
+    reports a new ``started_at`` and no invented history.  The remaining
+    fields are read from Postgres and therefore remain useful across restarts.
+    Event payloads are reduced to the three display-safe state fields rather
+    than exposing arbitrary historical JSON.
+    """
+    status_rows = (
+        await session.execute(select(Run.status, func.count()).group_by(Run.status))
+    ).all()
+    status_counts = {row.status: row.count for row in status_rows}
+
+    event_rows = (
+        await session.execute(
+            select(
+                RunEvent.id,
+                RunEvent.run_id,
+                Project.slug.label("project_slug"),
+                BacklogItem.github_issue_number.label("issue_number"),
+                BacklogItem.title.label("issue_title"),
+                Run.status.label("run_status"),
+                RunEvent.event_type,
+                RunEvent.payload,
+                RunEvent.created_at,
+            )
+            .join(Run, Run.id == RunEvent.run_id)
+            .join(Project, Project.id == Run.project_id)
+            .join(BacklogItem, BacklogItem.id == Run.backlog_item_id)
+            .order_by(RunEvent.id.desc())
+            .limit(25)
+        )
+    ).all()
+    recent_events = [
+        ActivityEvent(
+            id=row.id,
+            run_id=row.run_id,
+            project_slug=row.project_slug,
+            issue_number=row.issue_number,
+            issue_title=row.issue_title,
+            run_status=row.run_status,
+            event_type=row.event_type,
+            phase=row.payload.get("phase") if isinstance(row.payload, dict) else None,
+            from_status=row.payload.get("from") if isinstance(row.payload, dict) else None,
+            to_status=row.payload.get("to") if isinstance(row.payload, dict) else None,
+            created_at=row.created_at,
+        )
+        for row in event_rows
+    ]
+
+    open_attempt_started_at = (
+        select(RunAttempt.started_at)
+        .where(RunAttempt.run_id == Run.id, RunAttempt.ended_at.is_(None))
+        .order_by(RunAttempt.attempt_no.desc())
+        .limit(1)
+        .correlate(Run)
+        .scalar_subquery()
+    )
+    inactive_statuses = tuple(status.value for status in TERMINAL_STATUSES)
+    active_runs_limit = 200
+    active_runs_total = (
+        await session.execute(
+            select(func.count()).select_from(Run).where(Run.status.not_in(inactive_statuses))
+        )
+    ).scalar_one()
+    execution_order = case(
+        (Run.status == RunStatus.RUNNING.value, 0),
+        (Run.status == RunStatus.CLAIMED.value, 1),
+        else_=2,
+    )
+    run_rows = (
+        await session.execute(
+            select(
+                Run.id.label("run_id"),
+                Project.slug.label("project_slug"),
+                BacklogItem.github_issue_number.label("issue_number"),
+                BacklogItem.title.label("issue_title"),
+                Run.status,
+                Run.parked_reason,
+                Run.provider,
+                Run.container_id,
+                open_attempt_started_at.label("attempt_started_at"),
+                Run.last_heartbeat_at,
+                Run.lease_expires_at,
+                Run.hard_deadline_at,
+                Run.next_attempt_at,
+                Run.updated_at,
+            )
+            .join(Project, Project.id == Run.project_id)
+            .join(BacklogItem, BacklogItem.id == Run.backlog_item_id)
+            .where(Run.status.not_in(inactive_statuses))
+            .order_by(execution_order, Run.priority.desc(), Run.updated_at.desc(), Run.id.desc())
+            .limit(active_runs_limit)
+        )
+    ).all()
+    active_runs = [
+        ActivityRun(
+            run_id=row.run_id,
+            project_slug=row.project_slug,
+            issue_number=row.issue_number,
+            issue_title=row.issue_title,
+            status=row.status,
+            parked_reason=row.parked_reason,
+            provider=row.provider,
+            container_id=row.container_id,
+            attempt_started_at=row.attempt_started_at,
+            last_heartbeat_at=row.last_heartbeat_at,
+            lease_expires_at=row.lease_expires_at,
+            hard_deadline_at=row.hard_deadline_at,
+            next_attempt_at=row.next_attempt_at,
+            updated_at=row.updated_at,
+        )
+        for row in run_rows
+    ]
+    return ActivityResponse(
+        generated_at=datetime.now(UTC),
+        manager=request.app.state.activity.snapshot(),
+        status_counts=status_counts,
+        recent_events=recent_events,
+        active_runs_total=active_runs_total,
+        active_runs_limit=active_runs_limit,
+        active_runs=active_runs,
+    )
 
 
 async def _get_run_or_404(session: AsyncSession, run_id: UUID) -> None:
@@ -423,6 +567,73 @@ def _content_disposition_header(filename: str) -> str:
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
 
 
+def _artifact_byte_range(value: str | None, size: int) -> tuple[int, int] | None:
+    """Return an inclusive byte range for one RFC 7233 ``Range`` value.
+
+    ``None`` means no range was requested.  Invalid, unsatisfiable, and
+    multi-range values all raise ``ValueError``; the route deliberately
+    answers those with a 416 rather than accidentally serving the whole
+    artifact.  Keeping this parser small also ensures the dashboard's
+    bounded evidence preview cannot make the manager read a large file.
+    """
+    if value is None:
+        return None
+    if not value.startswith("bytes=") or "," in value:
+        raise ValueError("invalid byte range")
+    spec = value.removeprefix("bytes=")
+    if spec.count("-") != 1:
+        raise ValueError("invalid byte range")
+    start_text, end_text = spec.split("-", 1)
+    if not start_text and not end_text:
+        raise ValueError("invalid byte range")
+    if not start_text:
+        if not end_text.isascii() or not end_text.isdecimal():
+            raise ValueError("invalid byte range")
+        suffix_length = int(end_text)
+        if suffix_length <= 0 or size <= 0:
+            raise ValueError("unsatisfiable byte range")
+        return max(0, size - suffix_length), size - 1
+    if not start_text.isascii() or not start_text.isdecimal():
+        raise ValueError("invalid byte range")
+    start = int(start_text)
+    if start >= size:
+        raise ValueError("unsatisfiable byte range")
+    if not end_text:
+        return start, size - 1
+    if not end_text.isascii() or not end_text.isdecimal():
+        raise ValueError("invalid byte range")
+    end = int(end_text)
+    if end < start:
+        raise ValueError("unsatisfiable byte range")
+    return start, min(end, size - 1)
+
+
+def _stream_artifact(artifact_file, *, start: int, length: int):
+    """Yield an already-validated artifact file in bounded chunks."""
+    artifact_file.seek(start)
+    remaining = length
+    while remaining:
+        chunk = artifact_file.read(min(64 * 1024, remaining))
+        if not chunk:
+            return
+        remaining -= len(chunk)
+        yield chunk
+
+
+class _ArtifactStreamingResponse(StreamingResponse):
+    """A stream that owns and closes its artifact file on every ASGI exit."""
+
+    def __init__(self, content, *, artifact_file, **kwargs) -> None:
+        super().__init__(content, **kwargs)
+        self._artifact_file = artifact_file
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._artifact_file.close()
+
+
 @api_router.get("/runs/{run_id}/artifacts/{artifact_path:path}")
 async def get_artifact_file(
     run_id: UUID,
@@ -477,16 +688,55 @@ async def get_artifact_file(
     if not stat.S_ISREG(file_stat.st_mode):
         raise HTTPException(status_code=404, detail="artifact not found")
 
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        data = candidate.read_bytes()
+        fd = os.open(candidate, flags)
+        try:
+            opened_stat = os.fstat(fd)
+        except OSError:
+            os.close(fd)
+            raise
     except OSError as exc:
         raise HTTPException(status_code=404, detail="artifact not found") from exc
+    if not stat.S_ISREG(opened_stat.st_mode) or not os.path.samestat(file_stat, opened_stat):
+        os.close(fd)
+        raise HTTPException(status_code=404, detail="artifact not found")
+
+    try:
+        byte_range = _artifact_byte_range(request.headers.get("range"), opened_stat.st_size)
+    except ValueError:
+        os.close(fd)
+        return Response(
+            status_code=416,
+            headers={"Accept-Ranges": "bytes", "Content-Range": f"bytes */{opened_stat.st_size}"},
+        )
+
     filename = PurePosixPath(artifact_path).name
     headers = {
         "X-Content-Type-Options": "nosniff",
         "Content-Disposition": _content_disposition_header(filename),
+        "Accept-Ranges": "bytes",
     }
-    return Response(content=data, media_type="application/octet-stream", headers=headers)
+    if byte_range is None:
+        start, end, status_code = 0, opened_stat.st_size - 1, 200
+    else:
+        start, end = byte_range
+        status_code = 206
+        headers["Content-Range"] = f"bytes {start}-{end}/{opened_stat.st_size}"
+    length = end - start + 1
+    headers["Content-Length"] = str(length)
+    try:
+        artifact_file = os.fdopen(fd, "rb", closefd=True)
+    except OSError as exc:
+        os.close(fd)
+        raise HTTPException(status_code=404, detail="artifact not found") from exc
+    return _ArtifactStreamingResponse(
+        _stream_artifact(artifact_file, start=start, length=length),
+        artifact_file=artifact_file,
+        status_code=status_code,
+        media_type="application/octet-stream",
+        headers=headers,
+    )
 
 
 @api_router.get("/quota", response_model=QuotaResponse)
@@ -596,6 +846,14 @@ def _project_out(project: Project) -> ProjectOut:
         onboarded_at=project.onboarded_at,
         created_at=project.created_at,
     )
+
+
+@api_router.get("/projects", response_model=list[ProjectOut])
+async def list_projects(
+    session: AsyncSession = Depends(get_session),  # noqa: B008 - FastAPI DI
+) -> list[ProjectOut]:
+    projects = (await session.execute(select(Project).order_by(Project.slug))).scalars().all()
+    return [_project_out(project) for project in projects]
 
 
 async def _get_run_for_mutation(session: AsyncSession, run_id: UUID) -> Run:

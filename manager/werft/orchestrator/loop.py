@@ -119,9 +119,11 @@ from werft.domain.projects import ProjectLifecycle
 from werft.domain.runs import RunStatus
 from werft.github.auth import AppAuth
 from werft.github.ops import RepoOps
+from werft.observe.activity import ManagerActivity
 from werft.observe.alerts import AlertSink
 from werft.orchestrator.backlog import intake, sync_backlog
 from werft.orchestrator.ci_watch import advance_awaiting_ci, check_flip
+from werft.orchestrator.conversation import flush_conversation_outbox
 from werft.orchestrator.dispatch import ClaimOutcome, claim_next
 from werft.orchestrator.driver import DriverDeps, attend_run
 from werft.orchestrator.finalize import QuotaPort, advance_failed
@@ -205,6 +207,7 @@ class Orchestrator:
         self._alerts = alerts
         self._quota = quota
         self._settings = settings
+        self.activity = ManagerActivity(available=True)
         #: Guards `_advance_all_merging`'s whole body (module docstring):
         #: `tick_once` and `poll_checks_once` both call it on independent
         #: cadences that periodically coincide, and only one of them may
@@ -266,12 +269,15 @@ class Orchestrator:
         The `except` deliberately wraps the `async with` as a whole, so a
         failing COMMIT counts as a failed unit exactly like a failing body.
         """
+        activity_token = self.activity.unit_started(kind, key)
         try:
             async with self._session_factory() as session, session.begin():
                 await work(session)
         except Exception as exc:  # noqa: BLE001 - isolate every unit, by design
             logger.error("orchestrator.unit_failed", kind=kind, key=str(key), error=str(exc))
+            self.activity.unit_finished(activity_token, kind=kind, key=key, succeeded=False)
             return False
+        self.activity.unit_finished(activity_token, kind=kind, key=key, succeeded=True)
         return True
 
     # -- per-row work, one method per handler --------------------------------
@@ -405,6 +411,14 @@ class Orchestrator:
         attending immediately.
         """
         await self._sweep_disk_threshold(stop)
+        if self._settings.agent_conversations_enabled:
+            await self._run_unit(
+                "conversation_outbox",
+                "operator",
+                lambda session: flush_conversation_outbox(
+                    session, runs_root=self._settings.runs_root
+                ),
+            )
         await self._sweep_failed_wake(stop)
         await self._sweep_blocked_quota_wake(stop)
         await self._sweep_lease(stop)
@@ -624,9 +638,11 @@ class Orchestrator:
         """
         task = asyncio.create_task(attend_run(self._driver_bundle, run_id))
         self._drivers[run_id] = task
+        self.activity.set_live_driver_run_ids(self.live_driver_runs)
 
         def _done(finished: asyncio.Task[None], rid: UUID = run_id) -> None:
             self._drivers.pop(rid, None)
+            self.activity.set_live_driver_run_ids(self.live_driver_runs)
             if finished.cancelled():
                 return
             exc = finished.exception()
@@ -843,26 +859,45 @@ class Orchestrator:
         a group that waited for them would turn shutdown into "wait for the
         agent". They are drained on their own bounded budget instead, after the
         three loops have stopped starting new work (plan decision D1)."""
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(self._loop(stop, self.tick_once, self._settings.tick_seconds))
-            tg.create_task(
-                self._loop(stop, self.poll_issues_once, self._settings.issue_poll_seconds)
-            )
-            tg.create_task(
-                self._loop(stop, self.poll_checks_once, self._settings.check_poll_seconds)
-            )
-        await self.drain_drivers()
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(
+                    self._loop("tick", stop, self.tick_once, self._settings.tick_seconds)
+                )
+                tg.create_task(
+                    self._loop(
+                        "issues", stop, self.poll_issues_once, self._settings.issue_poll_seconds
+                    )
+                )
+                tg.create_task(
+                    self._loop(
+                        "checks", stop, self.poll_checks_once, self._settings.check_poll_seconds
+                    )
+                )
+            await self.drain_drivers()
+        finally:
+            self.activity.stop()
 
     async def _loop(
         self,
+        name: str,
         stop: asyncio.Event,
         work: Callable[[asyncio.Event], Awaitable[None]],
         interval_seconds: float,
     ) -> None:
-        while not stop.is_set():
-            try:
-                await work(stop)
-            except Exception as exc:  # noqa: BLE001 - one bad tick must not kill this loop
-                logger.error("orchestrator.loop_iteration_failed", error=str(exc))
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
+        worker_token = self.activity.bind_worker(name)
+        try:
+            while not stop.is_set():
+                self.activity.iteration_started(name)
+                try:
+                    await work(stop)
+                except Exception as exc:  # noqa: BLE001 - one bad tick must not kill this loop
+                    self.activity.iteration_failed(name)
+                    logger.error("orchestrator.loop_iteration_failed", error=str(exc))
+                else:
+                    self.activity.iteration_finished(name)
+                self.activity.waiting(name, interval_seconds)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
+        finally:
+            self.activity.reset_worker(worker_token)

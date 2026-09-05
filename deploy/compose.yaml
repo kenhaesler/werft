@@ -104,6 +104,8 @@ services:
       IMAGES: "1"
       NETWORKS: "1"
       EVENTS: "1"
+      INFO: "1"                     # read-only Docker host capacity for the dashboard
+      VERSION: "1"                  # API version negotiation for host inventory
       POST: "1"
       DELETE: "1"
       ALLOW_START: "1"

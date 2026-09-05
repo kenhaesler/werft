@@ -1,0 +1,115 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-05T11:59:21.179Z",
+  "title": "Design System: Werft",
+  "extensions": {
+    "shadows": [
+      {
+        "name": "dialog",
+        "value": "0 25px 100px #0009",
+        "purpose": "Modal lift."
+      },
+      {
+        "name": "toast",
+        "value": "0 10px 30px #0006",
+        "purpose": "Transient notification."
+      },
+      {
+        "name": "machine",
+        "value": "12px 26px 25px -12px #163d6b18",
+        "purpose": "Decorative server illustration."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease",
+        "value": "cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "Dialog and drawer entry."
+      },
+      {
+        "name": "control",
+        "value": "180ms",
+        "purpose": "Background, color, and border transitions."
+      },
+      {
+        "name": "dialog-entry",
+        "value": "250ms",
+        "purpose": "Modal entry."
+      },
+      {
+        "name": "inspector-entry",
+        "value": "300ms",
+        "purpose": "Side-panel entry."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "wide-min",
+        "value": "1550px"
+      },
+      {
+        "name": "compact-max",
+        "value": "1250px"
+      },
+      {
+        "name": "stack-insights-max",
+        "value": "1050px"
+      },
+      {
+        "name": "mobile-max",
+        "value": "760px"
+      },
+      {
+        "name": "single-column-max",
+        "value": "480px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Blue action with visible keyboard focus.",
+      "html": "<button class=\"primary\">Connect workspace</button>",
+      "css": ".primary { font-family: \"Geist Variable\", sans-serif; font-size: 11px; font-weight: 520; min-height: 36px; padding: 10px 13px; border: 1px solid transparent; border-radius: 7px; background: var(--accent, #2463eb); color: var(--accent-ink, #ffffff); cursor: pointer; transition: background .18s,color .18s,border-color .18s; } .primary:hover { background: #1d50c4; } .primary:focus-visible { outline: 2px solid var(--accent, #2463eb); outline-offset: 4px; } .primary:disabled { opacity: .5; cursor: not-allowed; } @media(prefers-reduced-motion:reduce) { .primary { transition: none; } }"
+    },
+    {
+      "name": "Field",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Labeled inset field.",
+      "html": "<label class=\"field\">Project repository<input placeholder=\"owner/repository\"></label>",
+      "css": ".field { display: grid; gap: 11px; font: 12px \"Geist Variable\",sans-serif; color: var(--text,#172b4d); } input { font: 13px \"Geist Variable\",sans-serif; min-width: 0; border: 1px solid #dce5f0; border-radius: 7px; background: var(--input,#edf3fb); color: var(--text,#172b4d); padding: 10px 12px; caret-color: var(--accent,#2463eb); } input::placeholder { color: #526a88; } input:focus { border-color: var(--accent,#2463eb); } input:focus-visible { outline: 2px solid var(--accent,#2463eb); outline-offset: 4px; }"
+    },
+    {
+      "name": "Navigation row",
+      "kind": "nav",
+      "description": "Current-page state in the left rail.",
+      "html": "<nav aria-label=\"Workspace\"><button aria-current=\"page\">Overview</button></nav>",
+      "css": "nav button { width: 100%; height: 42px; padding: 0 12px; border: 0; border-radius: 6px; background: transparent; color: #526a88; text-align: left; font: 12px \"Geist Variable\",sans-serif; cursor: pointer; transition: background .18s,color .18s; } nav button[aria-current] { background: #eaf2ff; color: #215bc7; } nav button:hover { background: #f1f5fb; color: #172b4d; } nav button:focus-visible { outline: 2px solid var(--accent,#2463eb); outline-offset: 4px; } @media(prefers-reduced-motion:reduce) { nav button { transition: none; } }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Agent Workstation",
+    "overview": "A clear operational workspace with white and cool gray surfaces and focused blue actions. The overview leads with human review, follows with active agents, and places activity last. VM and quota context remain visually quieter in the side column.",
+    "keyCharacteristics": [
+      "Tonal surfaces with quiet borders.",
+      "Readable Geist typography and selective blue emphasis.",
+      "Work, review, and machine capacity visible together.",
+      "Explicit state labels and keyboard access."
+    ],
+    "rules": [],
+    "dos": [
+      "Keep primary actions blue, review attention warm, and ordinary surfaces light and quiet.",
+      "Do pair color with status text, preserve visible focus, and respect reduced motion.",
+      "Do keep preview, live, stale, empty, and unavailable states explicit.",
+      "Do use real run evidence and capacity data to establish hierarchy."
+    ],
+    "donts": [
+      "Don't imply that a sample task changed live infrastructure.",
+      "Don't expose host reboot, snapshot, or shell actions without supporting APIs.",
+      "Don't replace dense supporting content with oversized decorative dashboard cards."
+    ]
+  }
+}

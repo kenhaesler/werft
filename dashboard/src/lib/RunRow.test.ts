@@ -102,7 +102,7 @@ describe('RunRow artifacts (B4/B7: no tokens in URLs — fetched, not linked)', 
     // would 401 (the endpoint requires the bearer header) and, if it ever
     // "worked", would mean a token in a URL.
     const artifactLinks = Array.from(container.querySelectorAll('a')).filter((a) =>
-      a.getAttribute('href')?.includes('/artifacts')
+      a.getAttribute('href')?.includes('/artifacts'),
     );
     expect(artifactLinks).toHaveLength(0);
   });
@@ -114,11 +114,16 @@ describe('RunRow artifacts (B4/B7: no tokens in URLs — fetched, not linked)', 
       new Response(
         JSON.stringify({
           artifacts: [
-            { path: hostilePath, bytes: 12, collected_at: '2026-01-01T00:00:00Z', content_hash: null },
+            {
+              path: hostilePath,
+              bytes: 12,
+              collected_at: '2026-01-01T00:00:00Z',
+              content_hash: null,
+            },
           ],
         }),
-        { status: 200 }
-      )
+        { status: 200 },
+      ),
     );
     vi.stubGlobal('fetch', fetchMock);
 
@@ -138,10 +143,7 @@ describe('RunRow artifacts (B4/B7: no tokens in URLs — fetched, not linked)', 
 
   it('shows a typed failure message rather than throwing when the request fails', async () => {
     const run = makeRun();
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue(new Response('', { status: 401 }))
-    );
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', { status: 401 })));
 
     const { getByText, container } = render(RunRow, { props: { run } });
 

@@ -1,0 +1,13 @@
+# Optional: compose -f compose.yaml -f compose.conversations.yaml up -d --build manager
+services:
+  manager:
+    environment:
+      WERFT_CONVERSATION_API_KEY_FILE: /run/secrets/conversation_api_key
+      WERFT_CONVERSATION_MODEL: ${CONVERSATION_MODEL:?Set a model available to your Anthropic API account}
+      # Enable only after rebuilding the configured runner with the new adapter.
+      WERFT_AGENT_CONVERSATIONS_ENABLED: ${AGENT_CONVERSATIONS_ENABLED:-false}
+    secrets:
+      - conversation_api_key
+secrets:
+  conversation_api_key:
+    file: /opt/werft/secrets/conversation_api_key

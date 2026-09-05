@@ -287,6 +287,12 @@ class DockerClient:
         self._check(response)
         return response.json()
 
+    async def host_info(self) -> dict[str, Any]:
+        """Read the daemon host's capacity, not the manager container's limits."""
+        response = await self._client.get(self._path("/info"))
+        self._check(response)
+        return response.json()
+
     async def container_disk_usage_bytes(self, container_id: str) -> int:
         """Bytes written to the container's own writable layer.
 

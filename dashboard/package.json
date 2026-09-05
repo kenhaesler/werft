@@ -3,19 +3,23 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Werft operator dashboard - single-page runs list, quota strip, review actions.",
+  "description": "Werft agent workspace with VM inventory, run evidence, review, projects, and provider quotas.",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
     "format:check": "prettier --check .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
+    "@fontsource-variable/geist": "^5.3.0",
     "svelte": "5.56.8"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
+    "@playwright/test": "^1.63.0",
     "@sveltejs/vite-plugin-svelte": "7.2.0",
     "@tailwindcss/vite": "4.3.3",
     "@testing-library/svelte": "5.4.2",
@@ -25,11 +29,12 @@
     "jsdom": "30.0.1",
     "prettier": "3.9.6",
     "prettier-plugin-svelte": "4.1.1",
+    "svelte-check": "^4.7.6",
     "svelte-eslint-parser": "1.8.0",
     "tailwindcss": "4.3.3",
     "typescript": "npm:@typescript/typescript6@6.0.2",
-    "typescript-native": "npm:typescript@7.0.2",
     "typescript-eslint": "8.66.0",
+    "typescript-native": "npm:typescript@7.0.2",
     "vite": "8.2.0",
     "vitest": "4.1.10"
   }

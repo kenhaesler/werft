@@ -184,6 +184,28 @@ async def test_happy_path_bytes_round_trip_and_headers(
     assert disposition == "attachment; filename=\"log.jsonl\"; filename*=UTF-8''log.jsonl"
 
 
+async def test_empty_artifact_full_download_is_a_valid_empty_stream(
+    db_session, token_file, auth_headers, artifacts_root
+) -> None:
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item)
+    await seed_artifact(db_session, run, path="empty.log", size=0)
+    file_path = artifact_file_path(artifacts_root, run, "empty.log")
+    file_path.parent.mkdir(parents=True)
+    file_path.write_bytes(b"")
+
+    app = make_client_app(db_session, token_file=token_file, artifacts_root=artifacts_root)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(f"/api/v1/runs/{run.id}/artifacts/empty.log", headers=auth_headers)
+
+    assert resp.status_code == 200
+    assert resp.content == b""
+    assert resp.headers["content-length"] == "0"
+    assert resp.headers["accept-ranges"] == "bytes"
+
+
 # -- DB row present, file missing --------------------------------------------
 
 
@@ -206,16 +228,16 @@ async def test_db_row_present_file_missing_is_404(
     assert resp.status_code == 404
 
 
-# -- file vanishes between the lstat check and the read ----------------------
+# -- file vanishes between the lstat check and the open ----------------------
 
 
 async def test_read_failure_between_lstat_and_read_is_404(
     db_session, token_file, auth_headers, artifacts_root, monkeypatch
 ) -> None:
     """A file removed or made unreadable in the narrow window between the
-    route's `os.lstat` check and its `read_bytes()` call must still 404,
+    route's `os.lstat` check and its safe file-descriptor open must still 404,
     like every other miss on this route — never surface an unhandled
-    `OSError` as an unrelated 500. Monkeypatches `Path.read_bytes` to
+    `OSError` as an unrelated 500. Monkeypatches `os.open` to
     simulate that race; a portable real-filesystem reproduction of a
     mid-request unlink isn't available across the platforms this suite
     runs on."""
@@ -228,10 +250,10 @@ async def test_read_failure_between_lstat_and_read_is_404(
     file_path.parent.mkdir(parents=True)
     file_path.write_bytes(b"data")
 
-    def _raise_oserror(self) -> bytes:
+    def _raise_oserror(path, flags) -> int:
         raise OSError("simulated race: file vanished after lstat")
 
-    monkeypatch.setattr(Path, "read_bytes", _raise_oserror)
+    monkeypatch.setattr(os, "open", _raise_oserror)
 
     app = make_client_app(db_session, token_file=token_file, artifacts_root=artifacts_root)
     transport = ASGITransport(app=app)
@@ -239,6 +261,62 @@ async def test_read_failure_between_lstat_and_read_is_404(
         resp = await client.get(f"/api/v1/runs/{run.id}/artifacts/log.jsonl", headers=auth_headers)
 
     assert resp.status_code == 404
+
+
+# -- bounded single-range reads ----------------------------------------------
+
+
+async def test_artifact_download_honors_single_byte_range(
+    db_session, token_file, auth_headers, artifacts_root
+) -> None:
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item)
+    content = b"0123456789"
+    await seed_artifact(db_session, run, path="large.log", size=len(content))
+    file_path = artifact_file_path(artifacts_root, run, "large.log")
+    file_path.parent.mkdir(parents=True)
+    file_path.write_bytes(content)
+
+    app = make_client_app(db_session, token_file=token_file, artifacts_root=artifacts_root)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(
+            f"/api/v1/runs/{run.id}/artifacts/large.log",
+            headers=auth_headers | {"Range": "bytes=2-5"},
+        )
+
+    assert resp.status_code == 206
+    assert resp.content == b"2345"
+    assert resp.headers["accept-ranges"] == "bytes"
+    assert resp.headers["content-range"] == "bytes 2-5/10"
+    assert resp.headers["content-length"] == "4"
+
+
+@pytest.mark.parametrize("range_header", ["bytes=20-30", "bytes=5-2", "bytes=0-1,4-5", "items=0-1"])
+async def test_artifact_download_rejects_invalid_or_unsatisfiable_ranges(
+    db_session, token_file, auth_headers, artifacts_root, range_header
+) -> None:
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 1)
+    run = await seed_run(db_session, project, item)
+    content = b"0123456789"
+    await seed_artifact(db_session, run, path="log.jsonl", size=len(content))
+    file_path = artifact_file_path(artifacts_root, run, "log.jsonl")
+    file_path.parent.mkdir(parents=True)
+    file_path.write_bytes(content)
+
+    app = make_client_app(db_session, token_file=token_file, artifacts_root=artifacts_root)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(
+            f"/api/v1/runs/{run.id}/artifacts/log.jsonl",
+            headers=auth_headers | {"Range": range_header},
+        )
+
+    assert resp.status_code == 416
+    assert resp.headers["accept-ranges"] == "bytes"
+    assert resp.headers["content-range"] == "bytes */10"
 
 
 # -- traversal path as a DB row itself ---------------------------------------

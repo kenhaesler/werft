@@ -22,6 +22,7 @@ from werft_adapter import (
     EXIT_RESULT_SERIALIZATION_FAILURE,
 )
 from werft_adapter.atomic import write_json_atomic
+from werft_adapter.conversation import ConversationInput
 from werft_adapter.process import reap_until_echild, start_in_own_process_group, tree_kill
 from werft_adapter.redact import Redactor
 
@@ -62,6 +63,7 @@ def run_cli(
     ceiling_seconds: float,
     secrets: list[str] | None = None,
     cwd: str = WORKSPACE,
+    conversation: dict | None = None,
 ) -> tuple[int, str]:
     """Run the CLI, tee a redacted transcript, return (exit code, stderr tail).
 
@@ -78,7 +80,7 @@ def run_cli(
     stderr_tail: deque[str] = deque(maxlen=50)
 
     try:
-        process = start_in_own_process_group(argv, env, cwd)
+        process = start_in_own_process_group(argv, env, cwd, input_pipe=conversation is not None)
     except OSError as exc:
         return EXIT_CLI_UNSTARTABLE, f"could not start {argv[0]!r} in {cwd!r}: {exc}"
 
@@ -96,12 +98,18 @@ def run_cli(
             tree_kill(process)
 
     threading.Thread(target=watchdog, daemon=True).start()
+    bridge = None
 
     try:
+        if conversation is not None:
+            bridge = ConversationInput(process, redact=redact, **conversation)
+            bridge.start()
         with open(log_path, "a", encoding="utf-8") as log:
             for line in process.stdout or ():
                 log.write(redact(line))
                 log.flush()
+                if bridge:
+                    bridge.on_line(line)
         exit_code = process.wait()
         finished.set()
         stderr_thread.join(timeout=5)
@@ -109,6 +117,8 @@ def run_cli(
     finally:
         finished.set()
         tree_kill(process)
+        if bridge:
+            bridge.close()
         reap_until_echild()
 
 
@@ -135,12 +145,24 @@ def main(argv: list[str] | None = None) -> int:
     env = dict(os.environ)
     env.update(task.get("env") or {})
 
+    conversation = None
+    if task.get("conversation_enabled"):
+        with open("/run/secrets/prompt.md", encoding="utf-8") as prompt_file:
+            prompt = prompt_file.read()
+        conversation = {
+            "prompt": prompt,
+            "attempt": task["attempt_no"],
+            "outputs": OUTPUTS_DIR,
+            "inbox": "/run/secrets/operator_messages.json",
+        }
+
     exit_code, stderr_tail = run_cli(
         cli_argv,
         env,
         log_path=os.path.join(OUTPUTS_DIR, "log.jsonl"),
         ceiling_seconds=float(task.get("timeout_seconds", 5400)),
         secrets=_read_secrets(env),
+        conversation=conversation,
     )
 
     ended = datetime.now(UTC)

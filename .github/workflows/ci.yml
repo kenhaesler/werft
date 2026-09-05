@@ -76,8 +76,11 @@ jobs:
           cache-dependency-path: dashboard/package-lock.json
       - run: npm ci
       - run: npx eslint .
+      - run: npm run check
       - run: npx vitest run
       - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
 
   deploy:
     name: deploy

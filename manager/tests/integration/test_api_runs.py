@@ -33,6 +33,146 @@ from werft.config.settings import Settings
 from werft.db.models import Artifact, BacklogItem, Project, ProviderAccount, Run
 from werft.db.transitions import transition_run
 from werft.domain.runs import RunStatus
+from werft.observe.activity import ManagerActivity
+
+
+async def test_session_and_capability_endpoints_use_auth_and_actual_run_state(
+    db_session, token_file, auth_headers, tmp_path
+) -> None:
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 501)
+    run = await seed_run(db_session, project, item, status="running")
+    await seed_attempt(db_session, run, attempt_no=7)
+    app = make_client_app(db_session, token_file=token_file)
+    app.state.settings = Settings(runs_root=str(tmp_path))
+    app.state.activity = ManagerActivity(available=True)
+    app.state.activity.set_live_driver_run_ids({run.id})
+    log_path = tmp_path / str(run.id) / "outputs" / "log.jsonl"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_bytes(b"first line\n")
+    endpoints = [
+        "/api/v1/capabilities",
+        f"/api/v1/projects/{project.id}/events",
+        f"/api/v1/runs/{run.id}/runtime",
+        f"/api/v1/runs/{run.id}/log",
+        "/api/v1/events",
+    ]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for endpoint in endpoints:
+            assert (await client.get(endpoint)).status_code == 401
+            response = await client.get(endpoint, headers=auth_headers)
+            assert response.status_code == 200, response.text
+        runtime = (await client.get(endpoints[2], headers=auth_headers)).json()
+        assert runtime["attended"] is True
+        assert runtime["attempt_no"] == 7
+        assert runtime["run"]["status"] == "running"
+        initial = (await client.get(endpoints[3], headers=auth_headers)).json()
+        assert initial["content"] == "first line\n"
+        with log_path.open("ab") as handle:
+            handle.write(b"second line\n")
+        appended = await client.get(
+            endpoints[3],
+            headers=auth_headers,
+            params={"offset": initial["next_offset"], "generation": initial["generation"]},
+        )
+        assert appended.json()["content"] == "second line\n"
+        assert appended.json()["reset"] is False
+        assert (
+            await client.get(endpoints[3] + "?offset=-1", headers=auth_headers)
+        ).status_code == 422
+        missing = f"/api/v1/runs/{uuid.uuid4()}/runtime"
+        assert (await client.get(missing, headers=auth_headers)).status_code == 404
+        caps = (await client.get(endpoints[0], headers=auth_headers)).json()
+        assert caps["dispatch"][0]["project"] == project.slug
+        assert caps["dispatch"][0]["configured"] is False
+
+
+async def test_filtered_search_finds_older_runs_beyond_first_page(
+    db_session, token_file, auth_headers
+) -> None:
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 900, title="Fix 100% important review")
+    target = await seed_run(
+        db_session, project, item, status="awaiting_review", created_offset_seconds=10000
+    )
+    await db_session.execute(
+        text(
+            "INSERT INTO backlog_items (project_id, github_issue_number, title, "
+            "github_updated_at) SELECT :p, n, 'Unrelated task', now() "
+            "FROM generate_series(1, 205) AS n"
+        ),
+        {"p": project.id},
+    )
+    await db_session.execute(
+        text(
+            "INSERT INTO runs (project_id, backlog_item_id) "
+            "SELECT project_id, id FROM backlog_items "
+            "WHERE project_id = :p AND github_issue_number < 900"
+        ),
+        {"p": project.id},
+    )
+    await db_session.commit()
+    app = make_client_app(db_session, token_file=token_file)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        first = await client.get("/api/v1/runs?limit=200", headers=auth_headers)
+        assert str(target.id) not in {row["id"] for row in first.json()["runs"]}
+        found = await client.get(
+            "/api/v1/runs",
+            headers=auth_headers,
+            params=[
+                ("statuses", "awaiting_review"),
+                ("statuses", "parked"),
+                ("project", project.slug),
+                ("q", "100%"),
+                ("limit", "8"),
+            ],
+        )
+        assert found.status_code == 200
+        assert found.json()["total"] == 1
+        assert found.json()["runs"][0]["id"] == str(target.id)
+        issue = await client.get("/api/v1/runs?q=%23900", headers=auth_headers)
+        assert issue.json()["total"] == 1
+        invalid = await client.get("/api/v1/runs?statuses=invalid", headers=auth_headers)
+        assert invalid.status_code == 422
+
+
+async def test_event_history_pages_and_searches_durable_records(
+    db_session, token_file, auth_headers
+) -> None:
+    project = await seed_project(db_session)
+    item = await seed_backlog_item(db_session, project, 502)
+    run = await seed_run(db_session, project, item)
+    for index in range(30):
+        await db_session.execute(
+            text(
+                "INSERT INTO run_events (run_id, event_type, payload) "
+                "VALUES (:run, 'transition', CAST(:payload AS jsonb))"
+            ),
+            {
+                "run": run.id,
+                "payload": json.dumps(
+                    {
+                        "from": "queued",
+                        "to": "running",
+                        "step": index,
+                        "message": "100% complete" if index == 0 else "milestone",
+                    }
+                ),
+            },
+        )
+    await db_session.commit()
+    app = make_client_app(db_session, token_file=token_file)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        page = await client.get("/api/v1/events?limit=6&offset=24", headers=auth_headers)
+        assert page.status_code == 200
+        assert page.json()["total"] == 31  # Includes the database's initial run-created event.
+        assert [event["payload"]["step"] for event in page.json()["events"]] == [5, 4, 3, 2, 1, 0]
+        found = await client.get(
+            "/api/v1/events", headers=auth_headers, params={"q": "100%", "project": project.slug}
+        )
+        assert found.json()["total"] == 1
+        assert found.json()["events"][0]["to_status"] == "running"
+
 
 # -- seeding ------------------------------------------------------------
 
@@ -284,6 +424,92 @@ def token_file(tmp_path) -> str:
 @pytest.fixture
 def auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {TOKEN}"}
+
+
+async def test_list_projects_includes_repositories_without_runs(
+    db_session, token_file, auth_headers
+) -> None:
+    first = await seed_project(db_session, owner="operator", repo="alpha")
+    second = await seed_project(db_session, owner="operator", repo="beta")
+    app = make_client_app(db_session, token_file=token_file)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        unauthorized = await client.get("/api/v1/projects")
+        response = await client.get("/api/v1/projects", headers=auth_headers)
+    assert unauthorized.status_code == 401
+    assert response.status_code == 200
+    projects = response.json()
+    assert [p["slug"] for p in projects] == sorted([first.slug, second.slug])
+    assert {p["repo"] for p in projects} == {"alpha", "beta"}
+    assert all(p["owner"] == "operator" for p in projects)
+    assert all(p["lifecycle"] == "bootstrap" for p in projects)
+
+
+async def test_activity_endpoint_combines_safe_manager_and_run_observations(
+    db_session, token_file, auth_headers
+) -> None:
+    project = await seed_project(db_session)
+    queued_item = await seed_backlog_item(db_session, project, 1, title="queued work")
+    running_item = await seed_backlog_item(db_session, project, 2, title="running work")
+    parked_item = await seed_backlog_item(db_session, project, 3, title="parked work")
+    queued = await seed_run(db_session, project, queued_item, status="queued")
+    running = await seed_run(db_session, project, running_item, status="running")
+    parked = await seed_run(
+        db_session,
+        project,
+        parked_item,
+        status="parked",
+        parked_reason="review_rejected",
+    )
+    await seed_attempt(db_session, running, ended=False)
+    await db_session.execute(
+        text(
+            "UPDATE runs SET provider = 'claude', container_id = 'c1', "
+            "last_heartbeat_at = now(), lease_expires_at = now() + interval '1 minute', "
+            "hard_deadline_at = now() + interval '1 hour' WHERE id = :id"
+        ),
+        {"id": running.id},
+    )
+    await db_session.execute(
+        text(
+            "INSERT INTO run_events (run_id, event_type, payload) "
+            'VALUES (:id, \'dispatch\', \'{"phase": "container_started", '
+            '"secret": "must_not_escape"}\'::jsonb)'
+        ),
+        {"id": running.id},
+    )
+    await db_session.commit()
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        unauthorized = await client.get("/api/v1/activity")
+        response = await client.get("/api/v1/activity", headers=auth_headers)
+
+    assert unauthorized.status_code == 401
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {
+        "generated_at",
+        "manager",
+        "status_counts",
+        "recent_events",
+        "active_runs_total",
+        "active_runs_limit",
+        "active_runs",
+    }
+    assert body["manager"]["available"] is False
+    assert body["manager"]["unavailable_reason"] == "manager_not_started"
+    assert body["status_counts"] == {"queued": 1, "running": 1, "parked": 1}
+    assert body["active_runs_total"] == 3
+    assert body["active_runs_limit"] == 200
+    active = {row["run_id"]: row for row in body["active_runs"]}
+    assert set(active) == {str(queued.id), str(running.id), str(parked.id)}
+    assert active[str(running.id)]["attempt_started_at"] is not None
+    assert active[str(running.id)]["container_id"] == "c1"
+    assert active[str(parked.id)]["parked_reason"] == "review_rejected"
+    event = next(row for row in body["recent_events"] if row["run_id"] == str(running.id))
+    assert event["phase"] == "container_started"
+    assert "secret" not in event
 
 
 # -- shape, ordering, latest_outcome, pr_url ------------------------------

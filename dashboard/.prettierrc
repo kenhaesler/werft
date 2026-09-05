@@ -1,6 +1,7 @@
 {
   "plugins": ["prettier-plugin-svelte"],
   "singleQuote": true,
+  "endOfLine": "auto",
   "printWidth": 100,
   "overrides": [
     {

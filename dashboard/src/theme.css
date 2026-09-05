@@ -1,0 +1,415 @@
+/* Semantic roles are remapped here so each theme keeps its own deliberate contrast. */
+:root {
+  --surface-raised: #ffffff;
+  --surface-input: #edf3fb;
+  --accent-hover: #1d50c4;
+  --accent-soft: #eaf2ff;
+  --accent-border: #c5d9fb;
+  --text-strong: #172b4d;
+  --text-subtle: #526a88;
+  --text-control: #344d70;
+  --warning-soft: #fff6e9;
+  --warning-border: #e5cda9;
+  --danger: #a34434;
+  --danger-soft: #fff0ec;
+  --dialog-backdrop: #020815bb;
+  --shadow: #163d6b18;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --canvas: #10131d;
+  --sidebar: #141824;
+  --panel: #191e2c;
+  --surface-raised: #202636;
+  --surface-input: #171c29;
+  --panel-hover: #242c40;
+  --border: #30394e;
+  --text: #edf1ff;
+  --text-strong: #f7f8ff;
+  --text-control: #d6dff5;
+  --muted: #a8b4cc;
+  --text-subtle: #91a0bd;
+  --dim: #8491aa;
+  --accent: #8ca9ff;
+  --accent-hover: #b2c4ff;
+  --accent-ink: #0d1220;
+  --accent-soft: #202b4a;
+  --accent-border: #40598d;
+  --amber: #f2bb72;
+  --warning-soft: #362919;
+  --warning-border: #74542a;
+  --danger: #ffad9f;
+  --danger-soft: #3b2428;
+  --dialog-backdrop: #05070dcc;
+  --shadow: #00000066;
+}
+
+/* Shared app surfaces: shell, panels, fields, inspectors, dialogs, and Talk. */
+:root[data-theme='dark'] body,
+:root[data-theme='dark'] .workspace-main,
+:root[data-theme='dark'] .page-content,
+:root[data-theme='dark'] .talk-workspace {
+  background: var(--canvas);
+  color: var(--text);
+}
+:root[data-theme='dark'] .topbar {
+  background: var(--panel);
+  color: var(--text);
+}
+:root[data-theme='dark'] .sidebar,
+:root[data-theme='dark'] .app-dialog,
+:root[data-theme='dark'] .inspector-dialog,
+:root[data-theme='dark'] .canvas-inspector,
+:root[data-theme='dark'] .resource-link,
+:root[data-theme='dark'] .conversation-shell,
+:root[data-theme='dark'] .conversation-message,
+:root[data-theme='dark'] .message-composer,
+:root[data-theme='dark'] .capabilities,
+:root[data-theme='dark'] .project-controls,
+:root[data-theme='dark'] .result-summary,
+:root[data-theme='dark'] .evidence-group,
+:root[data-theme='dark'] .live-session,
+:root[data-theme='dark'] .run-progress {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border);
+}
+:root[data-theme='dark'] .workspace-switch,
+:root[data-theme='dark'] .workspace-avatar,
+:root[data-theme='dark'] .profile-avatar,
+:root[data-theme='dark'] .topbar-avatar,
+:root[data-theme='dark'] .button,
+:root[data-theme='dark'] .button.subtle,
+:root[data-theme='dark'] .dialog-form input,
+:root[data-theme='dark'] .dialog-form select,
+:root[data-theme='dark'] .dialog-form textarea,
+:root[data-theme='dark'] input,
+:root[data-theme='dark'] select,
+:root[data-theme='dark'] textarea,
+:root[data-theme='dark'] .command-input,
+:root[data-theme='dark'] .event-payload pre,
+:root[data-theme='dark'] .artifact code {
+  background: var(--surface-input);
+  color: var(--text-control);
+  border-color: var(--border);
+}
+:root[data-theme='dark'] .button:hover,
+:root[data-theme='dark'] .icon-button:hover,
+:root[data-theme='dark'] .nav-item:hover,
+:root[data-theme='dark'] .resource-link:hover,
+:root[data-theme='dark'] .conversation-message:hover {
+  background: var(--panel-hover);
+  border-color: var(--accent-border);
+}
+:root[data-theme='dark'] .button.primary,
+:root[data-theme='dark'] .preview-banner button {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+:root[data-theme='dark'] .button.primary:hover,
+:root[data-theme='dark'] .preview-banner button:hover {
+  background: var(--accent-hover);
+}
+:root[data-theme='dark'] .nav-item.active,
+:root[data-theme='dark'] .filter-tabs button.active,
+:root[data-theme='dark'] .conversation-role,
+:root[data-theme='dark'] .timeline-point,
+:root[data-theme='dark'] .task-current {
+  background: var(--accent-soft);
+  color: var(--text);
+  border-color: var(--accent-border);
+}
+:root[data-theme='dark'] .filter-tabs button.active,
+:root[data-theme='dark'] .tabs > button.active,
+:root[data-theme='dark'] .text-button,
+:root[data-theme='dark'] .conversation-role {
+  color: var(--accent);
+}
+:root[data-theme='dark'] .tabs > button.active {
+  border-bottom-color: var(--accent);
+}
+:root[data-theme='dark'] .button.danger {
+  background: var(--danger-soft);
+  color: var(--danger);
+  border-color: var(--warning-border);
+}
+:root[data-theme='dark'] .status.pending,
+:root[data-theme='dark'] .signal-warning,
+:root[data-theme='dark'] .warning,
+:root[data-theme='dark'] .conversation-warning {
+  background: var(--warning-soft);
+  color: var(--amber);
+  border-color: var(--warning-border);
+}
+:root[data-theme='dark'] .dialog-backdrop,
+:root[data-theme='dark'] .app-dialog::backdrop,
+:root[data-theme='dark'] .inspector-dialog::backdrop {
+  background: var(--dialog-backdrop);
+}
+:root[data-theme='dark'] .sidebar .brand,
+:root[data-theme='dark'] .page-heading h1,
+:root[data-theme='dark'] .page-heading h2,
+:root[data-theme='dark'] .settings-row strong,
+:root[data-theme='dark'] .inspector-body h2,
+:root[data-theme='dark'] .inspector-body h3,
+:root[data-theme='dark'] .artifact strong,
+:root[data-theme='dark'] .event-title {
+  color: var(--text-strong);
+}
+:root[data-theme='dark'] .breadcrumbs > svg,
+:root[data-theme='dark'] kbd {
+  color: var(--text-subtle);
+  border-color: var(--border);
+}
+:root[data-theme='dark'] .preview-banner {
+  background: var(--surface-input);
+  color: var(--text-control);
+  border-color: var(--border);
+}
+:root[data-theme='dark'] .sidebar .brand,
+:root[data-theme='dark'] .nav-item,
+:root[data-theme='dark'] .nav-count,
+:root[data-theme='dark'] .workspace-switch,
+:root[data-theme='dark'] .workspace-avatar,
+:root[data-theme='dark'] .profile-avatar,
+:root[data-theme='dark'] .topbar-avatar,
+:root[data-theme='dark'] .connection-state,
+:root[data-theme='dark'] .preview-banner strong,
+:root[data-theme='dark'] .preview-banner .preview-description,
+:root[data-theme='dark'] .page-heading h1 > span,
+:root[data-theme='dark'] .workspace-summary strong,
+:root[data-theme='dark'] .agent-card h3,
+:root[data-theme='dark'] .run-task strong {
+  color: var(--text);
+}
+:root[data-theme='dark'] .workspace-switch,
+:root[data-theme='dark'] .workspace-avatar,
+:root[data-theme='dark'] .profile-avatar,
+:root[data-theme='dark'] .topbar-avatar,
+:root[data-theme='dark'] .nav-count,
+:root[data-theme='dark'] .live-dot,
+:root[data-theme='dark'] .nav-dot {
+  background: var(--surface-input);
+  border-color: var(--border);
+}
+
+/* Page-specific panels retain the same elevation and reading contrast. */
+:root[data-theme='dark'] .settings-section,
+:root[data-theme='dark'] .machine-page-grid > .machine-panel,
+:root[data-theme='dark'] .quota-page-grid .quota-panel,
+:root[data-theme='dark'] .agent-card,
+:root[data-theme='dark'] .review-callout,
+:root[data-theme='dark'] .active-empty,
+:root[data-theme='dark'] .toast,
+:root[data-theme='dark'] .command-dialog {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border);
+}
+:root[data-theme='dark'] .machine-page-grid .machine-visual,
+:root[data-theme='dark'] .agent-avatar,
+:root[data-theme='dark'] .review-callout-icon,
+:root[data-theme='dark'] .capacity-track,
+:root[data-theme='dark'] .quota-track,
+:root[data-theme='dark'] .lifecycle,
+:root[data-theme='dark'] .count-label {
+  background: var(--surface-input);
+  border-color: var(--border);
+}
+:root[data-theme='dark'] .settings-section h2,
+:root[data-theme='dark'] .settings-row strong,
+:root[data-theme='dark'] .machine-identity h3,
+:root[data-theme='dark'] .machine-specs strong,
+:root[data-theme='dark'] .policy-item h3,
+:root[data-theme='dark'] .quota-explainer dt,
+:root[data-theme='dark'] .section-heading h2,
+:root[data-theme='dark'] .review-callout strong,
+:root[data-theme='dark'] .run-task strong {
+  color: var(--text-strong);
+}
+:root[data-theme='dark'] .machine-identity p,
+:root[data-theme='dark'] .machine-specs > div,
+:root[data-theme='dark'] .machine-note,
+:root[data-theme='dark'] .policy-item p,
+:root[data-theme='dark'] .quota-explainer dd,
+:root[data-theme='dark'] .quota-explainer > p,
+:root[data-theme='dark'] .review-callout small,
+:root[data-theme='dark'] .agent-card > p,
+:root[data-theme='dark'] .agent-stage,
+:root[data-theme='dark'] .project-info,
+:root[data-theme='dark'] .container-row > svg {
+  color: var(--muted);
+}
+:root[data-theme='dark'] .review-link {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+:root[data-theme='dark'] .status-awaiting_ci,
+:root[data-theme='dark'] .status-awaiting_review,
+:root[data-theme='dark'] .status-blocked_quota {
+  color: var(--amber);
+}
+
+/* Inspector metadata and navigation remain legible against its dark panel. */
+:root[data-theme='dark'] .inspector-heading > span,
+:root[data-theme='dark'] .inspector-meta,
+:root[data-theme='dark'] .branch-line,
+:root[data-theme='dark'] .detail-facts span,
+:root[data-theme='dark'] .tabs > button,
+:root[data-theme='dark'] .tabs > button span,
+:root[data-theme='dark'] .timeline-title small,
+:root[data-theme='dark'] .timeline-event p,
+:root[data-theme='dark'] .section-description,
+:root[data-theme='dark'] .artifact-row small,
+:root[data-theme='dark'] .attempt-row small,
+:root[data-theme='dark'] .attempt-row > span:last-child,
+:root[data-theme='dark'] .inspector-actions > small,
+:root[data-theme='dark'] .statusbar,
+:root[data-theme='dark'] .quota-headroom,
+:root[data-theme='dark'] .quota-legend {
+  color: var(--muted);
+}
+:root[data-theme='dark'] .inspector-heading,
+:root[data-theme='dark'] .tabs,
+:root[data-theme='dark'] .detail-facts,
+:root[data-theme='dark'] .artifact-row,
+:root[data-theme='dark'] .attempt-row,
+:root[data-theme='dark'] .inspector-actions {
+  border-color: var(--border);
+}
+:root[data-theme='dark'] .inspector-meta .status,
+:root[data-theme='dark'] .tabs > button.active,
+:root[data-theme='dark'] .timeline-point,
+:root[data-theme='dark'] .assignment-signal {
+  color: var(--accent);
+}
+:root[data-theme='dark'] .tabs > button.active {
+  border-bottom-color: var(--accent);
+}
+:root[data-theme='dark'] .inspector-body h2,
+:root[data-theme='dark'] .detail-facts strong,
+:root[data-theme='dark'] .timeline-title strong,
+:root[data-theme='dark'] .artifact-row,
+:root[data-theme='dark'] .attempt-number,
+:root[data-theme='dark'] .quota-headroom strong {
+  color: var(--text);
+}
+:root[data-theme='dark'] .timeline-point,
+:root[data-theme='dark'] pre,
+:root[data-theme='dark'] .attempt-number {
+  background: var(--surface-input);
+  border-color: var(--border);
+}
+:root[data-theme='dark'] .statusbar,
+:root[data-theme='dark'] .command-footer {
+  background: var(--surface-input);
+  border-color: var(--border);
+}
+
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-raised);
+  color: var(--text-control);
+}
+.theme-toggle:hover {
+  background: var(--panel-hover);
+  color: var(--accent);
+  border-color: var(--accent-border);
+}
+
+.canvas-main {
+  view-transition-name: werft-workspace;
+}
+::view-transition-old(werft-workspace) {
+  animation: werft-workspace-out 260ms ease-out both;
+}
+::view-transition-new(werft-workspace) {
+  animation: werft-workspace-in 260ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@keyframes werft-workspace-out {
+  to {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+}
+@keyframes werft-workspace-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-old(werft-workspace),
+  ::view-transition-new(werft-workspace) {
+    animation: none;
+  }
+}
+@media (max-width: 600px) {
+  .canvas-inspector .tabs,
+  .inspector-dialog .tabs {
+    flex-wrap: wrap;
+    overflow: visible;
+    row-gap: 0;
+    column-gap: 14px;
+  }
+  .canvas-inspector .tabs > button,
+  .inspector-dialog .tabs > button {
+    min-height: 42px;
+  }
+}
+
+:root[data-theme='dark'] .capacity-heading,
+:root[data-theme='dark'] .capacity-heading strong,
+:root[data-theme='dark'] .capacity-heading strong span,
+:root[data-theme='dark'] .tiny-label,
+:root[data-theme='dark'] .settings-row > .status {
+  color: var(--muted);
+}
+:root[data-theme='dark'] .status-running {
+  color: var(--accent);
+}
+:root[data-theme='dark'] .motion-toggle {
+  color: var(--text);
+  background: var(--panel);
+}
+/* Translucent chrome sits above the scene; dense reading surfaces stay opaque. */
+.project-canvas .canvas-viewport {
+  background-image: radial-gradient(
+    ellipse at 48% 12%,
+    color-mix(in srgb, var(--accent) 10%, transparent),
+    transparent 65%
+  );
+}
+.project-canvas .fleet-hub,
+.project-canvas .project-keel {
+  background: color-mix(in srgb, var(--panel) 87%, transparent);
+  backdrop-filter: blur(24px) saturate(125%);
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--border));
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 10%, transparent),
+    0 12px 36px -20px var(--shadow);
+}
+.project-canvas .fleet-hub:hover {
+  border-color: var(--accent);
+}
+.talk-workspace {
+  padding-top: 8px;
+}
+@supports not (backdrop-filter: blur(1px)) {
+  .project-canvas .fleet-hub,
+  .project-canvas .project-keel {
+    background: var(--panel);
+  }
+}

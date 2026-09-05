@@ -118,6 +118,80 @@ class ArtifactsResponse(BaseModel):
     artifacts: list[ArtifactOut]
 
 
+class ActivityOperation(BaseModel):
+    kind: str
+    key: str
+
+
+class ActivityWorker(BaseModel):
+    state: Literal["idle", "running", "waiting", "error"]
+    current_operation: ActivityOperation | None
+    last_started_at: datetime | None
+    last_completed_at: datetime | None
+    last_error_at: datetime | None
+    waiting_until: datetime | None
+
+
+class RecentOperation(BaseModel):
+    worker: str
+    kind: str
+    key: str
+    outcome: Literal["succeeded", "failed"]
+    started_at: datetime
+    completed_at: datetime
+    duration_ms: int
+
+
+class ManagerActivityOut(BaseModel):
+    available: bool
+    unavailable_reason: str | None
+    started_at: datetime | None
+    workers: dict[str, ActivityWorker]
+    recent_operations: list[RecentOperation]
+    live_driver_run_ids: list[UUID]
+
+
+class ActivityEvent(BaseModel):
+    id: int
+    run_id: UUID
+    project_slug: str
+    issue_number: int
+    issue_title: str
+    run_status: str
+    event_type: str
+    phase: str | None
+    from_status: str | None
+    to_status: str | None
+    created_at: datetime
+
+
+class ActivityRun(BaseModel):
+    run_id: UUID
+    project_slug: str
+    issue_number: int
+    issue_title: str
+    status: str
+    parked_reason: str | None
+    provider: str | None
+    container_id: str | None
+    attempt_started_at: datetime | None
+    last_heartbeat_at: datetime | None
+    lease_expires_at: datetime | None
+    hard_deadline_at: datetime | None
+    next_attempt_at: datetime
+    updated_at: datetime
+
+
+class ActivityResponse(BaseModel):
+    generated_at: datetime
+    manager: ManagerActivityOut
+    status_counts: dict[str, int]
+    recent_events: list[ActivityEvent]
+    active_runs_total: int
+    active_runs_limit: int
+    active_runs: list[ActivityRun]
+
+
 class OnboardRequest(BaseModel):
     """`POST /api/v1/projects/onboard`'s body (SPEC §6.3) — the closed set
     of fields `onboard_project` needs; main/unattended branch names stay at

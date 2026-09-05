@@ -59,7 +59,12 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from werft.api.auth import make_require_token
+from werft.api.capabilities import capabilities_router
+from werft.api.conversations import conversations_router
+from werft.api.history import history_router
 from werft.api.routes import api_router, healthz_router
+from werft.api.session import session_router
+from werft.api.system import system_router
 from werft.config.dispatch import DispatchConfigCache, load_dispatch_config
 from werft.config.settings import Settings
 from werft.db.engine import create_engine_from_url
@@ -69,6 +74,7 @@ from werft.domain.errors import PermanentError
 from werft.github.auth import ADMIN_PERMISSIONS, MANAGER_PERMISSIONS, AppAuth
 from werft.github.client import GitHubClient
 from werft.github.ops import RepoOps
+from werft.observe.activity import ManagerActivity
 from werft.observe.alerts import NtfyAlertSink, NullAlertSink
 from werft.orchestrator.finalize import NullQuota, QuotaPort
 from werft.orchestrator.loop import DispatchServices, Orchestrator
@@ -350,6 +356,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # orchestrator, and no orchestrator exists here — but the cancel
             # route still needs a port to call `release` on.
             app.state.quota = NullQuota()
+            app.state.activity = ManagerActivity.unavailable("github_not_configured")
             try:
                 yield
             finally:
@@ -474,6 +481,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # lock set in `create_app` below is only ever the one the kick
             # takes when no orchestrator exists to contend with it.
             app.state.merging_lock = orchestrator.merging_lock
+            app.state.activity = orchestrator.activity
         except Exception:
             # Same close order the normal teardown below uses
             # (ntfy -> http -> docker -> engine), just without the bounded
@@ -550,6 +558,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.ops_for = None
     app.state.admin_ops_for = None
     app.state.alerts = NullAlertSink()
+    app.state.activity = ManagerActivity.unavailable("manager_not_started")
     # Same reasoning as `alerts` above: the cancel route (api/routes.py)
     # reads `request.app.state.quota` unconditionally, including in tests
     # that never enter `lifespan_context`. Both lifespan branches overwrite
@@ -570,8 +579,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # tests that override `get_session` and never enter `lifespan_context`
     # (test_api_runs.py's style) still need a well-defined value.
     app.state.artifacts_root = resolved.artifacts_root
+    app.state.settings = resolved
+    app.state.docker_url = resolved.docker_url
+    app.state.max_concurrent_runs = resolved.max_concurrent_runs
     app.include_router(healthz_router)
     app.include_router(api_router, prefix="/api/v1", dependencies=[Depends(require_token)])
+    app.include_router(system_router, prefix="/api/v1", dependencies=[Depends(require_token)])
+    app.include_router(capabilities_router, prefix="/api/v1", dependencies=[Depends(require_token)])
+    app.include_router(session_router, prefix="/api/v1", dependencies=[Depends(require_token)])
+    app.include_router(
+        conversations_router, prefix="/api/v1", dependencies=[Depends(require_token)]
+    )
+    app.include_router(history_router, prefix="/api/v1", dependencies=[Depends(require_token)])
 
     # B7: the built dashboard is served, conditionally, at `/ui` —
     # `StaticFiles` requires its directory to exist at construction time

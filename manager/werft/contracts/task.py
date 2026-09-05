@@ -49,3 +49,5 @@ class TaskSpec(BaseModel):
     #: has no `Env` key, and the adapter redacts these values out of the
     #: retained transcript by exact match.
     env: dict[str, str] = Field(default_factory=dict)
+    conversation_enabled: bool = False
+    attempt_no: int = Field(default=0, ge=0)
