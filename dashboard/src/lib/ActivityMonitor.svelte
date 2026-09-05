@@ -1,9 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import Icon from './Icon.svelte';
+  import EventHistory from './EventHistory.svelte';
   import {
     activityStages,
-    eventLabel,
     humanize,
     nextCheck,
     timeAgo,
@@ -35,25 +35,7 @@
   let now = $state(Date.now());
   let view = $state<'tasks' | 'events' | 'backend'>('tasks');
   let pageIndex = $state(0);
-  let eventPage = $state(0);
-  let eventSearch = $state('');
   const pageSize = 6;
-  let events = $derived(
-    (data?.recent_events ?? []).filter((event) =>
-      `${event.issue_title} ${event.project_slug} ${event.issue_number} ${eventLabel(event)}`
-        .toLowerCase()
-        .includes(eventSearch.trim().toLowerCase()),
-    ),
-  );
-  let eventLastPage = $derived(Math.max(0, Math.ceil(events.length / pageSize) - 1));
-  let currentEventPage = $derived(Math.min(eventPage, eventLastPage));
-  let visibleEvents = $derived(
-    events.slice(currentEventPage * pageSize, (currentEventPage + 1) * pageSize),
-  );
-  $effect(() => {
-    void eventSearch;
-    eventPage = 0;
-  });
   let selection = $state<string | null>(null);
   let stage = $derived(selection ?? (compact ? 'sessions' : 'all'));
   let workerErrors = $derived(
@@ -176,8 +158,7 @@
         ><Icon name="agent" size={18} />Tasks<span>{data?.active_runs_total ?? '—'}</span></button
       >
       <button aria-pressed={view === 'events'} onclick={() => (view = 'events')}
-        ><Icon name="activity" size={18} />Events<span>{data?.recent_events.length ?? '—'}</span
-        ></button
+        ><Icon name="activity" size={18} />Events{#if demo}<span>Sample</span>{/if}</button
       >
       <button aria-pressed={view === 'backend'} onclick={() => (view = 'backend')}
         ><Icon name="cpu" size={18} />Backend{#if workerErrors}<span class="view-error"
@@ -441,60 +422,7 @@
       {/if}
     {/if}
     {#if !compact && view === 'events'}
-      <div class="event-toolbar">
-        <label class="event-search"
-          ><Icon name="search" size={17} /><input
-            aria-label="Search recorded events"
-            placeholder="Search tasks, projects, or changes"
-            bind:value={eventSearch}
-          /></label
-        ><span>Latest {data.recent_events.length} recorded events</span>
-      </div>
-      <div class="event-columns" aria-hidden="true">
-        <span>Time</span><span>Task</span><span>Change</span>
-      </div>
-      <ol class="activity-event-list">
-        {#each visibleEvents as event (event.id)}<li>
-            <button onclick={() => inspect(event.run_id)} disabled={!!inspecting}>
-              <time datetime={event.created_at} title={new Date(event.created_at).toLocaleString()}
-                >{new Date(event.created_at).toLocaleTimeString([], {
-                  hour: '2-digit',
-                  minute: '2-digit',
-                  second: '2-digit',
-                })}</time
-              >
-              <span
-                ><strong>{event.issue_title}</strong><small
-                  >{event.project_slug} · #{event.issue_number}</small
-                ></span
-              >
-              <span class="event-change">{eventLabel(event)}</span>
-            </button>
-          </li>{:else}<li class="activity-empty">
-            {eventSearch ? 'No recorded events match this search.' : 'No recorded task events yet.'}
-          </li>{/each}
-      </ol>
-      {#if events.length > pageSize}<div class="activity-pagination" aria-label="Event pages">
-          <span
-            >{currentEventPage * pageSize + 1}–{Math.min(
-              (currentEventPage + 1) * pageSize,
-              events.length,
-            )} of {events.length} matching events</span
-          >
-          <div>
-            <button
-              class="button"
-              aria-label="Previous events"
-              disabled={currentEventPage === 0}
-              onclick={() => (eventPage = currentEventPage - 1)}>Previous</button
-            ><button
-              class="button"
-              aria-label="Next events"
-              disabled={currentEventPage >= eventLastPage}
-              onclick={() => (eventPage = currentEventPage + 1)}>Next</button
-            >
-          </div>
-        </div>{/if}
+      <EventHistory {demo} events={data.recent_events} ontask={inspect} />
     {/if}
   {:else if !error}<div class="activity-empty">
       <span class="spinner"></span>Waiting for the first activity snapshot…
@@ -824,44 +752,6 @@
   .worker dl {
     margin: 0 0 14px;
   }
-  .activity-event-list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-  }
-  .activity-event-list li {
-    border-bottom: 1px solid var(--border);
-  }
-  .event-dot {
-    display: none;
-  }
-  .activity-event-list button {
-    display: flex;
-    justify-content: space-between;
-    gap: 20px;
-    width: 100%;
-    padding: 15px 0;
-    border: 0;
-    background: none;
-    text-align: left;
-  }
-  .activity-event-list button:hover {
-    background: #f5f8fe;
-  }
-  .activity-event-list button > span {
-    display: grid;
-    gap: 5px;
-  }
-  .activity-event-list strong {
-    font-size: 14px;
-    font-weight: 550;
-  }
-  .activity-event-list small {
-    font-size: 13px;
-    color: var(--muted);
-    line-height: 1.5;
-    overflow-wrap: anywhere;
-  }
   time {
     color: var(--muted);
     font-size: 13px;
@@ -1105,50 +995,6 @@
     min-height: 40px;
     font-size: 13px;
   }
-  .event-toolbar {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 20px;
-    margin: 20px 0;
-    font-size: 13px;
-    color: var(--muted);
-  }
-  .event-search {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex: 1;
-    max-width: 420px;
-    padding: 0 12px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-  }
-  .event-search input {
-    border: 0;
-    background: transparent;
-    padding: 12px 0;
-    width: 100%;
-    font-size: 14px;
-    outline-offset: 4px;
-  }
-  .event-columns,
-  .activity-event-list button {
-    display: grid;
-    grid-template-columns: 90px minmax(0, 1fr) minmax(150px, 0.4fr);
-    gap: 24px;
-    align-items: center;
-  }
-  .event-columns {
-    font-size: 13px;
-    color: var(--muted);
-    padding: 12px 0;
-    border-bottom: 1px solid var(--border);
-  }
-  .activity-event-list button > .event-change {
-    font-size: 14px;
-    color: var(--accent);
-  }
   @media (max-width: 760px) {
     .activity-views {
       gap: 0;
@@ -1166,32 +1012,6 @@
     }
     .activity-views button span {
       font-size: 12px;
-    }
-    .event-toolbar {
-      flex-wrap: wrap;
-      gap: 10px;
-    }
-    .event-search {
-      flex-basis: 100%;
-    }
-    .event-columns {
-      display: none;
-    }
-    .activity-event-list button {
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 8px;
-    }
-    .activity-event-list button > span:first-of-type {
-      grid-row: 1;
-      grid-column: 1 / -1;
-    }
-    .activity-event-list button > time {
-      grid-row: 2;
-      grid-column: 2;
-    }
-    .activity-event-list button > .event-change {
-      grid-row: 2;
-      grid-column: 1;
     }
     .activity-pagination {
       flex-wrap: wrap;

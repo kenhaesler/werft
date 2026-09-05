@@ -19,8 +19,8 @@ export const runExplanation: Record<
   running: {
     title: 'Agent session in progress',
     description:
-      'The backend reports an active execution attempt. Individual commands and edits are not streamed here.',
-    next: 'Wait for the agent result. Werft then evaluates the result and any required checks or review.',
+      'The backend reports an active execution attempt. Open Session for retained raw agent output when it is available.',
+    next: 'Review Session output or wait for the agent result. Werft then evaluates the result and any required checks or review.',
   },
   awaiting_ci: {
     title: 'Waiting for automated checks',
@@ -83,14 +83,8 @@ export function milestoneTitle(event: RunDetail['events'][number]): string {
   if (typeof event.payload.phase === 'string' && phases[event.payload.phase])
     return phases[event.payload.phase];
   return eventLabel({
-    ...event,
-    run_id: '',
-    project_slug: '',
-    issue_number: 0,
-    issue_title: '',
-    run_status: 'queued',
+    event_type: event.event_type,
     phase: typeof event.payload.phase === 'string' ? event.payload.phase : null,
-    from_status: typeof event.payload.from_status === 'string' ? event.payload.from_status : null,
     to_status:
       typeof event.payload.to === 'string'
         ? event.payload.to

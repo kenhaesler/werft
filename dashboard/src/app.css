@@ -1753,6 +1753,9 @@ dialog::backdrop {
   margin: 25px 0;
 }
 .tabs > button {
+  transition:
+    color 120ms ease,
+    background-color 120ms ease;
   border: 0;
   border-bottom: 2px solid transparent;
   background: transparent;
@@ -3025,4 +3028,20 @@ pre {
   .timeline-title {
     flex-wrap: wrap;
   }
+}
+
+.project-entry {
+  flex-wrap: wrap;
+}
+.project-entry > .project-controls {
+  flex-basis: 100%;
+}
+.query-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.query-pagination .button {
+  min-height: 44px;
+  font-size: 14px;
 }

@@ -58,7 +58,9 @@ export function waitReason(run: ActivityRun, attended: boolean): string {
       return statusLabels[run.status];
   }
 }
-export function eventLabel(event: ActivitySnapshot['recent_events'][number]): string {
+export function eventLabel(
+  event: Pick<ActivitySnapshot['recent_events'][number], 'to_status' | 'phase' | 'event_type'>,
+): string {
   if (event.to_status)
     return statusLabels[event.to_status as RunStatus] ?? humanize(event.to_status);
   const phases: Record<string, string> = {

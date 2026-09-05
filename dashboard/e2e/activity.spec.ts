@@ -34,6 +34,11 @@ test('keeps many parallel sessions readable and exposes runtime details on deman
   await page.route('**/api/v1/**', (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith('/activity')) return route.fulfill({ json: data });
+    if (
+      path.endsWith('/runs') &&
+      new URL(route.request().url()).searchParams.get('status') === 'awaiting_review'
+    )
+      return route.fulfill({ json: { runs: [], total: 0 } });
     if (path.endsWith('/quota')) return route.fulfill({ json: { accounts: [] } });
     if (path.endsWith('/projects')) return route.fulfill({ json: [] });
     if (path.endsWith('/system')) return route.fulfill({ status: 503, json: {} });
@@ -231,7 +236,7 @@ async function connect(page: Page) {
     .getByRole('dialog')
     .getByRole('button', { name: 'Connect manager', exact: true })
     .click();
-  await expect(page.getByText('Loaded task stays visible')).toBeVisible();
+  await expect(page.getByText('Loaded task stays visible', { exact: true }).first()).toBeVisible();
   await page
     .getByRole('navigation', { name: 'Main navigation' })
     .getByRole('button', { name: 'Activity' })
@@ -250,6 +255,33 @@ test('shows authenticated backend activity, global stages, workers, and event in
     if (request.headers().authorization !== 'Bearer activity-token')
       return route.fulfill({ status: 401, json: { detail: 'unauthorized' } });
     if (path.endsWith('/activity')) return route.fulfill({ json: snapshot() });
+    if (path.endsWith('/events')) {
+      const query = new URL(request.url()).searchParams.get('q') ?? '';
+      if (query === 'no matching event') return route.fulfill({ json: { total: 0, events: [] } });
+      if (query === 'audit')
+        return route.fulfill({
+          json: {
+            total: 1,
+            events: [
+              {
+                id: 77,
+                run_id: 'event-only-run',
+                project_slug: 'platform',
+                issue_number: 44,
+                issue_title: 'Inspect a run absent from the loaded list',
+                run_status: 'failed',
+                event_type: 'audit_recorded',
+                phase: 'review',
+                from_status: null,
+                to_status: null,
+                created_at: now(),
+                payload: { reason: 'audit' },
+              },
+            ],
+          },
+        });
+      return route.fulfill({ json: { total: 0, events: [] } });
+    }
     if (path.endsWith('/quota')) return route.fulfill({ json: { accounts: [] } });
     if (path.endsWith('/projects')) return route.fulfill({ json: [] });
     if (path.endsWith('/system')) return route.fulfill({ json: { containers: [] } });
@@ -313,10 +345,17 @@ test('shows authenticated backend activity, global stages, workers, and event in
 
   await monitor.getByRole('button', { name: /Events/ }).click();
   await expect(monitor.locator('.worker')).toHaveCount(0);
-  await monitor.getByRole('textbox', { name: 'Search recorded events' }).fill('no matching event');
+  const eventSearch = monitor.getByRole('textbox', { name: 'Search event history' });
+  await eventSearch.fill('no matching event');
+  await monitor.getByRole('button', { name: 'Search', exact: true }).click();
   await expect(monitor.getByText('No recorded events match this search.')).toBeVisible();
-  await monitor.getByRole('textbox', { name: 'Search recorded events' }).fill('audit');
-  await monitor.getByRole('button', { name: /Inspect a run absent from the loaded list/ }).click();
+  await eventSearch.fill('audit');
+  await monitor.getByRole('button', { name: 'Search', exact: true }).click();
+  const matchingEvent = monitor
+    .locator('.event-history-list li')
+    .filter({ hasText: 'Inspect a run absent from the loaded list' });
+  await matchingEvent.locator('summary').click();
+  await matchingEvent.getByRole('button', { name: 'Open task' }).click();
   const inspector = page.getByRole('dialog', { name: 'Run details' });
   await expect(
     inspector.getByRole('heading', { name: 'Inspect a run absent from the loaded list' }),

@@ -166,6 +166,8 @@ def _row_to_run_summary(row) -> RunSummary:
 async def list_runs(
     status: str | None = None,
     project: str | None = None,
+    statuses: list[RunStatus] = Query(default=[]),  # noqa: B008 - FastAPI's DI pattern
+    q: str = Query(default="", max_length=200),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     session: AsyncSession = Depends(get_session),  # noqa: B008 - FastAPI's DI pattern
@@ -180,6 +182,14 @@ async def list_runs(
         base = base.where(Run.status == status)
     if project is not None:
         base = base.where(Project.slug == project)
+    if statuses:
+        base = base.where(Run.status.in_([item.value for item in statuses]))
+    if q.strip():
+        # Literal, case-insensitive search: user '%' and '_' are not SQL wildcards.
+        searchable = func.concat(
+            Project.slug, " #", BacklogItem.github_issue_number, " ", BacklogItem.title
+        )
+        base = base.where(searchable.icontains(q.strip(), autoescape=True))
 
     count_result = await session.execute(select(func.count()).select_from(base.subquery()))
     total = count_result.scalar_one()

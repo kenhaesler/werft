@@ -1,6 +1,9 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
+  import { SvelteURLSearchParams } from 'svelte/reactivity';
   import Icon from './lib/Icon.svelte';
+  import ProjectControls from './lib/ProjectControls.svelte';
+  import BackendCapabilities from './lib/BackendCapabilities.svelte';
   import RunList from './lib/RunList.svelte';
   import MachinePanel from './lib/MachinePanel.svelte';
   import QuotaPanel from './lib/QuotaPanel.svelte';
@@ -37,7 +40,6 @@
   let machine = $state<Machine | null>(structuredClone(demoMachine));
   let machineError = $state('');
   let projectsError = $state('');
-  let total = $state(demoRuns.length);
   let loading = $state(false);
   let loadError = $state('');
   let notice = $state('');
@@ -72,31 +74,142 @@
   let refreshCount = 0;
   let refreshCompletion: Promise<void> = Promise.resolve();
   let activeRuns = $derived(runs.filter((run) => activeStatuses.includes(run.status)));
-  let reviewRuns = $derived(runs.filter((run) => run.status === 'awaiting_review'));
-  let filteredRuns = $derived(
-    runs.filter(
-      (run) =>
-        (page !== 'review' || run.status === 'awaiting_review') &&
-        (filter === 'all' ||
-          (filter === 'active'
-            ? activeStatuses.includes(run.status)
+  let liveReview = $state<RunsResponse>({ runs: [], total: 0 });
+  let queryRuns = $state<RunSummary[]>([]);
+  let queryTotal = $state(0);
+  let queryOffset = $state(0);
+  let queryLoading = $state(false);
+  let queryError = $state('');
+  let queryRefresh = $state(0);
+  let remoteCommands = $state<RunSummary[]>([]);
+  let commandError = $state('');
+  let commandLoading = $state(false);
+  const queryPageSize = 8;
+  const queryFilterKey = $derived(`${session}|${page}|${filter}|${projectFilter}|${search}`);
+  $effect(() => {
+    void queryFilterKey;
+    queryOffset = 0;
+  });
+  const queryParams = $derived.by(() => {
+    const params = new SvelteURLSearchParams({
+      limit: String(queryPageSize),
+      offset: String(queryOffset),
+    });
+    if (projectFilter !== 'all') params.set('project', projectFilter);
+    if (search.trim()) params.set('q', search.trim());
+    const statuses =
+      page === 'review'
+        ? ['awaiting_review']
+        : filter === 'active'
+          ? activeStatuses
+          : filter === 'attention'
+            ? ['awaiting_review', 'parked', 'failed', 'blocked_quota']
             : filter === 'completed'
-              ? run.status === 'merged'
-              : filter === 'attention'
-                ? ['awaiting_review', 'parked', 'failed', 'blocked_quota'].includes(run.status)
-                : run.status === filter)) &&
-        (projectFilter === 'all' || run.project_slug === projectFilter) &&
-        `${run.issue_title} ${run.project_slug} #${run.issue_number}`
-          .toLowerCase()
-          .includes(search.toLowerCase()),
-    ),
+              ? ['merged']
+              : filter === 'all'
+                ? []
+                : [filter];
+    statuses.forEach((status) => params.append('statuses', status));
+    return params.toString();
+  });
+  let lastQuery = '';
+  $effect(() => {
+    if (demo || !['agents', 'review'].includes(page)) return;
+    const params = queryParams;
+    const queryKey = `${session}|${params}`;
+    void queryRefresh;
+    const controller = new AbortController();
+    if (queryKey !== lastQuery) {
+      queryRuns = [];
+      queryTotal = 0;
+      lastQuery = queryKey;
+    }
+    queryLoading = true;
+    queryError = '';
+    const timer = setTimeout(async () => {
+      try {
+        const result = await api<RunsResponse>(`/runs?${params}`, {
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]),
+        });
+        if (!controller.signal.aborted) {
+          const requestedOffset = Number(new URLSearchParams(params).get('offset'));
+          if (result.total > 0 && requestedOffset >= result.total) {
+            queryOffset = Math.floor((result.total - 1) / queryPageSize) * queryPageSize;
+            return;
+          }
+          queryRuns = result.runs;
+          queryTotal = result.total;
+        }
+      } catch (err) {
+        if (!controller.signal.aborted)
+          queryError =
+            err instanceof Error ? err.message : 'Could not load tasks. Retry the query.';
+      } finally {
+        if (!controller.signal.aborted) queryLoading = false;
+      }
+    }, 200);
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+    };
+  });
+  $effect(() => {
+    if (demo || modal !== 'command') return;
+    void session;
+    const params = new URLSearchParams({ q: command.trim(), limit: '5' });
+    const controller = new AbortController();
+    remoteCommands = [];
+    commandError = '';
+    commandLoading = true;
+    const timer = setTimeout(async () => {
+      try {
+        const result = await api<RunsResponse>(`/runs?${params}`, {
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]),
+        });
+        if (!controller.signal.aborted) remoteCommands = result.runs;
+      } catch {
+        if (!controller.signal.aborted) commandError = 'Could not search tasks. Close and retry.';
+      } finally {
+        if (!controller.signal.aborted) commandLoading = false;
+      }
+    }, 200);
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+    };
+  });
+  let reviewRuns = $derived(
+    demo ? runs.filter((run) => run.status === 'awaiting_review') : liveReview.runs,
+  );
+  let reviewCount = $derived(demo ? reviewRuns.length : liveReview.total);
+  let filteredRuns = $derived(
+    !demo
+      ? queryRuns
+      : runs.filter(
+          (run) =>
+            (page !== 'review' || run.status === 'awaiting_review') &&
+            (filter === 'all' ||
+              (filter === 'active'
+                ? activeStatuses.includes(run.status)
+                : filter === 'completed'
+                  ? run.status === 'merged'
+                  : filter === 'attention'
+                    ? ['awaiting_review', 'parked', 'failed', 'blocked_quota'].includes(run.status)
+                    : run.status === filter)) &&
+            (projectFilter === 'all' || run.project_slug === projectFilter) &&
+            `${run.issue_title} ${run.project_slug} #${run.issue_number}`
+              .toLowerCase()
+              .includes(search.toLowerCase()),
+        ),
   );
   let commandRuns = $derived(
-    runs
-      .filter((run) =>
-        `${run.issue_title} ${run.project_slug}`.toLowerCase().includes(command.toLowerCase()),
-      )
-      .slice(0, 5),
+    !demo
+      ? remoteCommands
+      : runs
+          .filter((run) =>
+            `${run.issue_title} ${run.project_slug}`.toLowerCase().includes(command.toLowerCase()),
+          )
+          .slice(0, 5),
   );
   let currentNav = $derived(navigation.find((item) => item.id === page));
   let selectedProject = $derived(projects.find((project) => project.id === taskProject));
@@ -153,7 +266,6 @@
     projects = structuredClone(demoProjects);
     quota = structuredClone(demoQuota);
     machine = structuredClone(demoMachine);
-    total = runs.length;
     selected = null;
     modal = null;
     loadError = '';
@@ -179,14 +291,22 @@
     const requestSession = session;
     const currentRefresh = ++refreshCount;
     try {
-      const [runResult, quotaResult, projectResult, machineResult] = await Promise.allSettled([
-        fetchRunPages(more),
-        api<QuotaResponse>('/quota'),
-        api<Project[]>('/projects'),
-        api<Machine>('/system'),
-      ]);
+      const [runResult, quotaResult, projectResult, machineResult, reviewResult] =
+        await Promise.allSettled([
+          fetchRunPages(more),
+          api<QuotaResponse>('/quota'),
+          api<Project[]>('/projects'),
+          api<Machine>('/system'),
+          api<RunsResponse>('/runs?status=awaiting_review&limit=1'),
+        ]);
       if (requestSession !== session) return;
-      const unauthorized = [runResult, quotaResult, projectResult, machineResult].some(
+      const unauthorized = [
+        runResult,
+        quotaResult,
+        projectResult,
+        machineResult,
+        reviewResult,
+      ].some(
         (result) =>
           result.status === 'rejected' &&
           result.reason instanceof ApiError &&
@@ -208,12 +328,15 @@
               ),
             ]
           : runResult.value.runs;
-        total = runResult.value.total;
         if (selected) selected = runs.find((run) => run.id === selected?.id) ?? selected;
       }
+      if (reviewResult.status === 'fulfilled') liveReview = reviewResult.value;
+      queryRefresh++;
       if (quotaResult.status === 'fulfilled') quota = quotaResult.value;
       loadError =
-        runResult.status === 'rejected' || quotaResult.status === 'rejected'
+        runResult.status === 'rejected' ||
+        quotaResult.status === 'rejected' ||
+        reviewResult.status === 'rejected'
           ? 'Could not refresh workspace data. Check your manager connection and retry. Displayed data may be out of date.'
           : '';
       if (projectResult.status === 'fulfilled') {
@@ -259,10 +382,10 @@
       tokenInput = '';
       demo = false;
       runs = [];
+      liveReview = { runs: [], total: 0 };
       projects = [];
       quota = { accounts: [] };
       machine = null;
-      total = 0;
       selected = null;
       modal = null;
       notice = '';
@@ -296,7 +419,12 @@
           };
         notice = 'Preview updated. No live environment was changed.';
       } else {
-        await actions[action](run.id);
+        const updated = await actions[action](run.id);
+        if (updated) {
+          runs = runs.map((item) => (item.id === updated.id ? updated : item));
+          queryRuns = queryRuns.map((item) => (item.id === updated.id ? updated : item));
+          if (selected?.id === updated.id) selected = updated;
+        }
         await refresh();
         notice = 'Run updated.';
       }
@@ -308,7 +436,7 @@
         selected = null;
         openModal('connect');
         formError = 'Reconnect to continue.';
-      } else notice = 'The action failed. Please retry.';
+      } else notice = err instanceof Error ? err.message : 'The action failed. Please retry.';
     } finally {
       busy = false;
     }
@@ -377,7 +505,6 @@
       },
       ...runs,
     ];
-    total = runs.length;
     taskTitle = '';
     taskBody = '';
     modal = null;
@@ -423,10 +550,10 @@
     if (getToken()) {
       demo = false;
       runs = [];
+      liveReview = { runs: [], total: 0 };
       projects = [];
       quota = { accounts: [] };
       machine = null;
-      total = 0;
       void refresh();
     }
     return () => media.removeEventListener('change', updateMobile);
@@ -559,8 +686,7 @@
           aria-current={page === item.id ? 'page' : undefined}
           onclick={() => navigate(item.id)}
           ><Icon name={item.icon} size={19} /><span>{item.label}</span
-          >{#if item.id === 'review' && reviewRuns.length}<span class="nav-count"
-              >{reviewRuns.length}</span
+          >{#if item.id === 'review' && reviewCount}<span class="nav-count">{reviewCount}</span
             >{:else if item.id === 'agents' && activeRuns.length}<span class="nav-dot"
             ></span>{/if}</button
         >{/each}
@@ -696,8 +822,8 @@
               <span class="review-callout-icon"><Icon name="review" size={20} /></span>
               <span class="review-task"
                 ><strong>{reviewRuns[0].issue_title}</strong><small
-                  >{reviewRuns.length}
-                  {reviewRuns.length === 1 ? 'task needs' : 'tasks need'} review · {reviewRuns[0]
+                  >{reviewCount}
+                  {reviewCount === 1 ? 'task needs' : 'tasks need'} review · {reviewRuns[0]
                     .project_slug}</small
                 ></span
               >
@@ -761,6 +887,7 @@
                 aria-label="Search tasks"
                 placeholder="Search tasks…"
                 bind:value={search}
+                maxlength={200}
               /></label
             ><select aria-label="Filter by project" bind:value={projectFilter}
               ><option value="all">All projects</option
@@ -770,22 +897,39 @@
             >
           </div>
         </div>
-        <RunList
-          runs={filteredRuns}
-          onselect={openRun}
-          empty={search || filter !== 'all' || projectFilter !== 'all'
-            ? 'No tasks match these filters'
-            : page === 'review'
-              ? 'You’re all caught up'
-              : 'No tasks found'}
-        />
+        {#if queryError && !demo}<p class="notice warning" role="alert">
+            {queryError}<button class="button" onclick={() => queryRefresh++}>Retry</button>
+          </p>{/if}
+        {#if !demo && queryLoading && !filteredRuns.length}<div class="loading-state">
+            <span class="spinner"></span>Loading tasks…
+          </div>
+        {:else}<RunList
+            runs={filteredRuns}
+            onselect={openRun}
+            empty={search || filter !== 'all' || projectFilter !== 'all'
+              ? 'No tasks match these filters'
+              : page === 'review'
+                ? 'You’re all caught up'
+                : 'No tasks found'}
+          />{/if}
         <div class="list-footer">
-          <span>{filteredRuns.length} matching · {runs.length} of {total} runs loaded</span
-          >{#if runs.length < total}<button
-              class="button"
-              disabled={loading}
-              onclick={() => refresh(true)}>Load more</button
-            >{/if}<span>{demo ? 'Sample data' : 'Refreshes every 10 seconds'}</span>
+          <span
+            >{demo
+              ? `${filteredRuns.length} matching sample tasks`
+              : `${queryTotal ? queryOffset + 1 : 0}–${Math.min(queryOffset + queryPageSize, queryTotal)} of ${queryTotal} matching tasks`}</span
+          >
+          {#if !demo}<div class="query-pagination">
+              <button
+                class="button"
+                disabled={queryLoading || queryOffset === 0}
+                onclick={() => (queryOffset = Math.max(0, queryOffset - queryPageSize))}
+                >Previous tasks</button
+              ><button
+                class="button"
+                disabled={queryLoading || queryOffset + queryPageSize >= queryTotal}
+                onclick={() => (queryOffset += queryPageSize)}>Next tasks</button
+              >
+            </div>{/if}
         </div>
       {:else if page === 'machines'}
         <div class="page-heading simple">
@@ -803,6 +947,7 @@
             {demo}
             {runs}
             onselect={openRun}
+            oninspect={inspectActivityRun}
             onrefresh={() => refresh()}
           />
           <section class="environment-policy">
@@ -865,7 +1010,7 @@
                       : 'Human review'}</span
                   ><span
                     >{projectRuns.filter((run) => activeStatuses.includes(run.status)).length} active
-                    · {projectRuns.length} loaded runs</span
+                    among {projectRuns.length} loaded runs</span
                   >
                 </div>
               </div>
@@ -876,6 +1021,14 @@
                   projectFilter = project.slug;
                 }}>Open agents<Icon name="arrow" size={16} /></button
               >
+              <ProjectControls
+                {project}
+                {demo}
+                onupdated={(updated) => {
+                  projects = projects.map((item) => (item.id === updated.id ? updated : item));
+                }}
+                onrefresh={() => refresh()}
+              />
             </article>{:else}<div class="empty-state">
               <Icon name="projects" size={32} />
               <h3>No projects connected</h3>
@@ -976,6 +1129,7 @@
             <span class="muted">System</span>
           </div>
         </section>
+        <BackendCapabilities {demo} />
       {/if}
     </main>
     <footer class="statusbar">
@@ -1035,6 +1189,7 @@
           bind:this={commandInput}
           placeholder="Where would you like to go?"
           bind:value={command}
+          maxlength={200}
         /></label
       >
       <p class="command-label">Navigate</p>
@@ -1046,6 +1201,8 @@
           ><Icon name={item.icon} /><span>{item.label}</span><Icon name="arrow" size={14} /></button
         >{/each}
       <p class="command-label">Tasks</p>
+      {#if commandLoading && !demo}<p class="muted empty-inline">Searching all tasks…</p>{/if}
+      {#if commandError && !demo}<p class="notice warning" role="alert">{commandError}</p>{/if}
       {#each commandRuns as run (run.id)}<button class="command-result" onclick={() => openRun(run)}
           ><Icon name="agent" /><span>{run.issue_title}<small>{run.project_slug}</small></span><Icon
             name="chevron"

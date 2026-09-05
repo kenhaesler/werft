@@ -1,5 +1,25 @@
 # Backend / frontend capability audit
 
+## Implementation follow-up — 2026-09-05
+
+The seven existing-API gaps below are now addressed on `codex/agentic-os-frontend`:
+
+- Tasks, Review, project filters, and command search query the server with pagination; review totals no longer depend on the first 200 tasks. Multi-status and literal text search are supported by `GET /runs`.
+- Session numbering is separate from the failure budget. Mutation responses immediately update task state, and bounded backend error details reach the operator.
+- Project settings expose the existing manual lifecycle flip and its branch-protection consequences.
+- Evidence includes structured results/usage, grouped files, collection timestamps, hashes, authenticated downloads, and bounded inert text previews.
+- Every labelled VM container can open its task directly by ID. Container image and quota observation/source diagnostics are available in drilldowns.
+
+Five authenticated read routes expose previously internal information: per-run runtime and incremental retained logs, paginated cross-run events, project lifecycle events, and safe dispatch/configuration metadata. Configuration presence and schema validation are explicitly distinct from connectivity verification. Raw logs remain raw output, not a reconstructed tool-action stream. Session output is bounded and cursor-based, with reset detection across file replacement and execution attempts.
+
+The inspector tab freeze was a reactive session-output loop. Polling now keeps cursor changes outside effect dependencies, serializes visibility wakeups, cancels on disposal, and clears old output when switching tasks. Preview mode renders one static sample.
+
+Validation includes real PostgreSQL API tests with an older review task behind 205 newer tasks, durable history pagination/search, authentication on every new route, actual session state, and incremental logs. Linux Docker exercises symlink/FIFO rejection and replacement/cursor semantics. Frontend unit and browser regression tests cover the inspector, evidence, filters, and responsive layouts.
+
+Remaining product capabilities require additional backend implementation: host power/snapshots, arbitrary interactive shell/files, live resource metrics, direct task creation/reordering, writeable dispatch settings, and a structured live tool-event stream. The frontend does not pretend these capabilities exist. Real GitHub/provider execution requires a configured manager and was not exercised in this validation.
+
+The original source audit follows as the historical baseline.
+
 Audited 2026-09-05 against commit `0dabc70` on `codex/agentic-os-frontend`.
 
 ## Verdict

@@ -10,6 +10,7 @@
     runs = [],
     onmanage,
     onselect,
+    oninspect,
     onrefresh,
   }: {
     machine: Machine | null;
@@ -19,8 +20,25 @@
     runs?: RunSummary[];
     onmanage?: () => void;
     onselect?: (run: RunSummary) => void;
+    oninspect?: (id: string) => Promise<void>;
     onrefresh?: () => void;
   } = $props();
+  let inspectingId = $state<string | null>(null);
+  let inspectError = $state('');
+
+  async function inspectContainer(container: Machine['containers'][number], run?: RunSummary) {
+    inspectError = '';
+    if (oninspect) {
+      inspectingId = container.run_id;
+      try {
+        await oninspect(container.run_id);
+      } catch {
+        inspectError = 'Task details could not be loaded. Retry the inspection.';
+      } finally {
+        inspectingId = null;
+      }
+    } else if (run) onselect?.(run);
+  }
 </script>
 
 <section class:compact class="machine-panel">
@@ -63,12 +81,13 @@
       </div>
     </div>
     <div class="capacity-heading">
-      <span>Runner capacity</span><strong
+      <span>Running containers</span><strong
         >{machine.containers.filter((c) => c.state === 'running').length}<span>
           / {machine.max_concurrent_runs} slots</span
         ></strong
       >
     </div>
+    <p class="capacity-note">Scheduler admission also considers the manager driver.</p>
     <div
       class="capacity-track"
       aria-label={`${machine.containers.filter((c) => c.state === 'running').length} running containers; ${machine.max_concurrent_runs} concurrent run slots`}
@@ -98,9 +117,26 @@
               >{container.id.slice(0, 12)} <span>·</span> {container.status}</small
             >
           </div>
-          {#if run}<button class="button small" onclick={() => onselect?.(run)}>Inspect</button
+          {#if oninspect || run}<button
+              class="button small"
+              disabled={inspectingId === container.run_id}
+              onclick={() => inspectContainer(container, run)}
+              >{inspectingId === container.run_id ? 'Loading…' : 'Inspect'}</button
             >{:else}<span class="status">{container.state}</span>{/if}
         </div>
+        <details class="container-details">
+          <summary>Technical details</summary>
+          <dl>
+            <div>
+              <dt>Image</dt>
+              <dd><code>{container.image}</code></dd>
+            </div>
+            <div>
+              <dt>Container ID</dt>
+              <dd><code>{container.id}</code></dd>
+            </div>
+          </dl>
+        </details>
       {:else}<p class="muted empty-inline">
           No agent environments are running. They are created when approved work is dispatched.
         </p>{/each}
@@ -112,6 +148,7 @@
           manager.
         </p>
       </div>
+      {#if inspectError}<p class="machine-error" role="alert">{inspectError}</p>{/if}
     {/if}
   {:else}<div class="empty-state machine-empty">
       <Icon name="vm" size={34} />
@@ -120,3 +157,43 @@
       {#if onrefresh}<button class="button" onclick={onrefresh}>Retry connection</button>{/if}
     </div>{/if}
 </section>
+
+<style>
+  .capacity-note,
+  .machine-error,
+  .container-details {
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .capacity-note {
+    color: var(--muted);
+    margin: 6px 0 12px;
+  }
+  .machine-error {
+    color: #9a481d;
+    margin: 14px 0 0;
+  }
+  .container-details {
+    margin: -8px 0 14px 32px;
+    color: var(--muted);
+  }
+  .container-details summary {
+    cursor: pointer;
+  }
+  .container-details dl {
+    display: grid;
+    gap: 8px;
+    margin: 10px 0 0;
+  }
+  .container-details dt {
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .container-details dd {
+    margin: 2px 0 0;
+    overflow-wrap: anywhere;
+  }
+  .container-details code {
+    font-size: 12px;
+  }
+</style>

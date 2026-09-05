@@ -2,8 +2,12 @@
   import { onMount, untrack } from 'svelte';
   import Icon from './Icon.svelte';
   import { api, downloadArtifact } from './api';
+  import { loadArtifactMetadata } from './artifact-evidence';
+  import ArtifactEvidence from './ArtifactEvidence.svelte';
+  import LiveSession from './LiveSession.svelte';
+  import ResultSummary from './ResultSummary.svelte';
   import { demoDetail } from './demo';
-  import { bytes, duration, relativeTime, safeExternalUrl, statusLabels } from './format';
+  import { duration, relativeTime, safeExternalUrl, statusLabels } from './format';
   import type { ActivitySnapshot, RunDetail, RunSummary } from './types';
   import { milestoneTitle, providerName, runExplanation } from './run-presentation';
   import { timeAgo } from './activity';
@@ -31,7 +35,6 @@
   let detail = $state<RunDetail | null>(null);
   let error = $state('');
   let downloadError = $state('');
-  let downloading = $state('');
   let tab = $state('Overview');
   let now = $state(Date.now());
   onMount(() => {
@@ -41,6 +44,8 @@
   let retry = $state(0);
   let syncError = $state('');
   let lastSuccessfulUpdate = $state('');
+  let artifactMetadata = $state<import('./types').Artifact[] | null>(null);
+  let artifactError = $state('');
   const runId = $derived(run.id);
   $effect(() => {
     const id = runId;
@@ -54,6 +59,8 @@
     error = '';
     syncError = '';
     lastSuccessfulUpdate = '';
+    artifactMetadata = null;
+    artifactError = '';
     const onVisibility = () => {
       if (document.visibilityState === 'visible') {
         if (timer) clearTimeout(timer);
@@ -80,6 +87,24 @@
             });
         if (controller.signal.aborted) return;
         detail = data;
+        if (!demo) {
+          try {
+            const metadata = await loadArtifactMetadata(
+              id,
+              AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]),
+            );
+            if (controller.signal.aborted || runId !== id) return;
+            artifactMetadata = metadata;
+            artifactError = '';
+          } catch (artifactFailure) {
+            if (!controller.signal.aborted) {
+              artifactError =
+                artifactFailure instanceof Error
+                  ? artifactFailure.message
+                  : 'Could not load artifact integrity details.';
+            }
+          }
+        }
         error = '';
         syncError = '';
         lastSuccessfulUpdate = new Date().toISOString();
@@ -105,10 +130,22 @@
       document.removeEventListener('visibilitychange', onVisibility);
     };
   });
-  const displayed = $derived(detail ?? run);
+  const displayed = $derived(
+    !detail ||
+      Date.parse(run.updated_at) > Date.parse(detail.updated_at) ||
+      (run.updated_at === detail.updated_at && run.status !== detail.status)
+      ? { ...detail, ...run }
+      : detail,
+  );
   const explanation = $derived(runExplanation[displayed.status]);
   const latestAttempt = $derived(
     detail?.attempts.slice().sort((a, b) => b.attempt_no - a.attempt_no)[0],
+  );
+  const failureBudget = $derived(`${displayed.attempt_count} of ${displayed.max_attempts} used`);
+  const evidenceArtifacts = $derived(
+    artifactMetadata ??
+      detail?.artifacts.map((artifact) => ({ ...artifact, content_hash: null })) ??
+      [],
   );
   const runtime = $derived(activity?.active_runs.find((item) => item.run_id === runId));
   const runtimeAvailable = $derived(
@@ -133,7 +170,6 @@
   );
   async function download(path: string) {
     downloadError = '';
-    downloading = path;
     try {
       if (demo) {
         const blob = new Blob(['Werft preview artifact. This is illustrative sample evidence.\n'], {
@@ -148,8 +184,6 @@
       } else await downloadArtifact(run.id, path);
     } catch {
       downloadError = `Could not download ${path}. Please retry.`;
-    } finally {
-      downloading = '';
     }
   }
 </script>
@@ -169,7 +203,7 @@
   </div>
   <h2>{displayed.issue_title}</h2>
   <div class="tabs" aria-label="Run details">
-    {#each ['Overview', 'Timeline', 'Evidence', 'Attempts'] as item (item)}<button
+    {#each ['Overview', 'Session', 'Timeline', 'Evidence', 'Attempts'] as item (item)}<button
         class:active={tab === item}
         aria-pressed={tab === item}
         onclick={() => (tab = item)}
@@ -223,7 +257,7 @@
             </h3>
             <p>
               {latestAttempt
-                ? `${latestAttempt.ended_at ? 'Last attempt' : 'Attempt'} ${latestAttempt.attempt_no} of ${displayed.max_attempts}`
+                ? `${latestAttempt.ended_at ? 'Last session' : 'Current session'} #${latestAttempt.attempt_no}`
                 : displayed.attempt_count
                   ? 'The backend has not returned attempt details.'
                   : 'An agent will be assigned when an attempt starts.'}
@@ -234,6 +268,10 @@
             An agent session is one attempt to complete this task in an isolated environment on your
             machine.
           </p>{/if}
+        <p class="assignment-definition">
+          <strong>Failure budget: {failureBudget}.</strong> Requeue starts a fresh failure budget while
+          retaining earlier sessions.
+        </p>
         {#if displayed.status === 'running'}
           <div class="assignment-signal" class:signal-warning={!attended}>
             <Icon name={attended ? 'activity' : 'warning'} size={17} /><span
@@ -288,6 +326,14 @@
             <dt>Last attempt outcome</dt>
             <dd>{displayed.latest_outcome?.replaceAll('_', ' ') ?? 'No outcome reported'}</dd>
           </div>
+          {#if detail.base_sha}<div>
+              <dt>Base commit</dt>
+              <dd><code>{detail.base_sha}</code></dd>
+            </div>{/if}
+          {#if detail.merge_commit_sha}<div>
+              <dt>Merge commit</dt>
+              <dd><code>{detail.merge_commit_sha}</code></dd>
+            </div>{/if}
           {#if runtimeAvailable && runtime?.status === displayed.status}<div>
               <dt>Agent container</dt>
               <dd><code>{runtime.container_id ?? 'Not reported'}</code></dd>
@@ -302,6 +348,7 @@
             </div>{/if}
         </dl>
       </details>
+    {:else if tab === 'Session'}<LiveSession runId={run.id} {demo} />
     {:else if tab === 'Timeline'}<p class="section-description">
         Recorded milestones, newest first. Open event details for the backend payload.
       </p>
@@ -330,38 +377,44 @@
             </div>
           </div>{:else}<p class="muted">No events recorded yet.</p>{/each}
       </div>
-      {#if detail.result}<details class="result-details">
-          <summary>Structured result</summary>
-          <pre>{JSON.stringify(detail.result, null, 2)}</pre>
-        </details>{/if}
+      {#if detail.result}<ResultSummary result={detail.result} />{/if}
     {:else if tab === 'Evidence'}<p class="section-description">
         {demo
           ? 'Sample files for exploring the workspace.'
           : 'Collected files from this run. Downloads use your authenticated connection.'}
       </p>
-      {#each detail.artifacts as artifact (artifact.path)}<button
-          class="artifact-row"
-          disabled={!!downloading}
-          onclick={() => download(artifact.path)}
-          ><Icon name="file" /><span
-            ><strong>{artifact.path}</strong><small>{bytes(artifact.bytes)}</small></span
-          ><Icon name={downloading === artifact.path ? 'clock' : 'download'} size={16} /></button
-        >{:else}<div class="empty-state">
+      {#if artifactError}<p class="notice warning" role="status">
+          Artifact integrity details are unavailable: {artifactError}. Downloads still work.
+        </p>{/if}
+      {#if evidenceArtifacts.length}<ArtifactEvidence
+          runId={run.id}
+          artifacts={evidenceArtifacts}
+          {demo}
+          ondownload={download}
+        />{:else}<div class="empty-state">
           <Icon name="file" size={28} />
           <h3>No evidence collected yet</h3>
           <p>Files appear when the manager collects this run’s outputs.</p>
-        </div>{/each}{#if downloadError}<p class="notice warning" role="alert">
+        </div>{/if}{#if downloadError}<p class="notice warning" role="alert">
           {downloadError}
         </p>{/if}
     {:else}<p class="section-description">
         Each attempt is a separate agent session. Earlier results remain available after a retry.
       </p>
+      <p class="assignment-definition">
+        <strong>Failure budget: {failureBudget}.</strong> Session numbers are lifetime records and can
+        be higher than the current budget after a requeue.
+      </p>
       {#each detail.attempts as attempt (attempt.attempt_no)}<div class="attempt-row">
           <span class="attempt-number">{attempt.attempt_no}</span>
           <div>
-            <strong>{providerName(attempt.provider)}</strong><small
+            <strong>Session #{attempt.attempt_no} · {providerName(attempt.provider)}</strong><small
               >{attempt.outcome?.replaceAll('_', ' ') ??
                 (attempt.ended_at ? 'No outcome reported' : 'No outcome yet')}</small
+            ><small
+              >{new Date(attempt.started_at).toLocaleString()}{attempt.ended_at
+                ? ` → ${new Date(attempt.ended_at).toLocaleString()}`
+                : ''}</small
             >
           </div>
           <span

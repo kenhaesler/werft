@@ -17,9 +17,9 @@ test('activity views isolate information and Settings remains readable at both s
   await page.screenshot({ path: '../.impeccable/review/activity-tasks.png', fullPage: true });
   await views.getByRole('button', { name: /Events/ }).click();
   await expect(monitor.locator('.session-row')).toHaveCount(0);
-  await expect(monitor.locator('.activity-event-list li')).toHaveCount(6);
+  await expect(monitor.locator('.event-history-list li')).toHaveCount(6);
   await monitor.getByRole('button', { name: 'Next events', exact: true }).click();
-  await expect(monitor.locator('.activity-event-list li')).toHaveCount(1);
+  await expect(monitor.locator('.event-history-list li')).toHaveCount(1);
   await monitor.getByRole('button', { name: 'Previous events', exact: true }).click();
   await page.screenshot({ path: '../.impeccable/review/activity-events.png', fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });

@@ -1,3 +1,4 @@
+import type { RunSummary } from './types';
 const TOKEN_KEY = 'werft_token';
 const API_PREFIX = '/api/v1';
 
@@ -39,7 +40,16 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   });
 
   if (!response.ok) {
-    throw new ApiError(response.status);
+    let message = `Request failed with status ${response.status}`;
+    try {
+      const body: unknown = await response.json();
+      if (body && typeof body === 'object' && 'detail' in body && typeof body.detail === 'string') {
+        message = body.detail.slice(0, 1200);
+      }
+    } catch {
+      /* Non-JSON errors keep the HTTP status fallback. */
+    }
+    throw new ApiError(response.status, message);
   }
 
   if (response.status === 204) {
@@ -53,8 +63,8 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return JSON.parse(text) as T;
 }
 
-function post(path: string): Promise<void> {
-  return api<void>(path, { method: 'POST' });
+function post(path: string): Promise<RunSummary> {
+  return api<RunSummary>(path, { method: 'POST' });
 }
 
 /**
@@ -99,8 +109,8 @@ export async function downloadArtifact(runId: string, path: string): Promise<voi
 }
 
 export const actions = {
-  accept: (id: string): Promise<void> => post(`/runs/${id}/review/accept`),
-  reject: (id: string): Promise<void> => post(`/runs/${id}/review/reject`),
-  cancel: (id: string): Promise<void> => post(`/runs/${id}/cancel`),
-  requeue: (id: string): Promise<void> => post(`/runs/${id}/requeue`),
+  accept: (id: string): Promise<RunSummary> => post(`/runs/${id}/review/accept`),
+  reject: (id: string): Promise<RunSummary> => post(`/runs/${id}/review/reject`),
+  cancel: (id: string): Promise<RunSummary> => post(`/runs/${id}/cancel`),
+  requeue: (id: string): Promise<RunSummary> => post(`/runs/${id}/requeue`),
 };

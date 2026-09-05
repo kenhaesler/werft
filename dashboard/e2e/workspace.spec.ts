@@ -25,7 +25,7 @@ test('drills from phase to task to evidence without showing runtime metadata upf
   await row.getByRole('button', { name: 'Open task' }).click();
   const inspector = page.getByRole('dialog', { name: 'Run details' });
   await inspector.getByRole('button', { name: /Evidence/ }).click();
-  await expect(inspector.getByRole('button', { name: /transcript.jsonl/ })).toBeVisible();
+  await expect(inspector.getByText('transcript.jsonl', { exact: true })).toBeVisible();
   await page.keyboard.press('Escape');
   await monitor.locator('.backend-summary').click();
   await expect(monitor.locator('.worker-list')).toBeVisible();
@@ -43,7 +43,7 @@ test('preview navigation, search, evidence, review, and task creation', async ({
   ).toBeVisible();
   await inspector.getByRole('button', { name: /Evidence/ }).click();
   const download = page.waitForEvent('download');
-  await inspector.getByRole('button', { name: /transcript.jsonl/ }).click();
+  await inspector.getByRole('button', { name: 'Download transcript.jsonl' }).click();
   expect((await download).suggestedFilename()).toContain('sample-');
   await inspector.getByRole('button', { name: 'Accept work' }).click();
   await expect(inspector.getByText('Merging', { exact: true })).toBeVisible();
