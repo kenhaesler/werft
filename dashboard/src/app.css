@@ -3113,3 +3113,7 @@ pre {
     padding: 16px;
   }
 }
+.talk-workspace {
+  max-width: 960px;
+  margin-inline: auto;
+}

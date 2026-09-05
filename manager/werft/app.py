@@ -60,6 +60,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from werft.api.auth import make_require_token
 from werft.api.capabilities import capabilities_router
+from werft.api.conversations import conversations_router
 from werft.api.history import history_router
 from werft.api.routes import api_router, healthz_router
 from werft.api.session import session_router
@@ -586,6 +587,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(system_router, prefix="/api/v1", dependencies=[Depends(require_token)])
     app.include_router(capabilities_router, prefix="/api/v1", dependencies=[Depends(require_token)])
     app.include_router(session_router, prefix="/api/v1", dependencies=[Depends(require_token)])
+    app.include_router(
+        conversations_router, prefix="/api/v1", dependencies=[Depends(require_token)]
+    )
     app.include_router(history_router, prefix="/api/v1", dependencies=[Depends(require_token)])
 
     # B7: the built dashboard is served, conditionally, at `/ui` —

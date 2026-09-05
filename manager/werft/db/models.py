@@ -277,3 +277,27 @@ class Artifact(Base):
     )
     content_hash: Mapped[str | None] = mapped_column(Text)
     event_ref: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("run_events.id"))
+
+
+class ConversationMessage(Base):
+    """Durable operator and runner conversation history."""
+
+    __tablename__ = "conversation_messages"
+    __table_args__ = (UniqueConstraint("scope", "client_id"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("uuidv7()")
+    )
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    client_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("runs.id", ondelete="CASCADE")
+    )
+    attempt_no: Mapped[int | None] = mapped_column(SmallInteger)
+    role: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'queued'"))
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )

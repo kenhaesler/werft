@@ -41,4 +41,11 @@ Run inspectors live-poll their selected run while visible and retain the last su
 
 ## Operating Assumptions
 
+Operator conversations live under Talk to Werft; each task inspector has a
+Conversation tab. With a configured Anthropic API model, Werft answers from
+bounded backend snapshots and can steer running tasks or reprioritize queued
+tasks through validated tools. Updated Claude runners accept operator input at
+turn boundaries. Delivery and answer states are recorded, and completed sessions
+remain read-only. See `docs/CONVERSATIONS.md` for deployment requirements.
+
 Desktop is the primary operating surface; mobile supports inspection and quick actions. Visual choices are delegated through the broad implementation request; optional workflow clarification was offered. The existing Svelte 5, TypeScript, Vite 8 stack is retained.

@@ -10,6 +10,7 @@
   import MachinePanel from './lib/MachinePanel.svelte';
   import QuotaPanel from './lib/QuotaPanel.svelte';
   import RunInspector from './lib/RunInspector.svelte';
+  import Conversation from './lib/Conversation.svelte';
   import ActivityMonitor from './lib/ActivityMonitor.svelte';
   import { previewActivity } from './lib/activity';
   import { api, actions, ApiError, getToken, setToken } from './lib/api';
@@ -31,6 +32,7 @@
     { id: 'review', label: 'Review', icon: 'review' },
     { id: 'machines', label: 'Virtual machine', icon: 'vm' },
     { id: 'activity', label: 'Activity', icon: 'activity' },
+    { id: 'talk', label: 'Talk to Werft', icon: 'agent' },
     { id: 'quotas', label: 'Usage', icon: 'quota' },
   ];
   let page = $state('overview');
@@ -908,6 +910,13 @@
           oninspect={inspectActivityRun}
           onrefresh={refreshActivity}
         />
+      {:else if page === 'talk'}
+        <div class="talk-workspace">
+          <div class="page-heading simple">
+            <div><h1>Talk to Werft</h1></div>
+          </div>
+          <Conversation scope="orchestrator" {demo} />
+        </div>
       {:else if page === 'agents' || page === 'review'}
         <div class="page-heading simple">
           <div>

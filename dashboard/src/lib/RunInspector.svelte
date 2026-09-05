@@ -5,6 +5,7 @@
   import { loadArtifactMetadata } from './artifact-evidence';
   import ArtifactEvidence from './ArtifactEvidence.svelte';
   import LiveSession from './LiveSession.svelte';
+  import Conversation from './Conversation.svelte';
   import RunProgress from './RunProgress.svelte';
   import ResultSummary from './ResultSummary.svelte';
   import { demoDetail } from './demo';
@@ -204,7 +205,7 @@
   </div>
   <h2>{displayed.issue_title}</h2>
   <div class="tabs" aria-label="Run details">
-    {#each ['Overview', 'Session', 'Timeline', 'Evidence', 'Attempts'] as item (item)}<button
+    {#each ['Overview', 'Conversation', 'Session', 'Timeline', 'Evidence', 'Attempts'] as item (item)}<button
         class:active={tab === item}
         aria-pressed={tab === item}
         onclick={() => (tab = item)}
@@ -217,7 +218,9 @@
         ? `: ${new Date(lastSuccessfulUpdate).toLocaleTimeString()}`
         : ''}.
     </p>{/if}
-  {#if error}<div class="empty-state">
+  {#if tab === 'Conversation'}
+    <Conversation scope={run.id} {demo} />
+  {:else if error}<div class="empty-state">
       <p role="alert">{error}</p>
       <button class="button" onclick={() => retry++}>Retry</button>
     </div>{:else if !detail}<div class="loading-state">

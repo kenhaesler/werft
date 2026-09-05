@@ -30,6 +30,14 @@ class Settings(BaseSettings):
     # than treating an unmounted secret as "auth disabled".
     api_token_file: str = ""
 
+    # Operator conversation uses an API key, deliberately separate from the
+    # runner's OAuth/setup token. Empty means this surface is unavailable.
+    conversation_api_key_file: str = ""
+    conversation_model: str = ""
+    # New adapters advertise readiness per attempt. Keep this opt-in while
+    # deployed runner images are upgraded.
+    agent_conversations_enabled: bool = False
+
     # SPEC §8: artifact metadata lives in the DB, bytes on disk under
     # `{artifacts_root}/{run_id}/artifacts/` — the root the collector writes
     # to and `werft/api/routes.py`'s artifact-download route reads from.

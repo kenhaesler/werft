@@ -176,7 +176,11 @@ class ClaudeSpec:
             # except the egress proxy, destroyed after the run (SPEC §4.2).
             "--permission-mode",
             "bypassPermissions",
-            "@" + prompt_file,
+            *(
+                ["--input-format", "stream-json", "--replay-user-messages"]
+                if task.conversation_enabled
+                else ["@" + prompt_file]
+            ),
         ]
 
     def build_env(self, task: TaskSpec, *, credential_path: str) -> dict[str, str]:

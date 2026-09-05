@@ -123,6 +123,7 @@ from werft.observe.activity import ManagerActivity
 from werft.observe.alerts import AlertSink
 from werft.orchestrator.backlog import intake, sync_backlog
 from werft.orchestrator.ci_watch import advance_awaiting_ci, check_flip
+from werft.orchestrator.conversation import flush_conversation_outbox
 from werft.orchestrator.dispatch import ClaimOutcome, claim_next
 from werft.orchestrator.driver import DriverDeps, attend_run
 from werft.orchestrator.finalize import QuotaPort, advance_failed
@@ -410,6 +411,14 @@ class Orchestrator:
         attending immediately.
         """
         await self._sweep_disk_threshold(stop)
+        if self._settings.agent_conversations_enabled:
+            await self._run_unit(
+                "conversation_outbox",
+                "operator",
+                lambda session: flush_conversation_outbox(
+                    session, runs_root=self._settings.runs_root
+                ),
+            )
         await self._sweep_failed_wake(stop)
         await self._sweep_blocked_quota_wake(stop)
         await self._sweep_lease(stop)

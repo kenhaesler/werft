@@ -47,6 +47,7 @@ from werft.github.auth import AppAuth
 from werft.github.client import GitHubUnavailable
 from werft.github.ops import RepoOps
 from werft.observe.alerts import AlertSink
+from werft.orchestrator.conversation import persist_run_conversation
 from werft.orchestrator.credentials import RunCredentials
 from werft.orchestrator.dispatch import runner_config_for
 from werft.orchestrator.egress_net import (
@@ -189,6 +190,7 @@ class _Loaded:
     issue_title: str
     issue_body: str
     issue_labels: list[str]
+    attempt_no: int = 0
 
 
 class _Driver:
@@ -375,6 +377,7 @@ class _Driver:
                 issue_title=item.title,
                 issue_body=item.body,
                 issue_labels=list(item.labels or []),
+                attempt_no=run.attempt_count,
             )
 
     async def _mint(self, loaded: _Loaded) -> None:
@@ -427,6 +430,8 @@ class _Driver:
             issue_labels=loaded.issue_labels,
             model=entry.model,
             timeout_seconds=entry.timeout_seconds,
+            conversation_enabled=self._settings.agent_conversations_enabled,
+            attempt_no=loaded.attempt_no,
         )
         argv = self._deps.spec.build_argv(
             task,
@@ -644,6 +649,8 @@ class _Driver:
             ).scalar_one_or_none()
             if run is None:
                 return
+            if self._settings.agent_conversations_enabled:
+                await persist_run_conversation(session, runs_root=self._settings.runs_root, run=run)
             session.add(
                 RunEvent(
                     run_id=self._run_id,
@@ -715,6 +722,8 @@ class _Driver:
             if run is None or run.status not in _ATTENDABLE:
                 return
 
+            if self._settings.agent_conversations_enabled:
+                await persist_run_conversation(session, runs_root=self._settings.runs_root, run=run)
             observed = await self._observed_seconds(session, run)
             attempt = (
                 await session.execute(

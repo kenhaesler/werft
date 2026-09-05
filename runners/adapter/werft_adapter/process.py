@@ -25,7 +25,9 @@ from collections.abc import Callable
 TERM_GRACE_SECONDS = 10.0
 
 
-def start_in_own_process_group(argv: list[str], env: dict[str, str], cwd: str) -> subprocess.Popen:
+def start_in_own_process_group(
+    argv: list[str], env: dict[str, str], cwd: str, *, input_pipe: bool = False
+) -> subprocess.Popen:
     """Launch the CLI as the leader of a new process group.
 
     The group is what makes tree-kill possible: a CLI that spawns a build which
@@ -46,6 +48,8 @@ def start_in_own_process_group(argv: list[str], env: dict[str, str], cwd: str) -
         "encoding": "utf-8",
         "errors": "replace",
     }
+    if input_pipe:
+        kwargs["stdin"] = subprocess.PIPE
     if hasattr(os, "setsid"):
         kwargs["preexec_fn"] = os.setsid  # noqa: PLW1509 - a new session is the point
     return subprocess.Popen(argv, **kwargs)
