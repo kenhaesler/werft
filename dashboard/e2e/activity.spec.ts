@@ -42,7 +42,7 @@ test('keeps many parallel sessions readable and exposes runtime details on deman
   await page.setViewportSize({ width: 1784, height: 1214 });
   await page.goto('/');
   await expect(page.getByRole('heading', { name: '24 active sessions' })).toBeVisible();
-  await expect(page.locator('.session-row')).toHaveCount(6);
+  await expect(page.locator('.session-row')).toHaveCount(3);
   await expect(page.locator('.session-runtime').first()).not.toBeVisible();
   await page.locator('.session-row summary').first().focus();
   await page.keyboard.press('Enter');

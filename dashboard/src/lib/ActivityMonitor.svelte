@@ -83,7 +83,7 @@
       return rank(a.run_id, a.status) - rank(b.run_id, b.status);
     }),
   );
-  let visible = $derived(ordered.slice(0, compact ? 6 : limit));
+  let visible = $derived(ordered.slice(0, compact ? 3 : limit));
   let headline = $derived(
     !data
       ? 'Connecting to backend activity…'
@@ -279,8 +279,8 @@
       >{/if}
     {#if inspectError}<p class="activity-warning" role="alert">{inspectError}</p>{/if}
     {#if compact && onexpand}<button class="activity-expand" onclick={onexpand}
-        >View all activity{#if filtered.length > 6}
-          · {filtered.length - 6} more tasks{/if}<Icon name="arrow" size={15} /></button
+        >View all activity{#if filtered.length > 3}
+          · {filtered.length - 3} more tasks{/if}<Icon name="arrow" size={15} /></button
       >{/if}
     {#if !compact && data.active_runs.length < data.active_runs_total}<p
         class="activity-annotation"
@@ -410,7 +410,7 @@
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 14px;
-    padding: 24px;
+    padding: 20px;
     min-width: 0;
   }
   .activity-heading {
@@ -470,7 +470,7 @@
   .work-pipeline {
     display: grid;
     grid-template-columns: repeat(5, minmax(0, 1fr));
-    margin: 26px 0;
+    margin: 20px 0 16px;
     gap: 8px;
   }
   .work-pipeline button {
@@ -512,7 +512,7 @@
     justify-content: space-between;
     flex-wrap: wrap;
     gap: 10px;
-    padding-bottom: 18px;
+    padding-bottom: 12px;
     color: var(--muted);
     font-size: 13px;
   }
@@ -560,7 +560,7 @@
   }
   .live-task {
     list-style: none;
-    padding: 17px 0;
+    padding: 14px 0;
     cursor: pointer;
   }
   .live-task::-webkit-details-marker {
@@ -660,9 +660,9 @@
     font-size: 14px;
   }
   .background-work {
-    margin-top: 24px;
+    margin-top: 16px;
     border-top: 1px solid var(--border);
-    padding-top: 18px;
+    padding-top: 14px;
   }
   .backend-summary {
     display: flex;
@@ -812,7 +812,7 @@
     margin: 16px 0 0;
   }
   .operation-details {
-    margin-top: 24px;
+    margin-top: 16px;
     border-top: 1px solid var(--border);
     padding-top: 20px;
   }
@@ -886,20 +886,21 @@
       max-width: 90px;
     }
     .work-pipeline {
-      gap: 4px;
-      margin: 22px 0;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      margin: 16px 0;
     }
     .work-pipeline button {
-      padding: 11px 3px;
+      padding: 12px 8px;
     }
     .pipeline-node {
       display: none;
     }
     .pipeline-label {
-      flex-direction: column;
+      flex-direction: row;
       align-items: center;
-      gap: 4px;
-      font-size: 12px;
+      gap: 8px;
+      font-size: 14px;
     }
     .pipeline-label strong {
       font-size: 15px;

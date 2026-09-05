@@ -160,7 +160,7 @@ test('live connection, authenticated actions, conflict recovery, and disconnect'
     .getByRole('button', { name: 'Connect manager', exact: true })
     .click();
   await expect(page.getByText('Demo workspace')).toHaveCount(0);
-  await expect(page.getByRole('heading', { name: 'Machine unavailable' })).toBeVisible();
+  await expect(page.getByText('Machine unavailable', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: /Review work/ }).click();
   await page.getByRole('button', { name: 'Accept work' }).click();
   await expect(page.getByRole('status')).toContainText('changed state');
@@ -174,10 +174,16 @@ test('live connection, authenticated actions, conflict recovery, and disconnect'
 });
 
 test('desktop and mobile visual evidence, keyboard focus and overflow', async ({ page }) => {
-  await page.setViewportSize({ width: 1440, height: 1050 });
+  await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible();
   await page.evaluate(() => document.fonts.ready);
+  expect(
+    await page.locator('.activity-monitor').evaluate((el) => el.getBoundingClientRect().width),
+  ).toBeGreaterThan(1000);
+  expect(await page.evaluate(() => document.documentElement.scrollHeight <= innerHeight)).toBe(
+    true,
+  );
   await page.screenshot({
     path: '../.impeccable/review/desktop.png',
     fullPage: true,
@@ -185,6 +191,13 @@ test('desktop and mobile visual evidence, keyboard focus and overflow', async ({
   });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBeLessThan(1250);
+  expect(
+    await page
+      .locator('.work-pipeline button')
+      .first()
+      .evaluate((el) => el.getBoundingClientRect().width),
+  ).toBeGreaterThan(85);
   await page.screenshot({
     path: '../.impeccable/review/mobile.png',
     fullPage: true,

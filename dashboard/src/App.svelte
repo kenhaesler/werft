@@ -9,7 +9,7 @@
   import { previewActivity } from './lib/activity';
   import { api, actions, ApiError, getToken, setToken } from './lib/api';
   import { demoMachine, demoProjects, demoQuota, demoRuns } from './lib/demo';
-  import { activeStatuses } from './lib/format';
+  import { activeStatuses, duration } from './lib/format';
   import type {
     ActivitySnapshot,
     Machine,
@@ -650,11 +650,33 @@
         >
       </div>{/if}
 
-    <main id="main-content" class="page-content">
+    <main id="main-content" class="page-content" class:overview-page={page === 'overview'}>
       {#if page === 'overview'}
-        <div class="page-heading">
-          <div>
-            <h1>Overview</h1>
+        <div class="overview-heading">
+          <h1>Overview</h1>
+          <div class="overview-resources">
+            <button
+              class="resource-link"
+              onclick={() => navigate('machines')}
+              title={machine?.name ?? machineError}
+            >
+              <Icon name="vm" size={17} /><span
+                >{machine ? machine.name : 'Machine unavailable'}</span
+              ><strong
+                >{machine
+                  ? `${machine.containers.filter((c) => c.state === 'running').length}/${machine.max_concurrent_runs} slots`
+                  : 'Inspect'}</strong
+              ><Icon name="chevron" size={14} />
+            </button>
+            <button class="resource-link" onclick={() => navigate('quotas')}>
+              <Icon name="quota" size={17} /><span>Usage</span><strong
+                >{quota.accounts.length === 1
+                  ? quota.accounts[0].exhausted_until
+                    ? 'Quota limited'
+                    : `${duration(quota.accounts[0].headroom_seconds)} available`
+                  : `${quota.accounts.length} providers`}</strong
+              ><Icon name="chevron" size={14} />
+            </button>
           </div>
           <button
             class="button"
@@ -662,43 +684,30 @@
             onclick={() => openModal('task')}><Icon name="plus" size={17} />New task</button
           >
         </div>
-        <div class="overview-layout">
-          <div class="overview-work">
-            {#if reviewRuns.length}
-              <div class="section-heading attention-heading">
-                <h2>Needs your attention <span class="count-label">{reviewRuns.length}</span></h2>
-              </div>
-              <button class="review-callout" onclick={() => openRun(reviewRuns[0])}>
-                <span class="review-callout-icon"><Icon name="review" size={23} /></span>
-                <span class="review-task"
-                  ><strong>{reviewRuns[0].issue_title}</strong><small
-                    >{reviewRuns[0].project_slug} · {reviewRuns.length}
-                    {reviewRuns.length === 1 ? 'task is' : 'tasks are'} ready for your review.</small
-                  ></span
-                >
-                <span class="review-link">Review work<Icon name="arrow" size={16} /></span>
-              </button>
-            {/if}
-            <ActivityMonitor
-              data={activityData}
-              error={activityError}
-              fetchedAt={activityFetchedAt}
-              {demo}
-              compact
-              oninspect={inspectActivityRun}
-              onrefresh={refreshActivity}
-              onexpand={() => navigate('activity')}
-            />
-          </div>
-          <aside class="overview-insights">
-            <MachinePanel
-              {machine}
-              error={machineError}
-              compact
-              {demo}
-              onmanage={() => navigate('machines')}
-            /><QuotaPanel accounts={quota.accounts} compact />
-          </aside>
+        <div class="overview-work">
+          {#if reviewRuns.length}
+            <button class="review-callout" onclick={() => openRun(reviewRuns[0])}>
+              <span class="review-callout-icon"><Icon name="review" size={20} /></span>
+              <span class="review-task"
+                ><strong>{reviewRuns[0].issue_title}</strong><small
+                  >{reviewRuns.length}
+                  {reviewRuns.length === 1 ? 'task needs' : 'tasks need'} review · {reviewRuns[0]
+                    .project_slug}</small
+                ></span
+              >
+              <span class="review-link">Review work<Icon name="arrow" size={16} /></span>
+            </button>
+          {/if}
+          <ActivityMonitor
+            data={activityData}
+            error={activityError}
+            fetchedAt={activityFetchedAt}
+            {demo}
+            compact
+            oninspect={inspectActivityRun}
+            onrefresh={refreshActivity}
+            onexpand={() => navigate('activity')}
+          />
         </div>
       {:else if page === 'activity'}
         <div class="page-heading simple">

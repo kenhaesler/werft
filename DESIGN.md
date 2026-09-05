@@ -147,7 +147,7 @@ Small rounded rectangles establish a practical, compact form language. Controls 
 
 **Navigation.** Compact rows combine an icon, label, and optional count. The active row gains a pale blue fill and blue text, with `aria-current="page"`. On mobile, the drawer traps Tab, closes with Escape or its backdrop, restores focus to the trigger, and makes the background inert. The closed drawer is inert as well.
 
-**Activity rows and review callout.** Aligned rows show task title, project, status, and last signal. Native details reveal grouped runtime facts and the Open task action. Titles use 15px; supporting session information uses 13px. Overview shows up to six active sessions; phase filters reveal other tasks, and the full activity page expands in groups of twenty. Hover highlights the row. Blue priority callouts make human decisions visible without overwhelming active work.
+**Activity rows and review callout.** Aligned rows show task title, project, status, and last signal. Native details reveal grouped runtime facts and the Open task action. Titles use 15px; supporting session information uses 13px. Overview shows up to three active sessions; phase filters reveal other tasks, and the full activity page expands in groups of twenty. Hover highlights the row. Blue priority callouts make human decisions visible without overwhelming active work.
 
 **Run list and inspector.** Rows open a native modal side panel, up to 640px wide and full viewport height. Timeline, Evidence, and Attempts use buttons with pressed state. A selected live run polls while visible and keeps its last successful detail through transient reconnect failures, showing stale status and the last update time. Evidence supports authenticated downloads, loading, empty, and error states. Available lifecycle actions follow the refreshed run state; a workload is canceled through its run, not by inventing host controls.
 
@@ -166,3 +166,5 @@ Small rounded rectangles establish a practical, compact form language. Controls 
 - **Don't** imply that a sample task changed live infrastructure.
 - **Don't** expose host reboot, snapshot, or shell actions without supporting APIs.
 - **Don't** replace dense supporting content with oversized decorative dashboard cards.
+
+**Overview layout.** Queues use the full content width. Compact machine capacity and quota links sit in the header; full infrastructure panels belong on their dedicated pages. The review callout uses one compact row. At mobile widths the resource links sit under the heading and the five phase filters wrap into a three-plus-two grid. Preserve readable text sizes; reduce module count and spacing rather than shrinking content. The default 1440×900 overview fits without vertical scrolling.
