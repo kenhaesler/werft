@@ -40,57 +40,32 @@
       uniform vec2 u_resolution;
       uniform float u_time;
       uniform float u_active;
-
-      mat2 turn(float a) { float c=cos(a), s=sin(a); return mat2(c,-s,s,c); }
-      float surface(vec3 p, float t) {
-        p.xz = turn(.38 + t * .16) * p.xz;
-        p.yz = turn(.52 + sin(t * .31) * .23) * p.yz;
-        float angle = atan(p.y, p.x);
-        float wave = sin(angle * 3.0 + t * .64);
-        float radius = .48 + .048 * wave;
-        p.z += .13 * sin(angle * 2.0 - t * .53);
-        vec2 section = vec2(length(p.xy) - radius, p.z);
-        section = turn(angle * 1.5 + t * .24) * section;
-        section /= vec2(1.0, .74);
-        return (length(section) - .235 - .028 * sin(angle * 3.0 - t * .7)) * .65;
-      }
-      vec3 normalAt(vec3 p, float t) {
-        vec2 e = vec2(.0015,0.0);
-        return normalize(vec3(surface(p+e.xyy,t)-surface(p-e.xyy,t), surface(p+e.yxy,t)-surface(p-e.yxy,t), surface(p+e.yyx,t)-surface(p-e.yyx,t)));
-      }
+      mat2 rotate(float a) { float c=cos(a),s=sin(a); return mat2(c,-s,s,c); }
       void main() {
-        vec2 uv=(2.0*gl_FragCoord.xy-u_resolution.xy)/min(u_resolution.x,u_resolution.y);
-        float t=u_time * .8;
-        vec3 ro=vec3(0.0,0.0,2.8);
-        vec3 rd=normalize(vec3(uv,-2.8));
-        float travel=0.0;
-        float distance=1.0;
-        for(int i=0;i<80;i++) {
-          distance=surface(ro+rd*travel,t);
-          travel+=distance;
-          if(abs(distance)<.001 || travel>4.0) break;
-        }
-        if(travel>4.0) { gl_FragColor=vec4(0.0); return; }
-        vec3 p=ro+rd*travel;
-        vec3 n=normalAt(p,t);
-        float facing=clamp(dot(n,-rd),0.0,1.0);
-        float rim=pow(1.0-facing,2.0);
-        float hue=sin(p.y*2.8+p.x*1.9+t*.25+n.z*2.0)*.5+.5;
-        vec3 blue=vec3(.08,.22,.86);
-        vec3 violet=vec3(.56,.27,.94);
-        vec3 cyan=vec3(.25,.91,.94);
-        vec3 color=mix(blue,violet,smoothstep(.25,.9,hue));
-        color=mix(color,cyan,smoothstep(.05,.94,n.y*.5+n.x*.3+.48));
-        float light=dot(n,normalize(vec3(-.5,.8,1.1)))*.5+.5;
-        color*=.55+.55*light;
-        vec3 reflection=reflect(rd,n);
-        float softbox=pow(max(0.0,dot(reflection,normalize(vec3(-.45,.9,1.5)))),8.0);
-        color=mix(color,vec3(.86,.96,1.0),softbox*.72);
-        color+=vec3(.15,.4,.48)*rim*.42;
-        color+=vec3(.09,.15,.19)*u_active;
-        // Subpixel coverage gives the sculpted silhouette a soft, clean edge.
-        float alpha=smoothstep(0.0,.075,facing);
-        gl_FragColor=vec4(color,alpha);
+        vec2 uv=(gl_FragCoord.xy*2.0-u_resolution.xy)/min(u_resolution.x,u_resolution.y);
+        float t=u_time*.55;
+        vec2 p=rotate(.12*sin(t*.7))*uv;
+        p += .045*vec2(sin(t*.83),cos(t*.61));
+        float angle=atan(p.y,p.x);
+        float radius=length(p);
+        float boundary=.55+.035*sin(angle*3.0+t)+.025*cos(angle*2.0-t*.73);
+        float body=1.0-smoothstep(boundary-.12,boundary+.19,radius);
+        float flow=sin(angle*2.0-t*.75+radius*2.0)*.5+.5;
+        vec2 drift=vec2(.17*sin(t*.62),.16*cos(t*.49));
+        float blue=exp(-5.0*dot(p-drift,p-drift));
+        float cyan=exp(-7.0*dot(p-vec2(.24,.22)-drift*.4,p-vec2(.24,.22)-drift*.4));
+        vec3 core=mix(vec3(.045,.28,.95),vec3(.0,.63,.98),clamp(cyan*.85+(1.0-blue)*.3,0.0,1.0));
+        core=mix(core,vec3(.20,.83,.90),smoothstep(.10,.67,p.y)*.48);
+        float bandRadius=.64+.06*sin(angle*2.0-t*.65)+.025*cos(angle*3.0+t*.43);
+        float band=exp(-pow((radius-bandRadius)/.105,2.0));
+        float haze=exp(-pow((radius-.62)/.23,2.0))*.28;
+        vec3 halo=mix(vec3(.38,.83,.97),vec3(.67,.60,.96),smoothstep(-.25,.6,-p.y));
+        halo=mix(halo,vec3(.62,.94,.84),smoothstep(.0,.6,p.y)*flow);
+        float haloAlpha=(band*.27+haze)*(.7+.3*flow);
+        float alpha=body+haloAlpha*(1.0-body);
+        vec3 color=(core*body+halo*haloAlpha*(1.0-body))/max(alpha,.001);
+        color=mix(color,vec3(.19,.72,1.0),u_active*.12);
+        gl_FragColor=vec4(color,alpha*(1.0-smoothstep(.86,1.0,radius)));
       }
     `;
 
@@ -256,9 +231,7 @@
   aria-hidden="true"
 >
   <div class="orb-aura"></div>
-  <div class="fallback-orb" class:is-hidden={!useFallback}>
-    <span class="fallback-core"></span><span class="fallback-filament"></span>
-  </div>
+  <div class="fallback-orb" class:is-hidden={!useFallback}></div>
   <canvas bind:this={canvas} class="orb-canvas" class:is-hidden={useFallback}></canvas>
 </div>
 
@@ -292,52 +265,15 @@
     display: none;
   }
   .fallback-orb {
-    position: relative;
-    overflow: hidden;
     background: radial-gradient(
-      circle at 31% 24%,
-      #9cf5ff 0 2%,
-      #36c8ff 7%,
-      #2254f1 28%,
-      #16066d 70%
+      ellipse at 48% 46%,
+      #0764f9 0 23%,
+      #128cfa 35%,
+      #61deed9c 47%,
+      #b3dbef44 59%,
+      transparent 70%
     );
-    box-shadow:
-      inset -18px -16px 29px #07034c99,
-      inset 10px 9px 19px #9ff7ff55,
-      0 0 23px #436cff55;
-  }
-  .fallback-orb::before,
-  .fallback-orb::after {
-    content: '';
-    position: absolute;
-    inset: -19%;
-    border: 1px solid #b96dff9c;
-    border-radius: 47% 53% 49% 51%;
-    transform: rotate(-32deg);
-    box-shadow: 0 0 10px #58e4ff88;
-  }
-  .fallback-orb::after {
-    inset: 9%;
-    border-color: #48ebffb0;
-    transform: rotate(38deg) skewX(-17deg);
-  }
-  .fallback-core {
-    position: absolute;
-    inset: 18%;
-    border-radius: 50%;
-    background: radial-gradient(circle at 37% 25%, #aaf6ff, #206cff 31%, #21107c 74%);
-    filter: blur(1px);
-  }
-  .fallback-filament {
-    position: absolute;
-    width: 136%;
-    height: 43%;
-    top: 29%;
-    left: -18%;
-    border: 2px solid #b38aff99;
-    border-radius: 50%;
-    transform: rotate(-31deg);
-    box-shadow: 0 0 12px #52deff;
+    filter: blur(3px);
   }
   @media (prefers-reduced-motion: reduce) {
     .orb-aura {
