@@ -2,6 +2,7 @@
   import { onMount, tick } from 'svelte';
   import { SvelteURLSearchParams } from 'svelte/reactivity';
   import Icon from './lib/Icon.svelte';
+  import ThemeToggle from './lib/ThemeToggle.svelte';
   import ProjectControls from './lib/ProjectControls.svelte';
   import ProjectCanvas from './lib/ProjectCanvas.svelte';
   import { loadCanvasRuns } from './lib/canvas-data';
@@ -691,6 +692,17 @@
     panel?.querySelector<HTMLButtonElement>('.icon-button')?.focus({ preventScroll: true });
     if (window.innerWidth <= 1100) panel?.scrollIntoView({ block: 'start' });
   }
+  function enterProject(project: Project | null) {
+    const update = async () => {
+      canvasProjectId = project?.id ?? null;
+      selected = null;
+      await tick();
+      document.querySelector<HTMLElement>('.canvas-header button')?.focus({ preventScroll: true });
+    };
+    if (document.startViewTransition && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      document.startViewTransition(update);
+    } else void update();
+  }
 </script>
 
 <svelte:window onkeydown={keydown} />
@@ -776,6 +788,7 @@
         >
       </div>
       <div class="topbar-right">
+        <ThemeToggle />
         <button
           class="connection-state"
           onclick={() => navigate('activity')}
@@ -854,10 +867,8 @@
               error={projectsError || canvasError || loadError}
               project={canvasProject}
               selectedRunId={selected?.id}
-              onproject={(project) => {
-                canvasProjectId = project?.id ?? null;
-                selected = null;
-              }}
+              onproject={enterProject}
+              ontalk={() => navigate('talk')}
               onrun={openCanvasRun}
               onnewtask={() => {
                 openModal('task');
@@ -912,9 +923,6 @@
         />
       {:else if page === 'talk'}
         <div class="talk-workspace">
-          <div class="page-heading simple">
-            <div><h1>Talk to Werft</h1></div>
-          </div>
           <Conversation scope="orchestrator" {demo} />
         </div>
       {:else if page === 'agents' || page === 'review'}

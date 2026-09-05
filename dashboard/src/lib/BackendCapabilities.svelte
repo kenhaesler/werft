@@ -166,10 +166,10 @@
 
 <style>
   .capabilities {
-    background: #fff;
-    border: 1px solid #dce5f0;
+    background: var(--panel);
+    border: 1px solid var(--border);
     border-radius: 12px;
-    color: #172b4d;
+    color: var(--text);
     padding: 20px;
     font:
       14px/1.5 'Geist Variable',
@@ -191,20 +191,20 @@
   }
   .intro,
   .muted {
-    color: #52657e;
+    color: var(--muted);
     margin: 8px 0 16px;
   }
   .sample {
-    color: #97601b;
+    color: var(--amber);
     font-size: 12px;
     font-weight: 650;
     letter-spacing: 0.04em;
   }
   .refresh {
-    background: #fff;
-    border: 1px solid #b9cbe3;
+    background: var(--surface-raised);
+    border: 1px solid var(--border);
     border-radius: 7px;
-    color: #344d70;
+    color: var(--text-control);
     cursor: pointer;
     min-height: 44px;
     min-width: 44px;
@@ -214,10 +214,10 @@
     opacity: 0.5;
   }
   .capability-list {
-    border-top: 1px solid #e6edf5;
+    border-top: 1px solid var(--border);
   }
   .capability-row {
-    border-bottom: 1px solid #edf1f6;
+    border-bottom: 1px solid var(--border);
     gap: 12px;
     min-height: 44px;
   }
@@ -225,14 +225,14 @@
     flex: 1;
   }
   .capability-row strong {
-    color: #8d3c2e;
+    color: var(--danger);
     font-size: 13px;
   }
   .capability-row strong.ready {
-    color: #2463eb;
+    color: var(--accent);
   }
   .dispatch {
-    border-bottom: 1px solid #e6edf5;
+    border-bottom: 1px solid var(--border);
   }
   summary {
     cursor: pointer;
@@ -248,7 +248,7 @@
   }
   summary small {
     align-items: center;
-    color: #52657e;
+    color: var(--muted);
     display: inline-flex;
     gap: 6px;
   }
@@ -265,7 +265,7 @@
     margin: 0 0 16px;
   }
   dt {
-    color: #63758c;
+    color: var(--dim);
     font-size: 13px;
   }
   dd {
@@ -278,11 +278,11 @@
       monospace;
   }
   .error {
-    color: #8d3c2e;
+    color: var(--danger);
   }
   button:focus-visible,
   summary:focus-visible {
-    outline: 2px solid #2463eb;
+    outline: 2px solid var(--accent);
     outline-offset: 3px;
   }
   @media (max-width: 560px) {

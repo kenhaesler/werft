@@ -132,7 +132,7 @@
 <style>
   .evidence {
     font-size: 14px;
-    color: #172b4d;
+    color: var(--text);
   }
   .evidence-group + .evidence-group {
     margin-top: 24px;
@@ -147,7 +147,7 @@
     align-items: center;
     justify-content: space-between;
     padding: 12px 0;
-    border-bottom: 1px solid #dce5f0;
+    border-bottom: 1px solid var(--border);
   }
   .artifact-name {
     display: flex;
@@ -156,7 +156,7 @@
     align-items: flex-start;
   }
   .artifact-name :global(svg) {
-    color: #365e95;
+    color: var(--text-control);
     margin-top: 2px;
   }
   .artifact-name span {
@@ -168,7 +168,7 @@
     overflow-wrap: anywhere;
   }
   small {
-    color: #52657e;
+    color: var(--muted);
     font-size: 13px;
     margin-top: 4px;
     line-height: 1.45;
@@ -184,20 +184,20 @@
   .text-button {
     border: 0;
     background: none;
-    color: #365e95;
+    color: var(--text-control);
     padding: 10px 0;
     min-height: 44px;
     font-size: 14px;
   }
   .text-button:hover {
-    color: #215bc7;
+    color: var(--accent);
     text-decoration: underline;
     text-underline-offset: 4px;
   }
   .preview {
     margin-top: 24px;
     padding: 16px;
-    background: #edf3ff;
+    background: var(--accent-soft);
     border-radius: 12px;
   }
   .preview > div {
@@ -207,18 +207,18 @@
     gap: 12px;
   }
   .preview p {
-    color: #52657e;
+    color: var(--muted);
     margin: 12px 0 0;
   }
   .preview-error {
-    color: #8a462d !important;
+    color: var(--danger) !important;
   }
   pre {
     max-height: 360px;
     overflow: auto;
     margin: 12px 0 0;
     padding: 12px;
-    background: #fff;
+    background: var(--surface-input);
     border-radius: 8px;
     font-size: 14px;
     line-height: 1.55;

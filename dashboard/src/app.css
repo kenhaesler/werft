@@ -3,8 +3,8 @@
 
 :root {
   font-family: 'Geist Variable', sans-serif;
-  color: #172b4d;
-  background: #f7f9fc;
+  color: var(--text);
+  background: var(--canvas);
   font-synthesis: none;
   font-optical-sizing: auto;
   -webkit-font-smoothing: antialiased;
@@ -29,6 +29,8 @@
 body {
   margin: 0;
   min-width: 360px;
+  background: var(--canvas);
+  color: var(--text);
 }
 button,
 input,
@@ -76,9 +78,9 @@ svg {
 input,
 select,
 textarea {
-  border: 1px solid #dce5f0;
+  border: 1px solid var(--border);
   border-radius: 7px;
-  background: #edf3fb;
+  background: var(--surface-input);
   color: var(--text);
   padding: 10px 12px;
   min-width: 0;
@@ -86,7 +88,7 @@ textarea {
 }
 input::placeholder,
 textarea::placeholder {
-  color: #526a88;
+  color: var(--text-subtle);
 }
 input:focus,
 textarea:focus,
@@ -101,12 +103,12 @@ textarea {
   outline-offset: 4px;
 }
 ::selection {
-  background: #2463eb;
-  color: #ffffff;
+  background: var(--accent);
+  color: var(--accent-ink);
 }
 * {
   scrollbar-width: thin;
-  scrollbar-color: #dce5f0 transparent;
+  scrollbar-color: var(--border) transparent;
 }
 h1,
 h2,

@@ -40,8 +40,8 @@ const callbacks = {
 };
 
 describe('ProjectCanvas', () => {
-  it('places seven active task nodes at distinct canvas coordinates', () => {
-    const { container } = render(ProjectCanvas, {
+  it('renders each active session as an operational task-to-result workstream', () => {
+    const { container, getAllByText } = render(ProjectCanvas, {
       props: {
         projects: [project],
         runs: Array.from({ length: 7 }, (_, index) => run(index + 1)),
@@ -56,9 +56,11 @@ describe('ProjectCanvas', () => {
 
     const nodes = [...container.querySelectorAll<HTMLElement>('[data-run-id]')];
     expect(nodes).toHaveLength(7);
-    expect(new Set(nodes.map((node) => node.getAttribute('style'))).size).toBe(7);
-    expect(nodes[0].getAttribute('style')).toContain('top: 280px');
-    expect(nodes[6].getAttribute('style')).toContain('top: 720px');
+    expect(container.querySelectorAll('.workstream')).toHaveLength(7);
+    expect(getAllByText('Task').length).toBeGreaterThan(0);
+    expect(getAllByText('Agent').length).toBeGreaterThan(0);
+    expect(getAllByText('Checks').length).toBeGreaterThan(0);
+    expect(getAllByText('Result').length).toBeGreaterThan(0);
   });
 
   it('explains the absence of sessions without inventing an idle agent', () => {
@@ -76,7 +78,7 @@ describe('ProjectCanvas', () => {
     });
 
     expect(getByText('No active sessions')).toBeTruthy();
-    expect(getByText('Agents start when an approved task is ready.')).toBeTruthy();
+    expect(getByText('Start an approved task to place an agent on this workbench.')).toBeTruthy();
     expect(queryByText('Idle agent')).toBeNull();
   });
 });

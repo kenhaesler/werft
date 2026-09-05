@@ -187,7 +187,7 @@
 <style>
   .session {
     font-size: 14px;
-    color: #172b4d;
+    color: var(--text);
   }
   .session-heading {
     display: flex;
@@ -200,7 +200,7 @@
     margin: 0;
   }
   p {
-    color: #52657e;
+    color: var(--muted);
     line-height: 1.55;
     margin: 6px 0 0;
   }
@@ -212,7 +212,7 @@
     padding: 10px 0;
     border: 0;
     background: none;
-    color: #365e95;
+    color: var(--text-control);
     font-size: 14px;
     white-space: nowrap;
   }
@@ -223,8 +223,8 @@
     margin: 16px 0;
     padding: 14px;
     border-radius: 10px;
-    background: #172b4d;
-    color: #f7f9fc;
+    background: var(--surface-input);
+    color: var(--text);
     font-size: 14px;
     line-height: 1.55;
     white-space: pre-wrap;
@@ -232,17 +232,17 @@
   }
   .state {
     padding: 12px 0;
-    border-bottom: 1px solid #dce5f0;
+    border-bottom: 1px solid var(--border);
   }
   .warning {
-    color: #8a462d;
+    color: var(--danger);
   }
   summary {
     min-height: 44px;
     display: flex;
     align-items: center;
     cursor: pointer;
-    color: #365e95;
+    color: var(--text-control);
   }
   dl {
     display: grid;
@@ -251,7 +251,7 @@
     margin: 8px 0 0;
   }
   dt {
-    color: #52657e;
+    color: var(--muted);
     font-size: 13px;
     margin-bottom: 4px;
   }

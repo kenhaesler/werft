@@ -9,6 +9,10 @@
   let reducedMotion = $state(false);
 
   onMount(() => {
+    if (!window.matchMedia || !window.IntersectionObserver) {
+      reducedMotion = true;
+      return;
+    }
     const preference = window.matchMedia('(prefers-reduced-motion: reduce)');
     const syncPreference = () => (reducedMotion = preference.matches);
     let intersecting = true;

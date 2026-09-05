@@ -1,8 +1,10 @@
 <script lang="ts">
   import type { RunStatus } from './types';
   import { statusLabels } from './format';
+  import Icon from './Icon.svelte';
   let { status }: { status: RunStatus } = $props();
   const steps = ['Preparing', 'Working', 'Checks', 'Review', 'Completed'];
+  const icons = ['projects', 'agent', 'review', 'check', 'branch'];
   const positions: Record<RunStatus, number> = {
     queued: 0,
     claimed: 0,
@@ -28,12 +30,12 @@
     {#each steps as step, index (step)}
       <li
         class:current={index === current}
+        class:passed={!interrupted && index < current}
         class:interrupted={interrupted && index === current}
         aria-current={index === current ? 'step' : undefined}
       >
-        <span class="stage-dot"></span><span
-          >{step === 'Completed' && status === 'merging' ? 'Merging' : step}</span
-        >
+        <span class="stage-dot" aria-hidden="true"><Icon name={icons[index]} size={17} /></span
+        ><span>{step === 'Completed' && status === 'merging' ? 'Merging' : step}</span>
       </li>
     {/each}
   </ol>
@@ -42,9 +44,9 @@
 
 <style>
   .run-progress {
-    padding: 18px 0 22px;
+    padding: 20px 0 24px;
     margin-bottom: 18px;
-    border-bottom: 1px solid #dce5f0;
+    border-bottom: 1px solid var(--border);
   }
   .progress-title {
     display: flex;
@@ -53,7 +55,7 @@
     font-size: 14px;
   }
   .progress-title span {
-    color: #245edb;
+    color: var(--accent);
   }
   ol {
     display: grid;
@@ -68,43 +70,54 @@
     flex-direction: column;
     align-items: center;
     gap: 10px;
-    color: #52657e;
+    color: var(--muted);
     font-size: 12px;
   }
   li:not(:last-child)::after {
     content: '';
     position: absolute;
     height: 1px;
-    background: #dce5f0;
-    top: 6px;
-    left: calc(50% + 10px);
-    width: calc(100% - 20px);
+    background: var(--border);
+    top: 18px;
+    left: calc(50% + 22px);
+    width: calc(100% - 44px);
   }
   .stage-dot {
-    width: 13px;
-    height: 13px;
-    border-radius: 50%;
-    border: 1px solid #a7b7ce;
-    background: #fff;
+    display: grid;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--panel);
   }
   .current {
-    color: #245edb;
+    color: var(--accent);
     font-weight: 650;
   }
   .current .stage-dot {
-    border-color: #245edb;
-    background: #245edb;
+    border-color: var(--accent);
+    color: var(--accent-ink);
+    background: var(--accent);
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+  .passed .stage-dot {
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 9%, var(--panel));
+  }
+  .passed::after {
+    background: var(--accent) !important;
   }
   .interrupted {
-    color: #975315 !important;
+    color: var(--amber) !important;
   }
   .interrupted .stage-dot {
-    border-color: #975315;
-    background: #975315;
+    border-color: var(--amber);
+    background: var(--amber);
   }
   p {
     margin: 15px 0 0;
-    color: #975315;
+    color: var(--amber);
     font-size: 13px;
   }
 </style>

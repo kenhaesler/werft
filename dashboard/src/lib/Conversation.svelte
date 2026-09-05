@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api } from './api';
   import Icon from './Icon.svelte';
+  import WerftOrb from './WerftOrb.svelte';
 
   type MessageStatus = 'queued' | 'delivered' | 'answered' | 'failed' | 'demo';
   type Message = {
@@ -26,6 +27,7 @@
   let draft = $state('');
   let sendError = $state('');
   let sending = $state(false);
+  let orbPaused = $state(false);
   let pendingContent = $state('');
   let pendingClientId = $state('');
   let scopeGeneration = 0;
@@ -244,11 +246,34 @@
 </script>
 
 <section class="conversation" aria-label={title}>
-  <div class="conversation-heading">
+  <div class="conversation-heading" class:orchestrator-presence={scope === 'orchestrator'}>
+    {#if scope === 'orchestrator'}<div class="presence-orb">
+        <WerftOrb size={168} active={sending && !demo} paused={orbPaused} />
+      </div>{/if}
     <div>
-      {#if scope !== 'orchestrator'}<h2>{title}</h2>{/if}
+      {#if scope === 'orchestrator'}<h1>{title}</h1>{:else}<h2>{title}</h2>{/if}
       <p>{scopeLabel} · Ask a question or give direction.</p>
+      {#if scope === 'orchestrator'}<span class="presence-state"
+          >{demo
+            ? 'Demo workspace'
+            : sending
+              ? 'Sending your message…'
+              : loading
+                ? 'Connecting…'
+                : refreshError
+                  ? 'Updates interrupted'
+                  : available
+                    ? 'Ready for your message'
+                    : 'Connection required'}</span
+        >{/if}
     </div>
+    {#if scope === 'orchestrator'}<button
+        class="orb-motion"
+        aria-label={orbPaused ? 'Play orb animation' : 'Pause orb animation'}
+        title={orbPaused ? 'Play orb animation' : 'Pause orb animation'}
+        onclick={() => (orbPaused = !orbPaused)}
+        ><Icon name={orbPaused ? 'play' : 'pause'} size={14} /></button
+      >{/if}
     {#if !demo && !loading}<span class:unavailable={!available} class="conversation-availability"
         >{available ? 'Available' : 'Unavailable'}</span
       >{/if}
@@ -323,6 +348,76 @@
 </section>
 
 <style>
+  .orchestrator-presence {
+    position: relative;
+    align-items: center !important;
+    justify-content: start !important;
+    padding: 20px 24px;
+    border: 1px solid var(--border);
+    border-radius: 22px;
+    background: linear-gradient(
+      120deg,
+      color-mix(in srgb, var(--accent) 9%, var(--panel)),
+      color-mix(in srgb, var(--panel) 90%, transparent)
+    );
+    backdrop-filter: blur(20px);
+  }
+  .orchestrator-presence h1 {
+    font-size: 30px;
+    letter-spacing: -0.03em;
+    margin: 0 0 8px;
+    color: var(--text);
+  }
+  .presence-orb {
+    flex: 0 0 168px;
+  }
+  .presence-state {
+    display: block;
+    margin-top: 12px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .orb-motion {
+    position: absolute;
+    right: 12px;
+    bottom: 12px;
+    width: 28px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+    background: var(--panel);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 50%;
+  }
+  @media (max-width: 600px) {
+    .orchestrator-presence {
+      padding: 16px;
+      gap: 12px !important;
+      flex-wrap: wrap;
+    }
+    .presence-orb {
+      flex-basis: 104px;
+      width: 104px;
+      height: 104px;
+      display: grid;
+      place-items: center;
+    }
+    .presence-orb :global(.werft-orb) {
+      max-width: 104px;
+      max-height: 104px;
+    }
+    .orchestrator-presence h1 {
+      font-size: 24px;
+    }
+    .orchestrator-presence > div:nth-child(2) {
+      flex: 1;
+      min-width: 140px;
+    }
+    .presence-state {
+      margin-top: 8px;
+    }
+  }
   .conversation {
     display: flex;
     flex: 1;
@@ -347,9 +442,9 @@
     line-height: 1.55;
   }
   .conversation-availability {
-    color: #215bc7;
-    background: #eaf2ff;
-    border: 1px solid #c5d9fb;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border: 1px solid var(--accent-border);
     border-radius: 6px;
     padding: 4px 7px;
     font-size: 12px;
@@ -357,24 +452,24 @@
   }
   .conversation-availability.unavailable,
   .failed {
-    color: #a34434;
+    color: var(--danger);
   }
   .conversation-demo,
   .conversation-notice {
     margin: 0;
     padding: 10px 12px;
-    background: #edf3ff;
-    border: 1px solid #c5d9fb;
+    background: var(--accent-soft);
+    border: 1px solid var(--accent-border);
     border-radius: 9px;
-    color: #365e95;
+    color: var(--text-control);
     font-size: 13px;
     line-height: 1.5;
   }
   .conversation-notice.warning,
   .conversation-send-error {
-    color: #92531c;
-    background: #fff7ea;
-    border: 1px solid #ead1a4;
+    color: var(--amber);
+    background: var(--warning-soft);
+    border: 1px solid var(--warning-border);
   }
   .conversation-messages {
     flex: 1;
@@ -390,15 +485,15 @@
     padding: 12px 14px;
     border: 1px solid var(--border);
     border-radius: 9px;
-    background: white;
+    background: var(--surface-raised);
     overflow-wrap: anywhere;
   }
   .conversation-message.user {
-    background: #eef4ff;
-    border-color: #c5d9fb;
+    background: var(--panel-hover);
+    border-color: var(--accent-border);
   }
   .conversation-message.system {
-    background: #f7f9fc;
+    background: var(--canvas);
   }
   .message-meta {
     display: flex;
@@ -435,7 +530,7 @@
   }
   .conversation-composer textarea {
     margin-bottom: 9px;
-    background: white;
+    background: var(--surface-raised);
     min-height: 76px;
     font-size: 14px;
     line-height: 1.55;

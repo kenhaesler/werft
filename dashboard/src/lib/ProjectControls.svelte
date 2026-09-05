@@ -227,10 +227,10 @@
 
 <style>
   .project-controls {
-    background: #fff;
+    background: var(--panel);
     border: 1px solid #dce5f0;
     border-radius: 12px;
-    color: #172b4d;
+    color: var(--text);
     padding: 16px 20px;
     font:
       14px/1.5 'Geist Variable',
@@ -253,20 +253,20 @@
     gap: 18px;
   }
   .sample-label {
-    color: #97601b;
+    color: var(--amber);
     font-size: 12px;
     font-weight: 650;
     letter-spacing: 0.04em;
     margin: 4px 0 0;
   }
   .lifecycle-explainer {
-    color: #52657e;
+    color: var(--muted);
     margin: 6px 0 0;
   }
   h2,
   h3 {
     margin: 0;
-    color: #172b4d;
+    color: var(--text);
   }
   h2 {
     font-size: 18px;
@@ -278,14 +278,14 @@
   .lifecycle {
     border: 1px solid #b9cbe3;
     border-radius: 999px;
-    color: #344d70;
+    color: var(--text-control);
     padding: 5px 10px;
     font-weight: 600;
     white-space: nowrap;
   }
   .lifecycle.oracle {
-    color: #2463eb;
-    border-color: #9db9f5;
+    color: var(--accent);
+    border-color: var(--accent-border);
     background: #eef4ff;
   }
   .project-controls > summary {
@@ -317,7 +317,7 @@
     min-width: 0;
   }
   dt {
-    color: #63758c;
+    color: var(--dim);
     font-size: 13px;
   }
   dd {
@@ -328,7 +328,7 @@
   }
   a {
     align-items: center;
-    color: #2463eb;
+    color: var(--accent);
     display: inline-flex;
     gap: 5px;
     text-decoration: none;
@@ -345,7 +345,7 @@
     padding-top: 18px;
   }
   .repair-copy p {
-    color: #52657e;
+    color: var(--muted);
     margin: 3px 0 0;
   }
   .history {
@@ -371,7 +371,7 @@
   }
   .history time,
   .muted {
-    color: #63758c;
+    color: var(--dim);
     font-size: 13px;
   }
   .history li details {
@@ -395,15 +395,15 @@
     white-space: pre-wrap;
   }
   .history-footer {
-    color: #63758c;
+    color: var(--dim);
     font-size: 13px;
     margin-top: 12px;
   }
   .history-button {
-    background: #fff;
+    background: var(--surface-raised);
     border: 1px solid #b9cbe3;
     border-radius: 6px;
-    color: #344d70;
+    color: var(--text-control);
     cursor: pointer;
     min-height: 34px;
     margin-left: 6px;
@@ -414,7 +414,7 @@
     opacity: 0.5;
   }
   .history-error {
-    color: #8d3c2e;
+    color: var(--danger);
     font-size: 14px;
   }
   .actions {
@@ -443,15 +443,15 @@
   }
   .button.primary {
     background: #2463eb;
-    border-color: #2463eb;
-    color: #fff;
+    border-color: var(--accent);
+    color: var(--accent-ink);
   }
   .button.primary:hover {
     background: #1d50c4;
   }
   .button.secondary {
-    background: #fff;
-    color: #344d70;
+    background: var(--surface-raised);
+    color: var(--text-control);
   }
   .button.secondary:hover {
     background: #eef4ff;
@@ -462,7 +462,7 @@
   }
   .impact {
     align-items: flex-start;
-    color: #52657e;
+    color: var(--muted);
     display: flex;
     flex-basis: 100%;
     gap: 8px;
@@ -475,10 +475,10 @@
   }
   .error {
     align-items: flex-start;
-    background: #fff4f1;
+    background: var(--danger-soft);
     border: 1px solid #efc7bd;
     border-radius: 9px;
-    color: #8d3c2e;
+    color: var(--danger);
     gap: 9px;
     margin-top: 16px;
     padding: 12px;
@@ -489,12 +489,12 @@
     gap: 2px;
   }
   .error span {
-    color: #71392f;
+    color: var(--danger);
   }
   .retry {
     background: transparent;
     border: 0;
-    color: #8d3c2e;
+    color: var(--danger);
     min-height: 30px;
     padding: 2px 0;
     text-decoration: underline;

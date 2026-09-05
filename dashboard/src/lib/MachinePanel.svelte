@@ -161,7 +161,7 @@
     margin: 6px 0 12px;
   }
   .machine-error {
-    color: #9a481d;
+    color: var(--danger);
     margin: 14px 0 0;
   }
   .container-row {

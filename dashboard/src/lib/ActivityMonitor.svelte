@@ -489,7 +489,7 @@
   }
   .stale,
   .signal-warning {
-    color: #9a481d;
+    color: var(--danger);
   }
   .work-pipeline {
     display: grid;
@@ -510,7 +510,7 @@
   .work-pipeline button:hover,
   .work-pipeline button.chosen {
     background: #eaf1ff;
-    border-color: #bfd2f7;
+    border-color: var(--accent-border);
   }
   .pipeline-node {
     display: inline-flex;
@@ -556,8 +556,8 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    color: #94511d;
-    background: #fff5e9;
+    color: var(--amber);
+    background: var(--warning-soft);
     padding: 7px 9px;
     border: none;
     border-radius: 6px;
@@ -707,7 +707,7 @@
     color: var(--muted);
   }
   .backend-summary > span.signal-warning {
-    color: #9a481d;
+    color: var(--danger);
   }
   .worker-list {
     padding-top: 14px;
@@ -747,7 +747,7 @@
   }
   .worker-error .worker-action,
   .worker-error .worker-state {
-    color: #9a481d;
+    color: var(--danger);
   }
   .worker dl {
     margin: 0 0 14px;
@@ -765,8 +765,8 @@
     line-height: 1.6;
     padding: 14px;
     margin: 16px 0;
-    color: #94511d;
-    background: #fff5e9;
+    color: var(--amber);
+    background: var(--warning-soft);
     border-radius: 8px;
   }
   .activity-warning > span {
@@ -976,7 +976,7 @@
     color: var(--muted);
   }
   .activity-views .view-error {
-    color: #9a481d;
+    color: var(--danger);
   }
   .activity-pagination {
     display: flex;

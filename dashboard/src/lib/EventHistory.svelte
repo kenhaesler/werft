@@ -282,7 +282,7 @@
     color: var(--muted);
   }
   .event-history-error {
-    color: #9a481d;
+    color: var(--danger);
     padding: 10px 0;
   }
   .event-history-empty {
