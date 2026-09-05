@@ -11,6 +11,8 @@ for (const viewport of [
     page.on('pageerror', (error) => errors.push(error.message));
     await page.setViewportSize(viewport);
     await page.goto('/');
+    if (viewport.width < 600) await page.getByRole('button', { name: 'Open navigation' }).click();
+    await page.getByRole('button', { name: 'Activity', exact: true }).click();
     const row = page.locator('.session-row').first();
     await row.locator('summary').click();
     const opener = row.getByRole('button', { name: 'Open task' });
@@ -40,6 +42,7 @@ test('task inspector explains the agent and keeps technical evidence behind dril
 }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto('/');
+  await page.getByRole('button', { name: 'Activity', exact: true }).click();
   const row = page.locator('.session-row').first();
   await row.locator('summary').click();
   await row.getByRole('button', { name: 'Open task' }).click();

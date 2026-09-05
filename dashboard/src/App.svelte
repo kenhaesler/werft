@@ -3,6 +3,8 @@
   import { SvelteURLSearchParams } from 'svelte/reactivity';
   import Icon from './lib/Icon.svelte';
   import ProjectControls from './lib/ProjectControls.svelte';
+  import ProjectCanvas from './lib/ProjectCanvas.svelte';
+  import { loadCanvasRuns } from './lib/canvas-data';
   import BackendCapabilities from './lib/BackendCapabilities.svelte';
   import RunList from './lib/RunList.svelte';
   import MachinePanel from './lib/MachinePanel.svelte';
@@ -12,7 +14,7 @@
   import { previewActivity } from './lib/activity';
   import { api, actions, ApiError, getToken, setToken } from './lib/api';
   import { demoMachine, demoProjects, demoQuota, demoRuns } from './lib/demo';
-  import { activeStatuses, duration } from './lib/format';
+  import { activeStatuses } from './lib/format';
   import type {
     ActivitySnapshot,
     Machine,
@@ -24,9 +26,8 @@
   } from './lib/types';
 
   const navigation = [
-    { id: 'overview', label: 'Overview', icon: 'overview' },
+    { id: 'overview', label: 'Projects', icon: 'projects' },
     { id: 'agents', label: 'Agents', icon: 'agent' },
-    { id: 'projects', label: 'Projects', icon: 'projects' },
     { id: 'review', label: 'Review', icon: 'review' },
     { id: 'machines', label: 'Virtual machine', icon: 'vm' },
     { id: 'activity', label: 'Activity', icon: 'activity' },
@@ -71,6 +72,14 @@
   let repoInput = $state('');
   let slugInput = $state('');
   let session = $state(0);
+  let canvasProjectId = $state<string | null>(null);
+  const canvasPage = $derived(page === 'overview' || page === 'projects');
+  const canvasProject = $derived(
+    projects.find((project) => project.id === canvasProjectId) ?? null,
+  );
+  let canvasRuns = $state<RunSummary[]>([]);
+  let canvasLoading = $state(false);
+  let canvasError = $state('');
   let refreshCount = 0;
   let refreshCompletion: Promise<void> = Promise.resolve();
   let activeRuns = $derived(runs.filter((run) => activeStatuses.includes(run.status)));
@@ -81,6 +90,27 @@
   let queryLoading = $state(false);
   let queryError = $state('');
   let queryRefresh = $state(0);
+  $effect(() => {
+    void session;
+    void queryRefresh;
+    if (demo || !canvasPage) return;
+    const request = new AbortController();
+    canvasLoading = true;
+    void loadCanvasRuns(AbortSignal.any([request.signal, AbortSignal.timeout(30_000)]))
+      .then((data) => {
+        if (request.signal.aborted) return;
+        canvasRuns = data;
+        canvasError = '';
+      })
+      .catch(() => {
+        if (!request.signal.aborted)
+          canvasError = 'Project activity could not refresh. Displayed work may be out of date.';
+      })
+      .finally(() => {
+        if (!request.signal.aborted) canvasLoading = false;
+      });
+    return () => request.abort();
+  });
   let remoteCommands = $state<RunSummary[]>([]);
   let commandError = $state('');
   let commandLoading = $state(false);
@@ -220,6 +250,8 @@
   );
 
   function navigate(id: string) {
+    selected = null;
+    canvasProjectId = null;
     page = id;
     filter = 'all';
     search = '';
@@ -257,6 +289,9 @@
     if (requestSession === session) openRun(run);
   }
   function preview() {
+    canvasRuns = [];
+    canvasProjectId = null;
+    canvasError = '';
     session++;
     refreshCount++;
     loading = false;
@@ -379,6 +414,8 @@
       await api<QuotaResponse>('/quota', { headers: { Authorization: `Bearer ${value}` } });
       session++;
       setToken(value);
+      canvasRuns = [];
+      canvasProjectId = null;
       tokenInput = '';
       demo = false;
       runs = [];
@@ -423,6 +460,7 @@
         if (updated) {
           runs = runs.map((item) => (item.id === updated.id ? updated : item));
           queryRuns = queryRuns.map((item) => (item.id === updated.id ? updated : item));
+          canvasRuns = canvasRuns.map((item) => (item.id === updated.id ? updated : item));
           if (selected?.id === updated.id) selected = updated;
         }
         await refresh();
@@ -512,6 +550,11 @@
     notice = 'Task queued in the preview. No GitHub issue was created.';
   }
   function keydown(event: KeyboardEvent) {
+    if (event.key === 'Escape' && canvasPage && selected && !modal && !sidebarOpen) {
+      event.preventDefault();
+      void closeCanvasInspector();
+      return;
+    }
     if (isMobile && sidebarOpen) {
       if (event.key === 'Escape') {
         event.preventDefault();
@@ -629,10 +672,23 @@
   });
   $effect(() => {
     if (!inspector) return;
-    if (selected) {
+    if (selected && !canvasPage) {
       if (!inspector.open) inspector.showModal();
     } else inspector.close();
   });
+  async function closeCanvasInspector() {
+    const id = selected?.id;
+    selected = null;
+    await tick();
+    if (id) document.querySelector<HTMLButtonElement>(`[data-run-id="${CSS.escape(id)}"]`)?.focus();
+  }
+  async function openCanvasRun(run: RunSummary) {
+    openRun(run);
+    await tick();
+    const panel = document.querySelector<HTMLElement>('.canvas-inspector');
+    panel?.querySelector<HTMLButtonElement>('.icon-button')?.focus({ preventScroll: true });
+    if (window.innerWidth <= 1100) panel?.scrollIntoView({ block: 'start' });
+  }
 </script>
 
 <svelte:window onkeydown={keydown} />
@@ -782,64 +838,58 @@
       class:overview-page={page === 'overview'}
       class:activity-page={page === 'activity'}
       class:settings-page={page === 'settings'}
+      class:canvas-page={canvasPage}
     >
-      {#if page === 'overview'}
-        <div class="overview-heading">
-          <h1>Overview</h1>
-          <div class="overview-resources">
-            <button
-              class="resource-link"
-              onclick={() => navigate('machines')}
-              title={machine?.name ?? machineError}
-            >
-              <Icon name="vm" size={17} /><span
-                >{machine ? machine.name : 'Machine unavailable'}</span
-              ><strong
-                >{machine
-                  ? `${machine.containers.filter((c) => c.state === 'running').length}/${machine.max_concurrent_runs} slots`
-                  : 'Inspect'}</strong
-              ><Icon name="chevron" size={14} />
-            </button>
-            <button class="resource-link" onclick={() => navigate('quotas')}>
-              <Icon name="quota" size={17} /><span>Usage</span><strong
-                >{quota.accounts.length === 1
-                  ? quota.accounts[0].exhausted_until
-                    ? 'Quota limited'
-                    : `${duration(quota.accounts[0].headroom_seconds)} available`
-                  : `${quota.accounts.length} providers`}</strong
-              ><Icon name="chevron" size={14} />
-            </button>
+      {#if canvasPage}
+        <div class="canvas-layout" class:with-inspector={!!selected}>
+          <div class="canvas-main">
+            <ProjectCanvas
+              {projects}
+              runs={demo ? runs : canvasRuns}
+              activity={activityData}
+              {demo}
+              loading={canvasLoading || loading}
+              error={projectsError || canvasError || loadError}
+              project={canvasProject}
+              selectedRunId={selected?.id}
+              onproject={(project) => {
+                canvasProjectId = project?.id ?? null;
+                selected = null;
+              }}
+              onrun={openCanvasRun}
+              onnewtask={() => {
+                openModal('task');
+                taskProject = canvasProject?.id ?? projects[0]?.id ?? '';
+              }}
+              onnewproject={() => openModal('project')}
+              onrefresh={() => refresh()}
+            />
+            {#if canvasProject}
+              <ProjectControls
+                project={canvasProject}
+                {demo}
+                onupdated={(updated) => {
+                  projects = projects.map((item) => (item.id === updated.id ? updated : item));
+                }}
+                onrefresh={() => refresh()}
+              />
+            {/if}
           </div>
-          <button
-            class="button"
-            class:primary={!reviewRuns.length}
-            onclick={() => openModal('task')}><Icon name="plus" size={17} />New task</button
-          >
-        </div>
-        <div class="overview-work">
-          {#if reviewRuns.length}
-            <button class="review-callout" onclick={() => openRun(reviewRuns[0])}>
-              <span class="review-callout-icon"><Icon name="review" size={20} /></span>
-              <span class="review-task"
-                ><strong>{reviewRuns[0].issue_title}</strong><small
-                  >{reviewCount}
-                  {reviewCount === 1 ? 'task needs' : 'tasks need'} review · {reviewRuns[0]
-                    .project_slug}</small
-                ></span
-              >
-              <span class="review-link">Review work<Icon name="arrow" size={16} /></span>
-            </button>
+          {#if selected}
+            <aside class="canvas-inspector" aria-label="Agent details">
+              <RunInspector
+                run={selected}
+                activity={activityData}
+                {activityError}
+                {activityFetchedAt}
+                message={notice}
+                {demo}
+                {busy}
+                onclose={closeCanvasInspector}
+                onaction={runAction}
+              />
+            </aside>
           {/if}
-          <ActivityMonitor
-            data={activityData}
-            error={activityError}
-            fetchedAt={activityFetchedAt}
-            {demo}
-            compact
-            oninspect={inspectActivityRun}
-            onrefresh={refreshActivity}
-            onexpand={() => navigate('activity')}
-          />
         </div>
       {:else if page === 'activity'}
         <div class="page-heading simple">
@@ -983,60 +1033,6 @@
               >Inspect active workloads<Icon name="arrow" size={16} /></button
             >
           </section>
-        </div>
-      {:else if page === 'projects'}
-        <div class="page-heading simple">
-          <div>
-            <h1>Projects</h1>
-          </div>
-          <button class="button primary" onclick={() => openModal('project')}
-            ><Icon name="plus" size={17} />Add project</button
-          >
-        </div>
-        {#if projectsError}<p class="notice warning" role="alert">{projectsError}</p>{/if}
-        <div class="project-list">
-          {#each projects as project (project.id)}{@const projectRuns = runs.filter(
-              (run) => run.project_slug === project.slug,
-            )}
-            <article class="project-entry">
-              <span class="project-symbol"><Icon name="projects" size={23} /></span>
-              <div>
-                <h2>{project.slug}</h2>
-                <p>{project.owner}/{project.repo}</p>
-                <div class="project-info">
-                  <span
-                    ><Icon name="shield" size={14} />{project.lifecycle === 'oracle_gated'
-                      ? 'CI verified merges'
-                      : 'Human review'}</span
-                  ><span
-                    >{projectRuns.filter((run) => activeStatuses.includes(run.status)).length} active
-                    among {projectRuns.length} loaded runs</span
-                  >
-                </div>
-              </div>
-              <button
-                class="button"
-                onclick={() => {
-                  navigate('agents');
-                  projectFilter = project.slug;
-                }}>Open agents<Icon name="arrow" size={16} /></button
-              >
-              <ProjectControls
-                {project}
-                {demo}
-                onupdated={(updated) => {
-                  projects = projects.map((item) => (item.id === updated.id ? updated : item));
-                }}
-                onrefresh={() => refresh()}
-              />
-            </article>{:else}<div class="empty-state">
-              <Icon name="projects" size={32} />
-              <h3>No projects connected</h3>
-              <p>Connect a GitHub repository to bring its approved work into Werft.</p>
-              <button class="button primary" onclick={() => openModal('project')}
-                >Add your first project</button
-              >
-            </div>{/each}
         </div>
       {:else if page === 'quotas'}
         <div class="page-heading simple">
@@ -1285,7 +1281,7 @@
   oncancel={() => (selected = null)}
   aria-label="Run details"
 >
-  {#if selected}<RunInspector
+  {#if selected && !canvasPage}<RunInspector
       run={selected}
       activity={activityData}
       {activityError}

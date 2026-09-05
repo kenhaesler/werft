@@ -46,8 +46,9 @@ test('keeps many parallel sessions readable and exposes runtime details on deman
   });
   await page.setViewportSize({ width: 1784, height: 1214 });
   await page.goto('/');
+  await page.getByRole('button', { name: 'Activity', exact: true }).click();
   await expect(page.getByRole('heading', { name: '24 active sessions' })).toBeVisible();
-  await expect(page.locator('.session-row')).toHaveCount(3);
+  await expect(page.locator('.session-row')).toHaveCount(6);
   await expect(page.locator('.session-runtime').first()).not.toBeVisible();
   await page.locator('.session-row summary').first().focus();
   await page.keyboard.press('Enter');
@@ -58,7 +59,6 @@ test('keeps many parallel sessions readable and exposes runtime details on deman
     path: '../.impeccable/review/parallel-sessions-desktop.png',
     fullPage: true,
   });
-  await page.getByRole('button', { name: /View all activity/ }).click();
   await expect(page.locator('.session-row')).toHaveCount(6);
   for (let i = 0; i < 3; i++) await page.getByRole('button', { name: 'Next tasks' }).click();
   await expect(page.getByText('19–24 of 24 loaded tasks')).toBeVisible();
@@ -236,11 +236,11 @@ async function connect(page: Page) {
     .getByRole('dialog')
     .getByRole('button', { name: 'Connect manager', exact: true })
     .click();
-  await expect(page.getByText('Loaded task stays visible', { exact: true }).first()).toBeVisible();
   await page
     .getByRole('navigation', { name: 'Main navigation' })
     .getByRole('button', { name: 'Activity' })
     .click();
+  await expect(page.getByText('Loaded task stays visible', { exact: true }).first()).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Activity' })).toBeVisible();
 }
 

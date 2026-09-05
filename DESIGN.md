@@ -80,7 +80,7 @@ components:
 
 **Creative North Star: "The Agent Workstation"**
 
-A clear operational workspace with white and cool gray surfaces, focused blue actions, and warm review signals. The overview leads with work requiring human review, then active agents, then recent activity. Machine and quota details are quieter supporting context. The operator approved the logo geometry and lettering; preserve both. This is a record of the implemented code, not an approved image composition.
+A project canvas with white and cool gray surfaces, focused blue actions, and warm attention signals. The approved navigation is Projects → inside a project → agent progress. Project tiles summarize work; connected task nodes reveal sessions and their actual lifecycle stage. Details open alongside the canvas to preserve context. The operator approved the logo geometry and lettering; preserve both.
 
 The design supports an operator supervising approved work. Live observations, illustrative preview data, and unavailable capabilities remain visibly distinct. The source of truth is `dashboard/src/app.css` and the Svelte components; `PRODUCT.md` defines product constraints.
 
@@ -115,7 +115,7 @@ The headline and section-title roles are recorded above. Task-card titles use a 
 
 ## Layout
 
-The desktop shell uses a sticky left navigation rail (232px) and a flexible main area. Content is centered with a maximum width (1680px). The overview places active agents and recent work centrally, with a machine and quota column (288px) separated by a gap (28px). Active agents form two equal columns with a gap (15px). This overview composition is a surface pattern, not a requirement for every page.
+The desktop shell uses a sticky left navigation rail (232px) and a flexible main area. The project canvas has a subtle blue dot grid and connected project/session nodes. Selecting a node opens an adjacent detail panel. Below 1100px the inspector stacks below the canvas; below 760px the map becomes a connected vertical layout without horizontal clipping. VM and quota details remain in dedicated views.
 
 Observed responsive boundaries:
 
@@ -147,11 +147,11 @@ Small rounded rectangles establish a practical, compact form language. Controls 
 
 **Navigation.** Compact rows combine an icon, label, and optional count. The active row gains a pale blue fill and blue text, with `aria-current="page"`. On mobile, the drawer traps Tab, closes with Escape or its backdrop, restores focus to the trigger, and makes the background inert. The closed drawer is inert as well.
 
-**Activity rows and review callout.** Aligned rows show task title, project, status, and last signal. Native details reveal grouped runtime facts and the Open task action. Titles use 15px; supporting session information uses 13px. Overview shows up to three active sessions; phase filters reveal other tasks, and the full activity page uses pages of six tasks. Hover highlights the row. Blue priority callouts make human decisions visible without overwhelming active work.
+**Activity rows and review callout.** Aligned rows show task title, project, status, and last signal. Native details reveal grouped runtime facts and the Open task action. Titles use 15px; supporting session information uses 13px. Phase filters reveal tasks on the Activity page, in pages of six. Hover highlights the row. Blue priority callouts make human decisions visible without overwhelming active work.
 
 **Run list and inspector.** Rows open a native modal side panel, up to 640px wide and full viewport height. Timeline, Evidence, and Attempts use buttons with pressed state. A selected live run polls while visible and keeps its last successful detail through transient reconnect failures, showing stale status and the last update time. Evidence supports authenticated downloads, loading, empty, and error states. Available lifecycle actions follow the refreshed run state; a workload is canceled through its run, not by inventing host controls.
 
-**Activity monitor.** Full Activity separates Tasks, Events, and Backend into dedicated views. Events have search and six-row pagination over the latest recorded milestones returned by the backend (up to 25), with explicit timestamps. Backend errors remain visible in the view selector. Phase filters lead to task rows, runtime details, and task evidence. Backend processes are collapsed on Overview with error counts visible in the summary. Decorative subtitles and slogans are omitted. The demo banner uses at least 14px text and explains what connecting enables. The activity page polls every three seconds while visible and refreshes immediately when visibility returns. It reports stale data and heartbeat state; process-local worker operations are separate from durable backend run milestones. Live tool stdout is unavailable until it appears in an existing artifact.
+**Activity monitor.** Full Activity separates Tasks, Events, and Backend into dedicated views. Events have search and six-row pagination over the latest recorded milestones returned by the backend (up to 25), with explicit timestamps. Backend errors remain visible in the view selector. Phase filters lead to task rows, runtime details, and task evidence. Backend processes have a dedicated Activity view. Decorative subtitles and slogans are omitted. The demo banner uses at least 14px text and explains what connecting enables. The activity page polls every three seconds while visible and refreshes immediately when visibility returns. It reports stale data and heartbeat state; process-local worker operations are separate from durable backend run milestones. Live tool stdout is unavailable until it appears in an existing artifact.
 
 **Dialogs and command menu.** Native `dialog.showModal()` provides modal behavior and Escape dismissal. Standard dialogs are 510px wide; command search is 580px, both constrained to the viewport. Ctrl/Cmd+K opens search and focuses its input. Results use Tab and Enter, as the footer states; this is not an arrow-key listbox.
 
@@ -167,7 +167,7 @@ Small rounded rectangles establish a practical, compact form language. Controls 
 - **Don't** expose host reboot, snapshot, or shell actions without supporting APIs.
 - **Don't** replace dense supporting content with oversized decorative dashboard cards.
 
-**Overview layout.** Queues use the full content width. Compact machine capacity and quota links sit in the header; full infrastructure panels belong on their dedicated pages. The review callout uses one compact row. At mobile widths the resource links sit under the heading and the five phase filters wrap into a three-plus-two grid. Preserve readable text sizes; reduce module count and spacing rather than shrinking content. The default 1440×900 overview fits without vertical scrolling.
+**Project canvas layout.** Project tiles lead to a project hub connected to task-session nodes. Keep the current status readable on each node and show the selected task in an adjacent panel. Mobile uses a vertical connected layout. The canvas scrolls internally for large projects; infrastructure remains in dedicated views.
 
 **Settings readability.** Use 18px section headings, 15px labels, and at least 14px help text, statuses, and shortcuts. Keep actions at least 44px tall on desktop and mobile. Group settings in a bounded white panel with comfortable spacing.
 

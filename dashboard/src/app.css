@@ -3045,3 +3045,71 @@ pre {
   min-height: 44px;
   font-size: 14px;
 }
+
+/* The project map and its inspector share one workspace. */
+.page-content.canvas-page {
+  padding: 20px 24px 16px;
+}
+.canvas-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+.canvas-layout.with-inspector {
+  grid-template-columns: minmax(320px, 1fr) minmax(400px, 520px);
+}
+.canvas-main {
+  min-width: 0;
+}
+.canvas-main > .project-controls {
+  margin-top: 14px;
+}
+.canvas-inspector {
+  min-width: 0;
+  height: calc(100dvh - 185px);
+  min-height: 540px;
+  display: flex;
+  flex-direction: column;
+  background: white;
+  border: 1px solid #dce5f0;
+  border-radius: 14px;
+  overflow: hidden;
+}
+.canvas-inspector .inspector-heading {
+  padding: 12px 18px;
+}
+.canvas-inspector .inspector-body {
+  padding: 20px;
+}
+.canvas-inspector .inspector-body h2 {
+  font-size: 23px;
+}
+.canvas-inspector .inspector-actions {
+  padding: 14px 18px;
+}
+.canvas-inspector .tabs {
+  gap: 16px;
+  overflow-x: auto;
+  flex-shrink: 0;
+}
+.canvas-inspector .tabs > button {
+  white-space: nowrap;
+}
+@media (max-width: 1100px) {
+  .canvas-layout.with-inspector {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .canvas-inspector {
+    height: min(760px, 85dvh);
+    min-height: 460px;
+  }
+}
+@media (max-width: 760px) {
+  .page-content.canvas-page {
+    padding: 12px;
+  }
+  .canvas-inspector .inspector-body {
+    padding: 16px;
+  }
+}

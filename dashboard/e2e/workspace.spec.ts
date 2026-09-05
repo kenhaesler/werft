@@ -4,6 +4,7 @@ test('drills from phase to task to evidence without showing runtime metadata upf
   page,
 }) => {
   await page.goto('/');
+  await page.getByRole('button', { name: 'Activity', exact: true }).click();
   const monitor = page.getByRole('region', { name: 'Backend activity' });
   await expect(page.getByText('Demo workspace', { exact: true })).toBeVisible();
   await expect(
@@ -14,7 +15,7 @@ test('drills from phase to task to evidence without showing runtime metadata upf
       .locator('.preview-description')
       .evaluate((el) => parseFloat(getComputedStyle(el).fontSize)),
   ).toBeGreaterThanOrEqual(14);
-  await expect(page.locator('.session-row')).toHaveCount(1);
+  await expect(page.locator('.session-row')).toHaveCount(5);
   await expect(page.locator('.worker-list')).not.toBeVisible();
   await monitor.getByRole('button', { name: /Review\s*1/ }).click();
   const row = monitor.locator('.session-row');
@@ -27,7 +28,7 @@ test('drills from phase to task to evidence without showing runtime metadata upf
   await inspector.getByRole('button', { name: /Evidence/ }).click();
   await expect(inspector.getByText('transcript.jsonl', { exact: true })).toBeVisible();
   await page.keyboard.press('Escape');
-  await monitor.locator('.backend-summary').click();
+  await monitor.getByRole('button', { name: /^Backend/ }).click();
   await expect(monitor.locator('.worker-list')).toBeVisible();
 });
 
@@ -36,7 +37,11 @@ test('preview navigation, search, evidence, review, and task creation', async ({
   page.on('pageerror', (error) => errors.push(error.message));
   await page.goto('/');
   await expect(page.getByText('Demo workspace')).toBeVisible();
-  await page.getByRole('button', { name: /Review work/ }).click();
+  await page.getByRole('button', { name: /^Review/ }).click();
+  await page
+    .locator('.run-item')
+    .filter({ hasText: 'Create accessible command menu primitives' })
+    .click();
   const inspector = page.getByRole('dialog', { name: 'Run details' });
   await expect(
     inspector.getByRole('heading', { name: 'Create accessible command menu primitives' }),
@@ -46,7 +51,7 @@ test('preview navigation, search, evidence, review, and task creation', async ({
   await inspector.getByRole('button', { name: 'Download transcript.jsonl' }).click();
   expect((await download).suggestedFilename()).toContain('sample-');
   await inspector.getByRole('button', { name: 'Accept work' }).click();
-  await expect(inspector.getByText('Merging', { exact: true })).toBeVisible();
+  await expect(inspector.getByText('Merging', { exact: true }).first()).toBeVisible();
   await page.keyboard.press('Escape');
   await page.keyboard.press('Control+k');
   await expect(page.getByRole('textbox', { name: 'Search commands and tasks' })).toBeFocused();
@@ -73,6 +78,8 @@ test('preview navigation, search, evidence, review, and task creation', async ({
 test('live connection, authenticated actions, conflict recovery, and disconnect', async ({
   page,
 }) => {
+  const errors: string[] = [];
+  page.on('pageerror', (error) => errors.push(error.message));
   let status = 'awaiting_review';
   let conflict = true;
   const requests: { url: string; auth: string | undefined }[] = [];
@@ -98,6 +105,8 @@ test('live connection, authenticated actions, conflict recovery, and disconnect'
       return route.fulfill({ status: 401, json: { detail: 'unauthorized' } });
     const path = new URL(request.url()).pathname;
     if (path.endsWith('/quota')) return route.fulfill({ json: { accounts: [] } });
+    if (path.endsWith('/capabilities'))
+      return route.fulfill({ json: { capabilities: {}, readiness: {}, dispatch: [] } });
     if (path.endsWith('/projects'))
       return route.fulfill({
         json: [
@@ -160,30 +169,32 @@ test('live connection, authenticated actions, conflict recovery, and disconnect'
     .getByRole('button', { name: 'Connect manager', exact: true })
     .click();
   await expect(page.getByText('Demo workspace')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Virtual machine', exact: true }).click();
   await expect(page.getByText('Machine unavailable', { exact: true })).toBeVisible();
-  await page.getByRole('button', { name: /Review work/ }).click();
+  await page.getByRole('button', { name: /^Review/ }).click();
+  await page.locator('.run-item').filter({ hasText: 'Live review task' }).click();
   await page.getByRole('button', { name: 'Accept work' }).click();
   await expect(page.getByRole('status')).toContainText('changed state');
   await page.getByRole('button', { name: 'Accept work' }).click();
-  await expect(page.getByRole('dialog').getByText('Merging', { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole('dialog').getByText('Merging', { exact: true }).first(),
+  ).toBeVisible();
   await page.keyboard.press('Escape');
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
   expect(await page.evaluate(() => localStorage.getItem('werft_token'))).toBeNull();
   expect(requests.every((request) => !request.url.includes('token'))).toBe(true);
+  expect(errors).toEqual([]);
 });
 
 test('desktop and mobile visual evidence, keyboard focus and overflow', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible();
+  await expect(page.locator('.project-canvas')).toBeVisible();
   await page.evaluate(() => document.fonts.ready);
   expect(
-    await page.locator('.activity-monitor').evaluate((el) => el.getBoundingClientRect().width),
+    await page.locator('.project-canvas').evaluate((el) => el.getBoundingClientRect().width),
   ).toBeGreaterThan(1000);
-  expect(await page.evaluate(() => document.documentElement.scrollHeight <= innerHeight)).toBe(
-    true,
-  );
   await page.screenshot({
     path: '../.impeccable/review/desktop.png',
     fullPage: true,
@@ -194,7 +205,7 @@ test('desktop and mobile visual evidence, keyboard focus and overflow', async ({
   expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBeLessThan(1250);
   expect(
     await page
-      .locator('.work-pipeline button')
+      .locator('.project-tile')
       .first()
       .evaluate((el) => el.getBoundingClientRect().width),
   ).toBeGreaterThan(85);
@@ -211,11 +222,11 @@ test('desktop and mobile visual evidence, keyboard focus and overflow', async ({
   await expect(page.locator('.sidebar')).toHaveAttribute('inert', '');
   await page.getByRole('button', { name: 'Open navigation' }).click();
   await page.getByRole('button', { name: 'Projects', exact: true }).click();
-  await expect(page.getByRole('heading', { name: 'Projects' })).toBeVisible();
-  await page.getByRole('button', { name: 'Add project' }).click();
+  await expect(page.locator('.project-canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'New project', exact: true }).click();
   await page.getByLabel('GitHub repository').fill('sample/new-project');
   await page.getByLabel('Project name', { exact: true }).fill('new-project');
   await page.getByRole('button', { name: 'Add to preview' }).click();
-  await expect(page.getByRole('heading', { name: 'new-project', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: /new-project/ })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });

@@ -213,9 +213,10 @@ test('flips lifecycle through the mounted project settings controls', async ({ p
     .locator('nav[aria-label="Main navigation"]')
     .getByRole('button', { name: 'Projects' })
     .click();
-  const entry = page.locator('.project-entry').filter({ hasText: 'alpha' }).first();
-  await entry.getByText('Project settings').click();
-  await entry.getByRole('button', { name: 'Set oracle-gated' }).click();
-  await expect(entry.getByText('CI checked')).toBeVisible();
+  await page.locator('.project-tile').filter({ hasText: 'alpha' }).click();
+  const controls = page.locator('.project-controls');
+  await controls.locator('summary').first().click();
+  await controls.getByRole('button', { name: 'Set oracle-gated' }).click();
+  await expect(controls.getByText('CI checked')).toBeVisible();
   expect(requests.some((request) => request.includes('/projects/alpha-id/flip'))).toBe(true);
 });

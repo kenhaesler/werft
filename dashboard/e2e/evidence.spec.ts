@@ -2,6 +2,7 @@ import { test, expect } from '@playwright/test';
 
 test('evidence is grouped and previewed as inert text', async ({ page }) => {
   await page.goto('/');
+  await page.getByRole('button', { name: 'Activity', exact: true }).click();
   const row = page.locator('.session-row').first();
   await row.locator('summary').click();
   await row.getByRole('button', { name: 'Open task' }).click();

@@ -5,6 +5,7 @@
   import { loadArtifactMetadata } from './artifact-evidence';
   import ArtifactEvidence from './ArtifactEvidence.svelte';
   import LiveSession from './LiveSession.svelte';
+  import RunProgress from './RunProgress.svelte';
   import ResultSummary from './ResultSummary.svelte';
   import { demoDetail } from './demo';
   import { duration, relativeTime, safeExternalUrl, statusLabels } from './format';
@@ -227,6 +228,7 @@
       </p>{/if}
     {#if detail.error_message}<p class="notice warning">{detail.error_message}</p>{/if}
     {#if tab === 'Overview'}
+      <RunProgress status={displayed.status} />
       <section class="task-current" aria-label="Current task state">
         <h3>{explanation.title}</h3>
         <p>{explanation.description}</p>
