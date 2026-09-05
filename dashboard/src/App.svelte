@@ -650,7 +650,13 @@
         >
       </div>{/if}
 
-    <main id="main-content" class="page-content" class:overview-page={page === 'overview'}>
+    <main
+      id="main-content"
+      class="page-content"
+      class:overview-page={page === 'overview'}
+      class:activity-page={page === 'activity'}
+      class:settings-page={page === 'settings'}
+    >
       {#if page === 'overview'}
         <div class="overview-heading">
           <h1>Overview</h1>
@@ -946,9 +952,14 @@
           <div class="settings-row">
             <div>
               <strong>Live updates</strong>
-              <p>Refreshes every 10 seconds while this tab is visible.</p>
+              <p>
+                Task activity refreshes every 3 seconds; workspace data every 10 seconds while this
+                tab is visible.
+              </p>
             </div>
-            <span class="status status-running">Enabled</span>
+            <span class="status" class:status-running={!demo}
+              >{demo ? 'Preview only' : 'Enabled'}</span
+            >
           </div>
           <div class="settings-row">
             <div>

@@ -29,7 +29,7 @@ The dashboard's Activity Monitor polls `/activity` every three seconds while vis
 
 ## Information Hierarchy
 
-Show overall status first, then let the operator drill into a phase, a task, its runtime details, and its evidence. Overview lists active sessions first; other phases are explicit filters. Keep backend processes collapsed with error counts visible in their summary. Use full-width aligned session rows that scale to parallel work. Overview previews three sessions and links to the rest. Keep infrastructure as compact status links so full VM and quota panels do not squeeze queues or lengthen the mobile overview. Remove slogans and generic subtitles; copy must identify a function, report a fact, or explain an action. Explain demo mode clearly with readable text and a connection action.
+Show overall status first, then let the operator drill into a phase, a task, its runtime details, and its evidence. Overview lists active sessions first; other phases are explicit filters. Keep backend processes collapsed with error counts visible in their summary. Use full-width aligned session rows that scale to parallel work. Overview previews three sessions and links to the rest. Full Activity separates current tasks, recent events, and backend processes into dedicated views. Paginate tasks and searchable recent events in groups of six; keep backend errors visible in the view selector. Keep infrastructure as compact status links so full VM and quota panels do not squeeze queues or lengthen the mobile overview. Remove slogans and generic subtitles; copy must identify a function, report a fact, or explain an action. Explain demo mode clearly with readable text and a connection action.
 
 ## Brand Commitment
 

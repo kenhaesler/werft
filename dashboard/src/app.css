@@ -1435,28 +1435,56 @@ kbd {
   padding-top: 23px;
 }
 .settings-section {
-  max-width: 870px;
+  max-width: 900px;
+  padding: 8px 28px 10px;
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
 }
 .settings-section h2 {
-  margin: 35px 0 12px;
-  font-size: 17px;
+  margin: 28px 0 8px;
+  font-size: 18px;
+  line-height: 1.4;
 }
 .settings-row {
   display: flex;
   justify-content: space-between;
-  gap: 20px;
+  gap: 24px;
   align-items: center;
-  padding: 23px 0;
+  padding: 22px 0;
   border-bottom: 1px solid var(--border);
 }
+.settings-row > div {
+  min-width: 0;
+  max-width: 68ch;
+}
 .settings-row strong {
-  font-size: 13px;
+  display: block;
+  font-size: 15px;
+  line-height: 1.45;
 }
 .settings-row p {
   color: var(--muted);
-  font-size: 11px;
-  margin-top: 8px;
-  line-height: 1.8;
+  max-width: 68ch;
+  margin-top: 6px;
+  font-size: 14px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.settings-row > .button {
+  min-height: 44px;
+  flex: 0 0 auto;
+  font-size: 14px;
+}
+.settings-row > .status,
+.settings-row > .muted,
+.settings-row > kbd {
+  font-size: 14px;
+}
+.settings-row > kbd {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
 }
 .toast {
   position: fixed;
@@ -2433,9 +2461,6 @@ pre {
   .settings-row {
     align-items: flex-start;
   }
-  .settings-row > .button {
-    font-size: 10px;
-  }
   .command-footer > span:last-child {
     font-size: 8px;
   }
@@ -2590,6 +2615,15 @@ pre {
   }
   .settings-row {
     flex-wrap: wrap;
+  }
+  .settings-section {
+    padding-inline: 19px;
+  }
+  .settings-row {
+    gap: 14px;
+  }
+  .settings-row > .button {
+    min-height: 44px;
   }
   .project-info {
     gap: 12px;
@@ -2766,5 +2800,20 @@ pre {
   }
   .overview-work .review-callout strong {
     font-size: 13px;
+  }
+}
+
+.page-content.activity-page,
+.page-content.settings-page {
+  padding: 24px;
+}
+.activity-page .page-heading.simple,
+.settings-page .page-heading.simple {
+  margin: 0 0 20px;
+}
+@media (max-width: 760px) {
+  .page-content.activity-page,
+  .page-content.settings-page {
+    padding: 16px;
   }
 }

@@ -54,9 +54,13 @@ test('keeps many parallel sessions readable and exposes runtime details on deman
     fullPage: true,
   });
   await page.getByRole('button', { name: /View all activity/ }).click();
-  await expect(page.locator('.session-row')).toHaveCount(20);
-  await page.getByRole('button', { name: 'Show 4 more tasks' }).click();
-  await expect(page.locator('.session-row')).toHaveCount(24);
+  await expect(page.locator('.session-row')).toHaveCount(6);
+  for (let i = 0; i < 3; i++) await page.getByRole('button', { name: 'Next tasks' }).click();
+  await expect(page.getByText('19–24 of 24 loaded tasks')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Next tasks' })).toBeDisabled();
+  await expect(page.getByText('Parallel task 24', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Previous tasks' }).click();
+  await expect(page.getByText('13–18 of 24 loaded tasks')).toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
   await page.locator('.session-row summary').first().click();
   await expect(page.locator('.session-runtime').first()).toBeVisible();
@@ -287,13 +291,15 @@ test('shows authenticated backend activity, global stages, workers, and event in
   await expect(monitor.getByText('Only one queued task is loaded')).toBeVisible();
   await expect(monitor.getByText('Loaded task stays visible')).toHaveCount(0);
   await monitor.getByRole('button', { name: /Show all current tasks/ }).click();
-  await expect(monitor.getByText('lease renewal')).toBeVisible();
   await monitor
     .locator('.session-row')
     .filter({ hasText: 'Loaded task stays visible' })
     .locator('summary')
     .click();
   await expect(monitor.getByText('Manager is attending this agent session')).toBeVisible();
+  await monitor.getByRole('button', { name: /Backend.*error/ }).click();
+  await expect(monitor.getByText('lease renewal')).toBeVisible();
+  await expect(monitor.locator('.session-row')).toHaveCount(0);
   await expect(
     monitor.locator('.worker summary').getByText('Next check in', { exact: false }).first(),
   ).toBeVisible();
@@ -305,7 +311,12 @@ test('shows authenticated backend activity, global stages, workers, and event in
     .click();
   await expect(monitor.getByText('Last error', { exact: false })).toBeVisible();
 
-  await monitor.getByRole('button', { name: /Failed Inspect a run absent/ }).click();
+  await monitor.getByRole('button', { name: /Events/ }).click();
+  await expect(monitor.locator('.worker')).toHaveCount(0);
+  await monitor.getByRole('textbox', { name: 'Search recorded events' }).fill('no matching event');
+  await expect(monitor.getByText('No recorded events match this search.')).toBeVisible();
+  await monitor.getByRole('textbox', { name: 'Search recorded events' }).fill('audit');
+  await monitor.getByRole('button', { name: /Inspect a run absent from the loaded list/ }).click();
   const inspector = page.getByRole('dialog', { name: 'Run details' });
   await expect(
     inspector.getByRole('heading', { name: 'Inspect a run absent from the loaded list' }),
