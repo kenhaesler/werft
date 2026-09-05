@@ -24,6 +24,7 @@ from uuid import UUID, uuid4
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import StreamingResponse
 from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -566,6 +567,73 @@ def _content_disposition_header(filename: str) -> str:
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
 
 
+def _artifact_byte_range(value: str | None, size: int) -> tuple[int, int] | None:
+    """Return an inclusive byte range for one RFC 7233 ``Range`` value.
+
+    ``None`` means no range was requested.  Invalid, unsatisfiable, and
+    multi-range values all raise ``ValueError``; the route deliberately
+    answers those with a 416 rather than accidentally serving the whole
+    artifact.  Keeping this parser small also ensures the dashboard's
+    bounded evidence preview cannot make the manager read a large file.
+    """
+    if value is None:
+        return None
+    if not value.startswith("bytes=") or "," in value:
+        raise ValueError("invalid byte range")
+    spec = value.removeprefix("bytes=")
+    if spec.count("-") != 1:
+        raise ValueError("invalid byte range")
+    start_text, end_text = spec.split("-", 1)
+    if not start_text and not end_text:
+        raise ValueError("invalid byte range")
+    if not start_text:
+        if not end_text.isascii() or not end_text.isdecimal():
+            raise ValueError("invalid byte range")
+        suffix_length = int(end_text)
+        if suffix_length <= 0 or size <= 0:
+            raise ValueError("unsatisfiable byte range")
+        return max(0, size - suffix_length), size - 1
+    if not start_text.isascii() or not start_text.isdecimal():
+        raise ValueError("invalid byte range")
+    start = int(start_text)
+    if start >= size:
+        raise ValueError("unsatisfiable byte range")
+    if not end_text:
+        return start, size - 1
+    if not end_text.isascii() or not end_text.isdecimal():
+        raise ValueError("invalid byte range")
+    end = int(end_text)
+    if end < start:
+        raise ValueError("unsatisfiable byte range")
+    return start, min(end, size - 1)
+
+
+def _stream_artifact(artifact_file, *, start: int, length: int):
+    """Yield an already-validated artifact file in bounded chunks."""
+    artifact_file.seek(start)
+    remaining = length
+    while remaining:
+        chunk = artifact_file.read(min(64 * 1024, remaining))
+        if not chunk:
+            return
+        remaining -= len(chunk)
+        yield chunk
+
+
+class _ArtifactStreamingResponse(StreamingResponse):
+    """A stream that owns and closes its artifact file on every ASGI exit."""
+
+    def __init__(self, content, *, artifact_file, **kwargs) -> None:
+        super().__init__(content, **kwargs)
+        self._artifact_file = artifact_file
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._artifact_file.close()
+
+
 @api_router.get("/runs/{run_id}/artifacts/{artifact_path:path}")
 async def get_artifact_file(
     run_id: UUID,
@@ -620,16 +688,55 @@ async def get_artifact_file(
     if not stat.S_ISREG(file_stat.st_mode):
         raise HTTPException(status_code=404, detail="artifact not found")
 
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        data = candidate.read_bytes()
+        fd = os.open(candidate, flags)
+        try:
+            opened_stat = os.fstat(fd)
+        except OSError:
+            os.close(fd)
+            raise
     except OSError as exc:
         raise HTTPException(status_code=404, detail="artifact not found") from exc
+    if not stat.S_ISREG(opened_stat.st_mode) or not os.path.samestat(file_stat, opened_stat):
+        os.close(fd)
+        raise HTTPException(status_code=404, detail="artifact not found")
+
+    try:
+        byte_range = _artifact_byte_range(request.headers.get("range"), opened_stat.st_size)
+    except ValueError:
+        os.close(fd)
+        return Response(
+            status_code=416,
+            headers={"Accept-Ranges": "bytes", "Content-Range": f"bytes */{opened_stat.st_size}"},
+        )
+
     filename = PurePosixPath(artifact_path).name
     headers = {
         "X-Content-Type-Options": "nosniff",
         "Content-Disposition": _content_disposition_header(filename),
+        "Accept-Ranges": "bytes",
     }
-    return Response(content=data, media_type="application/octet-stream", headers=headers)
+    if byte_range is None:
+        start, end, status_code = 0, opened_stat.st_size - 1, 200
+    else:
+        start, end = byte_range
+        status_code = 206
+        headers["Content-Range"] = f"bytes {start}-{end}/{opened_stat.st_size}"
+    length = end - start + 1
+    headers["Content-Length"] = str(length)
+    try:
+        artifact_file = os.fdopen(fd, "rb", closefd=True)
+    except OSError as exc:
+        os.close(fd)
+        raise HTTPException(status_code=404, detail="artifact not found") from exc
+    return _ArtifactStreamingResponse(
+        _stream_artifact(artifact_file, start=start, length=length),
+        artifact_file=artifact_file,
+        status_code=status_code,
+        media_type="application/octet-stream",
+        headers=headers,
+    )
 
 
 @api_router.get("/quota", response_model=QuotaResponse)

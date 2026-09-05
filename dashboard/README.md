@@ -35,7 +35,7 @@ which the manager serves via the `WERFT_DASHBOARD_DIST` environment variable
 - `GET /api/v1/projects` lists repositories, including those with no runs.
   Add project uses the existing onboarding endpoint.
 - New task opens a prefilled GitHub issue with `werft:ready`; the operator still
-  submits the issue in GitHub. There is no invented chat or direct-dispatch API.
+  submits the issue in GitHub. Task creation is issue-driven; there is no direct-dispatch API.
 - `GET /api/v1/system` reports the configured Docker host's name, operating
   system, architecture, CPU count, memory capacity, engine version, concurrent
   run limit, and Werft-labelled containers. The manager filters Docker output;
@@ -46,6 +46,43 @@ which the manager serves via the `WERFT_DASHBOARD_DIST` environment variable
   through the existing run state machine. Host reboot, snapshots, live utilization,
   and interactive shell access require additional backend capabilities; the UI
   explains their absence instead of simulating them.
+
+## API coverage and deployment requirements
+
+The dashboard uses the manager's authenticated `/api/v1` routes. Preview mode
+never substitutes sample data for a failed live response; unavailable and stale
+states remain visible.
+
+| Dashboard surface                   | Manager routes                                                                           |
+| ----------------------------------- | ---------------------------------------------------------------------------------------- |
+| Projects and agent canvas           | `GET /projects`, paginated `GET /runs` with status filters                               |
+| Project onboarding and lifecycle    | `POST /projects/onboard`, `POST /projects/{id}/flip`, `GET /projects/{id}/events`        |
+| Activity and history                | `GET /activity`, `GET /events`                                                           |
+| Task drilldown                      | `GET /runs/{id}`, `GET /runs/{id}/runtime`, cursor-based `GET /runs/{id}/log`            |
+| Review and recovery                 | `POST /runs/{id}/review/accept`, `/review/reject`, `/cancel`, `/requeue`                 |
+| Evidence                            | `GET /runs/{id}/artifacts`, authenticated file downloads and bounded byte-range previews |
+| VM inventory                        | `GET /system`; workload actions use the run state machine                                |
+| Usage and configuration             | `GET /quota`, `GET /capabilities`                                                        |
+| Orchestrator and agent conversation | `GET /conversations/{scope}`, `POST /conversations/{scope}/messages`                     |
+
+Conversation scope is `orchestrator` or a run UUID. Sending uses a stable client
+message ID for safe retries; polling displays recorded replies and delivery status.
+Orchestrator replies require `WERFT_CONVERSATION_API_KEY_FILE` and
+`WERFT_CONVERSATION_MODEL`. Agent steering additionally requires
+`WERFT_AGENT_CONVERSATIONS_ENABLED` and a compatible runner transport; availability
+comes from the conversation endpoint. See `deploy/compose.conversations.yaml`.
+Questions and directions reach an agent at supported turn boundaries, not as an
+interactive terminal interrupt.
+
+A successful API connection does not prove GitHub, provider credentials, or Docker
+are ready: Settings reports configuration separately from verification. New tasks
+continue to GitHub for submission. Host reboot, snapshots, and interactive shells
+are not exposed by the manager and are not represented as working dashboard actions.
+
+The integration audit exercised backend routes against PostgreSQL in Docker and
+browser contract tests against controlled HTTP fixtures. It did not send a paid
+model request or create a real GitHub issue. Windows skips POSIX-only no-follow,
+FIFO, and symlink tests when those facilities are unavailable.
 
 ## Verification
 

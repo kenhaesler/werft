@@ -1,6 +1,7 @@
 import { expect, it, vi, afterEach } from 'vitest';
 import { render, waitFor } from '@testing-library/svelte';
 import ArtifactEvidence from './ArtifactEvidence.svelte';
+import { loadArtifactPreview } from './artifact-evidence';
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -47,4 +48,11 @@ it('renders hostile artifact contents as text and ignores a stale preview reques
   );
   expect(document.querySelector('img')).toBeNull();
   expect(screen.queryByText('stale first')).toBeNull();
+});
+
+it('previews empty artifacts without requesting an unsatisfiable byte range', async () => {
+  const fetchMock = vi.fn();
+  vi.stubGlobal('fetch', fetchMock);
+  await expect(loadArtifactPreview('run-1', { path: 'empty.log', bytes: 0 })).resolves.toBe('');
+  expect(fetchMock).not.toHaveBeenCalled();
 });

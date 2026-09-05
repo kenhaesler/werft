@@ -40,6 +40,7 @@ export async function loadArtifactPreview(
   signal?: AbortSignal,
 ): Promise<string> {
   if (!canPreviewArtifact(artifact)) throw new Error('This file is available to download only.');
+  if (artifact.bytes === 0) return '';
   const headers = new Headers({ Range: `bytes=0-${MAX_PREVIEW_BYTES - 1}` });
   const token = getToken();
   if (token) headers.set('Authorization', `Bearer ${token}`);
