@@ -173,11 +173,18 @@
     color: #9a481d;
     margin: 14px 0 0;
   }
+  .container-row {
+    padding-bottom: 4px;
+    border-bottom: 0;
+  }
   .container-details {
-    margin: -8px 0 14px 32px;
+    margin: 0;
+    padding: 0 0 14px 32px;
+    border-bottom: 1px solid var(--border);
     color: var(--muted);
   }
   .container-details summary {
+    padding: 6px 0;
     cursor: pointer;
   }
   .container-details dl {
