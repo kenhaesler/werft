@@ -41,124 +41,56 @@
       uniform float u_time;
       uniform float u_active;
 
-      #define PI 3.14159265359
-
-      mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
-      vec3 rotateX(vec3 p, float a) { p.yz = rot(a) * p.yz; return p; }
-      vec3 rotateY(vec3 p, float a) { p.xz = rot(a) * p.xz; return p; }
-      float smin(float a, float b, float k) { float h = max(k - abs(a - b), 0.0) / k; return min(a, b) - h * h * h * k / 6.0; }
-      float torus(vec3 p, vec2 t) { vec2 q = vec2(length(p.xz) - t.x, p.y); return length(q) - t.y; }
-      vec3 breathe(vec3 p, float t, float seed) {
-        p += vec3(
-          sin(p.y * 5.0 + t * (1.13 + seed) + seed * 8.0),
-          sin(p.z * 4.0 - t * (0.81 + seed) + seed * 3.0),
-          sin(p.x * 6.0 + t * (0.67 + seed) + seed * 5.0)
-        ) * .026;
-        return p;
-      }
-
-      vec2 mapScene(vec3 p, float t) {
-        vec3 q = p;
-        q = breathe(q, t, .0);
-        float azimuth = atan(q.z, q.x) + sin(q.y * 5.0 + t * .84) * .14;
-        float elevation = atan(q.y, length(q.xz)) + sin(azimuth * 3.0 - t * .63) * .10;
-        float radius = .575 + sin(azimuth * 4.0 + elevation * 3.0 + t * .67) * .026;
-        float shell = abs(length(q) - radius) - .013;
-        float longitude = (abs(sin(azimuth * 9.0 + sin(elevation * 4.0 + t) * .7)) - .105) * .052;
-        float latitude = (abs(sin(elevation * 7.0 + sin(azimuth * 3.0 - t) * .55)) - .11) * .052;
-        float core = max(shell, min(longitude, latitude));
-        vec3 ringA = breathe(rotateY(rotateX(p, .72 + sin(t * .4) * .18), -.34 + sin(t * .37) * .10), t, .21);
-        vec3 ringB = breathe(rotateY(rotateX(p, -1.03 + sin(t * .53) * .12), .68 + sin(t * .29) * .22), t, .49);
-        vec3 ringC = breathe(rotateY(rotateX(p, .05 + sin(t * .31) * .15), 1.35 - sin(t * .33) * .20), t, .78);
-        float a = torus(ringA, vec2(.80, .027));
-        float b = torus(ringB, vec2(.72, .021));
-        float c = torus(ringC, vec2(.88, .017));
-        vec3 innerRing = breathe(rotateY(rotateX(p, .85 + sin(t * .72) * .16), t * .38), t, .94);
-        float inner = torus(innerRing, vec2(.235, .016));
-        float distance = core;
-        float material = 1.0;
-        if (a < distance) { distance = a; material = 2.0; }
-        if (b < distance) { distance = b; material = 3.0; }
-        if (c < distance) { distance = c; material = 4.0; }
-        if (inner < distance) { distance = inner; material = 5.0; }
-        return vec2(distance, material);
+      mat2 turn(float a) { float c=cos(a), s=sin(a); return mat2(c,-s,s,c); }
+      float surface(vec3 p, float t) {
+        p.xz = turn(.38 + t * .16) * p.xz;
+        p.yz = turn(.52 + sin(t * .31) * .23) * p.yz;
+        float angle = atan(p.y, p.x);
+        float wave = sin(angle * 3.0 + t * .64);
+        float radius = .48 + .048 * wave;
+        p.z += .13 * sin(angle * 2.0 - t * .53);
+        vec2 section = vec2(length(p.xy) - radius, p.z);
+        section = turn(angle * 1.5 + t * .24) * section;
+        section /= vec2(1.0, .74);
+        return (length(section) - .235 - .028 * sin(angle * 3.0 - t * .7)) * .65;
       }
       vec3 normalAt(vec3 p, float t) {
-        vec2 e = vec2(.0022, 0.0);
-        return normalize(vec3(
-          mapScene(p + e.xyy, t).x - mapScene(p - e.xyy, t).x,
-          mapScene(p + e.yxy, t).x - mapScene(p - e.yxy, t).x,
-          mapScene(p + e.yyx, t).x - mapScene(p - e.yyx, t).x
-        ));
-      }
-      vec2 march(vec3 ro, vec3 rd, float t) {
-        float travel = 0.0;
-        float material = 0.0;
-        for (int i = 0; i < 60; i++) {
-          vec2 hit = mapScene(ro + rd * travel, t);
-          if (hit.x < .0015) { material = hit.y; break; }
-          travel += hit.x * .72;
-          if (travel > 4.4) break;
-        }
-        return vec2(travel, material);
-      }
-      float shadow(vec3 ro, vec3 rd, float t) {
-        float strength = 1.0, travel = .025;
-        for (int i = 0; i < 18; i++) {
-          float h = mapScene(ro + rd * travel, t).x;
-          strength = min(strength, 11.0 * h / travel);
-          travel += clamp(h, .018, .12);
-          if (h < .001 || travel > 2.0) break;
-        }
-        return clamp(strength, .22, 1.0);
+        vec2 e = vec2(.0015,0.0);
+        return normalize(vec3(surface(p+e.xyy,t)-surface(p-e.xyy,t), surface(p+e.yxy,t)-surface(p-e.yxy,t), surface(p+e.yyx,t)-surface(p-e.yyx,t)));
       }
       void main() {
-        vec2 uv = (gl_FragCoord.xy * 2.0 - u_resolution.xy) / min(u_resolution.x, u_resolution.y);
-        uv.y *= -1.0;
-        float energy = u_active;
-        float t = u_time * .48;
-        float cameraTurn = t * .15;
-        vec3 ro = vec3(0.0, .035, 2.55);
-        ro = rotateY(ro, cameraTurn);
-        vec3 target = vec3(0.0, 0.0, 0.0);
-        vec3 forward = normalize(target - ro);
-        vec3 right = normalize(cross(vec3(0.0, 1.0, 0.0), forward));
-        vec3 up = cross(forward, right);
-        vec3 rd = normalize(forward * 2.25 + right * uv.x + up * uv.y);
-        vec2 hit = march(ro, rd, t);
-        if (hit.y < .5) {
-          float glow = exp(-3.4 * max(0.0, length(uv) - .46));
-          gl_FragColor = vec4(vec3(.10, .39, 1.0) * glow, glow * .055);
-          return;
+        vec2 uv=(2.0*gl_FragCoord.xy-u_resolution.xy)/min(u_resolution.x,u_resolution.y);
+        float t=u_time * .8;
+        vec3 ro=vec3(0.0,0.0,2.8);
+        vec3 rd=normalize(vec3(uv,-2.8));
+        float travel=0.0;
+        float distance=1.0;
+        for(int i=0;i<80;i++) {
+          distance=surface(ro+rd*travel,t);
+          travel+=distance;
+          if(abs(distance)<.001 || travel>4.0) break;
         }
-        vec3 position = ro + rd * hit.x;
-        vec3 normal = normalAt(position, t);
-        vec3 key = normalize(vec3(-.55, .72, 1.0));
-        float diffuse = max(0.0, dot(normal, key));
-        float rim = pow(1.0 - max(0.0, dot(normal, -rd)), 3.1);
-        float occlusion = shadow(position + normal * .008, key, t);
-        vec3 color;
-        if (hit.y < 1.5) {
-          float latitude = atan(position.z, position.x) * 4.0 + position.y * 12.0 - t * 2.2;
-          float liquid = sin(latitude + sin(position.y * 17.0 + t) * 1.7) * .5 + .5;
-          float vein = pow(max(0.0, sin(latitude * 2.4 - t * 2.0)), 15.0);
-          color = mix(vec3(.12, .035, .005), vec3(1.0, .42, .035), .46 + diffuse * .54);
-          color += mix(vec3(1.0, .55, .10), vec3(.35, .72, 1.0), liquid) * (.20 + .28 * energy);
-          color += vec3(1.0, .79, .27) * vein * (.35 + .45 * energy);
-          color *= .84 + diffuse * .45;
-          color *= occlusion;
-        } else {
-          float ringTone = hit.y == 2.0 ? 0.0 : hit.y == 3.0 ? .35 : hit.y == 4.0 ? .70 : .13;
-          color = mix(vec3(.12, .72, 1.0), vec3(1.0, .39, .045), ringTone);
-          color *= .55 + diffuse * .75;
-          color += vec3(.64, .91, 1.0) * rim * .85;
-          color *= 1.0 + energy * .42;
-        }
-        float highlight = pow(max(0.0, dot(reflect(rd, normal), key)), 28.0);
-        color += vec3(1.0, .83, .43) * highlight * .95;
-        color += vec3(.15, .53, 1.0) * rim * (.18 + energy * .30);
-        float alpha = hit.y < 1.5 ? .86 : .92;
-        gl_FragColor = vec4(color, alpha);
+        if(travel>4.0) { gl_FragColor=vec4(0.0); return; }
+        vec3 p=ro+rd*travel;
+        vec3 n=normalAt(p,t);
+        float facing=clamp(dot(n,-rd),0.0,1.0);
+        float rim=pow(1.0-facing,2.0);
+        float hue=sin(p.y*2.8+p.x*1.9+t*.25+n.z*2.0)*.5+.5;
+        vec3 blue=vec3(.08,.22,.86);
+        vec3 violet=vec3(.56,.27,.94);
+        vec3 cyan=vec3(.25,.91,.94);
+        vec3 color=mix(blue,violet,smoothstep(.25,.9,hue));
+        color=mix(color,cyan,smoothstep(.05,.94,n.y*.5+n.x*.3+.48));
+        float light=dot(n,normalize(vec3(-.5,.8,1.1)))*.5+.5;
+        color*=.55+.55*light;
+        vec3 reflection=reflect(rd,n);
+        float softbox=pow(max(0.0,dot(reflection,normalize(vec3(-.45,.9,1.5)))),8.0);
+        color=mix(color,vec3(.86,.96,1.0),softbox*.72);
+        color+=vec3(.15,.4,.48)*rim*.42;
+        color+=vec3(.09,.15,.19)*u_active;
+        // Subpixel coverage gives the sculpted silhouette a soft, clean edge.
+        float alpha=smoothstep(0.0,.075,facing);
+        gl_FragColor=vec4(color,alpha);
       }
     `;
 

@@ -104,7 +104,7 @@ The fleet hub, project keel, and conversation presence header are translucent sc
 
 Route changes use the native View Transitions API through the `werft-workspace` transition name. The implemented transition scales and fades the workspace over 260ms. Component hover transitions are short (about 180–240ms). Every motion path has a `prefers-reduced-motion: reduce` rule that removes transitions, hover lift, and view-transition animation. Do not add persistent animation that competes with live status.
 
-`WerftOrb.svelte` is a transparent native WebGL raymarched sphere containing a 3D lattice and orbital rings with flowing layers, lighting, and organic deformation, plus a CSS fallback when WebGL compilation or context support fails. The decorative layers can live and flow independently by default; the shader's energy response is reserved for an actual connected request and never implies backend activity. Animation pauses for reduced motion, when the document is hidden, and when its stage is offscreen via `IntersectionObserver`. Both fleet and Talk expose an explicit play/pause control.
+`WerftOrb.svelte` is a native WebGL raymarched fluid sculpture with a continuously folding, asymmetrical toroidal surface, soft lighting, and cyan/blue/violet iridescence, plus a CSS fallback when WebGL compilation or context support fails. The decorative form folds continuously by default; the shader's energy response is reserved for an actual connected request and never implies backend activity. Animation pauses for reduced motion, when the document is hidden, and when its stage is offscreen via `IntersectionObserver`. Both fleet and Talk expose an explicit play/pause control.
 
 ## Shapes
 
