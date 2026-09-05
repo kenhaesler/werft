@@ -182,7 +182,7 @@ export const demoMachine: Machine = {
   ],
 };
 export function demoDetail(run: RunSummary): RunDetail {
-  return {
+  const result: RunDetail = {
     ...run,
     branch_name: `werft/${run.project_slug}-${run.issue_number}`,
     base_sha: '0f4a8c27',
@@ -216,12 +216,14 @@ export function demoDetail(run: RunSummary): RunDetail {
         id: 2,
         event_type: 'runner.started',
         payload: { message: 'Isolated workspace prepared. Agent runtime started.' },
-        created_at: ago(10),
+        created_at: new Date(
+          (Date.parse(run.created_at) + Date.parse(run.updated_at)) / 2,
+        ).toISOString(),
       },
       {
         id: 3,
-        event_type: 'agent.working',
-        payload: { message: 'Reading project context and implementing the requested changes.' },
+        event_type: 'status_changed',
+        payload: { from: 'claimed', to: run.status },
         created_at: run.updated_at,
       },
     ],
@@ -230,4 +232,11 @@ export function demoDetail(run: RunSummary): RunDetail {
       { path: 'changes.diff', bytes: 16400, collected_at: ago(1) },
     ],
   };
+  if (!run.attempt_count) {
+    result.attempts = [];
+    result.branch_name = null;
+    result.artifacts = [];
+    result.events = [{ id: 1, event_type: 'created', payload: {}, created_at: run.created_at }];
+  }
+  return result;
 }

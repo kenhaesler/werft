@@ -1,15 +1,20 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import Icon from './Icon.svelte';
   import { api, downloadArtifact } from './api';
   import { demoDetail } from './demo';
   import { bytes, duration, relativeTime, safeExternalUrl, statusLabels } from './format';
-  import type { RunDetail, RunSummary } from './types';
+  import type { ActivitySnapshot, RunDetail, RunSummary } from './types';
+  import { milestoneTitle, providerName, runExplanation } from './run-presentation';
+  import { timeAgo } from './activity';
   let {
     run,
     demo,
     busy,
     message = '',
+    activity = null,
+    activityError = '',
+    activityFetchedAt = 0,
     onclose,
     onaction,
   }: {
@@ -17,6 +22,9 @@
     demo: boolean;
     busy: boolean;
     message?: string;
+    activity?: ActivitySnapshot | null;
+    activityError?: string;
+    activityFetchedAt?: number;
     onclose: () => void;
     onaction: (action: 'accept' | 'reject' | 'cancel' | 'requeue', run: RunSummary) => void;
   } = $props();
@@ -24,7 +32,12 @@
   let error = $state('');
   let downloadError = $state('');
   let downloading = $state('');
-  let tab = $state('Timeline');
+  let tab = $state('Overview');
+  let now = $state(Date.now());
+  onMount(() => {
+    const timer = setInterval(() => (now = Date.now()), 1000);
+    return () => clearInterval(timer);
+  });
   let retry = $state(0);
   let syncError = $state('');
   let lastSuccessfulUpdate = $state('');
@@ -36,6 +49,7 @@
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     let wake: (() => void) | undefined;
+    tab = 'Overview';
     detail = null;
     error = '';
     syncError = '';
@@ -92,6 +106,31 @@
     };
   });
   const displayed = $derived(detail ?? run);
+  const explanation = $derived(runExplanation[displayed.status]);
+  const latestAttempt = $derived(
+    detail?.attempts.slice().sort((a, b) => b.attempt_no - a.attempt_no)[0],
+  );
+  const runtime = $derived(activity?.active_runs.find((item) => item.run_id === runId));
+  const runtimeAvailable = $derived(
+    !!activity?.manager.available &&
+      (demo || (!activityError && activityFetchedAt > 0 && now - activityFetchedAt < 12_000)),
+  );
+  const attended = $derived(
+    runtimeAvailable && !!activity?.manager.live_driver_run_ids.includes(runId),
+  );
+  const events = $derived(
+    detail?.events
+      .slice()
+      .sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id - a.id) ?? [],
+  );
+  const latestEvent = $derived(events[0]);
+  const provider = $derived(
+    providerName(
+      runtimeAvailable && runtime?.status === displayed.status
+        ? (runtime?.provider ?? latestAttempt?.provider)
+        : latestAttempt?.provider,
+    ),
+  );
   async function download(path: string) {
     downloadError = '';
     downloading = path;
@@ -116,10 +155,11 @@
 </script>
 
 <div class="inspector-heading">
-  <span><Icon name="agent" />Run workspace</span><button
-    class="icon-button"
-    aria-label="Close run details"
-    onclick={onclose}><Icon name="close" /></button
+  <span
+    ><Icon name="agent" />Task details{#if demo}<span class="inspector-preview">Sample task</span
+      >{/if}</span
+  ><button class="icon-button" aria-label="Close run details" onclick={onclose}
+    ><Icon name="close" /></button
   >
 </div>
 <div class="inspector-body">
@@ -128,31 +168,8 @@
     ><span>{displayed.project_slug} / #{displayed.issue_number}</span>
   </div>
   <h2>{displayed.issue_title}</h2>
-  <div class="detail-facts">
-    <div>
-      <span>Attempts</span><strong>{displayed.attempt_count} / {displayed.max_attempts}</strong>
-    </div>
-    <div><span>Last updated</span><strong>{relativeTime(displayed.updated_at)}</strong></div>
-    <div>
-      <span>Outcome</span><strong
-        >{displayed.latest_outcome?.replaceAll('_', ' ') ?? 'In progress'}</strong
-      >
-    </div>
-  </div>
-  {#if displayed.parked_reason}<p class="notice warning">
-      <Icon name="warning" />{displayed.parked_reason.replaceAll('_', ' ')}
-    </p>{/if}
-  {#if safeExternalUrl(displayed.pr_url)}<a
-      class="button"
-      href={safeExternalUrl(run.pr_url)}
-      target="_blank"
-      rel="noreferrer">View pull request #{displayed.pr_number}<Icon name="external" size={15} /></a
-    >{/if}
-  {#if detail?.branch_name}<div class="branch-line">
-      <Icon name="branch" size={15} /><code>{detail.branch_name}</code>
-    </div>{/if}
   <div class="tabs" aria-label="Run details">
-    {#each ['Timeline', 'Evidence', 'Attempts'] as item (item)}<button
+    {#each ['Overview', 'Timeline', 'Evidence', 'Attempts'] as item (item)}<button
         class:active={tab === item}
         aria-pressed={tab === item}
         onclick={() => (tab = item)}
@@ -171,27 +188,145 @@
     </div>{:else if !detail}<div class="loading-state">
       <span class="spinner"></span>Loading run evidence…
     </div>{:else}
+    {#if displayed.parked_reason}<p class="notice warning">
+        <Icon name="warning" />{displayed.parked_reason.replaceAll('_', ' ')}
+      </p>{/if}
     {#if detail.error_message}<p class="notice warning">{detail.error_message}</p>{/if}
-    {#if tab === 'Timeline'}<div class="event-timeline">
-        {#each detail.events as event (event.id)}<div class="timeline-event">
+    {#if tab === 'Overview'}
+      <section class="task-current" aria-label="Current task state">
+        <h3>{explanation.title}</h3>
+        <p>{explanation.description}</p>
+        <div class="task-next">
+          <strong>Next step</strong>
+          <p>{explanation.next}</p>
+        </div>
+        {#if safeExternalUrl(displayed.pr_url)}<a
+            class="button"
+            href={safeExternalUrl(displayed.pr_url)}
+            target="_blank"
+            rel="noreferrer"
+            >View pull request #{displayed.pr_number}<Icon name="external" size={15} /></a
+          >{/if}
+      </section>
+      <section class="task-assignment" aria-label="Agent assignment">
+        <div class="assignment-heading">
+          <Icon name="agent" size={22} />
+          <div>
+            <h3>
+              {latestAttempt
+                ? provider === 'Not reported'
+                  ? 'Agent provider not reported'
+                  : `${provider} agent`
+                : displayed.attempt_count
+                  ? 'Session details unavailable'
+                  : 'No agent assigned yet'}
+            </h3>
+            <p>
+              {latestAttempt
+                ? `${latestAttempt.ended_at ? 'Last attempt' : 'Attempt'} ${latestAttempt.attempt_no} of ${displayed.max_attempts}`
+                : displayed.attempt_count
+                  ? 'The backend has not returned attempt details.'
+                  : 'An agent will be assigned when an attempt starts.'}
+            </p>
+          </div>
+        </div>
+        {#if latestAttempt}<p class="assignment-definition">
+            An agent session is one attempt to complete this task in an isolated environment on your
+            machine.
+          </p>{/if}
+        {#if displayed.status === 'running'}
+          <div class="assignment-signal" class:signal-warning={!attended}>
+            <Icon name={attended ? 'activity' : 'warning'} size={17} /><span
+              >{!runtimeAvailable
+                ? 'Live session monitoring unavailable'
+                : attended
+                  ? 'Manager is monitoring this session'
+                  : 'Manager is not currently monitoring this session'}</span
+            >
+          </div>
+          {#if runtimeAvailable && runtime?.last_heartbeat_at}<p class="assignment-heartbeat">
+              Last session heartbeat: {timeAgo(
+                runtime.last_heartbeat_at,
+                demo && activity ? Date.parse(activity.generated_at) : now,
+              )}
+            </p>{/if}
+        {/if}
+      </section>
+      {#if latestEvent}<section class="task-latest" aria-label="Latest recorded update">
+          <div>
+            <h3>Latest recorded update</h3>
+            <time
+              datetime={latestEvent.created_at}
+              title={new Date(latestEvent.created_at).toLocaleString()}
+              >{relativeTime(latestEvent.created_at)}</time
+            >
+          </div>
+          <strong>{milestoneTitle(latestEvent)}</strong>
+          {#if typeof latestEvent.payload.message === 'string'}<p>
+              {latestEvent.payload.message}
+            </p>{/if}
+          <button class="text-button" onclick={() => (tab = 'Timeline')}
+            >View timeline<Icon name="arrow" size={15} /></button
+          >
+        </section>{/if}
+      <details class="task-technical">
+        <summary>Technical details</summary>
+        <dl>
+          <div>
+            <dt>Task ID</dt>
+            <dd><code>{displayed.id}</code></dd>
+          </div>
+          <div>
+            <dt>Branch</dt>
+            <dd><code>{detail.branch_name ?? 'Not created yet'}</code></dd>
+          </div>
+          <div>
+            <dt>Last task update</dt>
+            <dd>{new Date(displayed.updated_at).toLocaleString()}</dd>
+          </div>
+          <div>
+            <dt>Last attempt outcome</dt>
+            <dd>{displayed.latest_outcome?.replaceAll('_', ' ') ?? 'No outcome reported'}</dd>
+          </div>
+          {#if runtimeAvailable && runtime?.status === displayed.status}<div>
+              <dt>Agent container</dt>
+              <dd><code>{runtime.container_id ?? 'Not reported'}</code></dd>
+            </div>
+            <div>
+              <dt>Session deadline</dt>
+              <dd>
+                {runtime.hard_deadline_at
+                  ? new Date(runtime.hard_deadline_at).toLocaleString()
+                  : 'Not reported'}
+              </dd>
+            </div>{/if}
+        </dl>
+      </details>
+    {:else if tab === 'Timeline'}<p class="section-description">
+        Recorded milestones, newest first. Open event details for the backend payload.
+      </p>
+      <div class="event-timeline">
+        {#each events as event (event.id)}<div class="timeline-event">
             <span class="timeline-point"
               ><Icon
-                name={event.event_type.includes('fail') ? 'warning' : 'check'}
-                size={12}
+                name={event.event_type.includes('fail') ? 'warning' : 'activity'}
+                size={14}
               /></span
             >
             <div>
               <div class="timeline-title">
-                <strong>{event.event_type.replaceAll('.', ' · ').replaceAll('_', ' ')}</strong
-                ><small>{relativeTime(event.created_at)}</small>
+                <strong>{milestoneTitle(event)}</strong><time
+                  datetime={event.created_at}
+                  title={new Date(event.created_at).toLocaleString()}
+                  >{relativeTime(event.created_at)}</time
+                >
               </div>
-              {#if typeof event.payload.message === 'string'}<p>
-                  {event.payload.message}
-                </p>{:else if Object.keys(event.payload).length}<pre>{JSON.stringify(
-                    event.payload,
-                    null,
-                    2,
-                  )}</pre>{/if}
+              {#if typeof event.payload.message === 'string'}<p>{event.payload.message}</p>{/if}
+              <details class="event-payload">
+                <summary>Event details</summary><code>{event.event_type}</code>
+                <p>{new Date(event.created_at).toLocaleString()}</p>
+                <pre>{JSON.stringify(event.payload, null, 2)}</pre>
+              </details>
             </div>
           </div>{:else}<p class="muted">No events recorded yet.</p>{/each}
       </div>
@@ -218,17 +353,23 @@
         </div>{/each}{#if downloadError}<p class="notice warning" role="alert">
           {downloadError}
         </p>{/if}
-    {:else}{#each detail.attempts as attempt (attempt.attempt_no)}<div class="attempt-row">
+    {:else}<p class="section-description">
+        Each attempt is a separate agent session. Earlier results remain available after a retry.
+      </p>
+      {#each detail.attempts as attempt (attempt.attempt_no)}<div class="attempt-row">
           <span class="attempt-number">{attempt.attempt_no}</span>
           <div>
-            <strong>{attempt.provider}</strong><small
-              >{attempt.outcome?.replaceAll('_', ' ') ?? 'Running'}</small
+            <strong>{providerName(attempt.provider)}</strong><small
+              >{attempt.outcome?.replaceAll('_', ' ') ??
+                (attempt.ended_at ? 'No outcome reported' : 'No outcome yet')}</small
             >
           </div>
           <span
             >{attempt.duration_seconds !== null
               ? duration(attempt.duration_seconds)
-              : 'In progress'}</span
+              : attempt.ended_at
+                ? 'Duration unavailable'
+                : 'Not finished'}</span
           >
         </div>{:else}<p class="muted empty-inline">
           No attempts yet. This run is waiting to be dispatched.

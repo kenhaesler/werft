@@ -2817,3 +2817,212 @@ pre {
     padding: 16px;
   }
 }
+
+/* Task inspector: summary first, execution details on demand. */
+.inspector-heading > span {
+  font-size: 14px;
+  flex-wrap: wrap;
+}
+.inspector-preview {
+  font-size: 13px;
+  color: var(--muted);
+  padding-left: 10px;
+  border-left: 1px solid var(--border);
+}
+.inspector-body {
+  padding: 28px;
+}
+.inspector-meta {
+  font-size: 14px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.inspector-meta .status {
+  font-size: 13px;
+}
+.inspector-body .tabs {
+  margin: 24px 0;
+  gap: 24px;
+}
+.inspector-body .tabs > button {
+  font-size: 14px;
+  min-height: 44px;
+}
+.inspector-body .tabs > button span {
+  font-size: 13px;
+}
+.inspector-body h3 {
+  font-size: 18px;
+  line-height: 1.4;
+  margin: 0;
+}
+.task-current {
+  padding: 22px;
+  background: var(--accent-soft, #edf3ff);
+  border-radius: 12px;
+}
+.task-current > p,
+.task-next p,
+.assignment-definition,
+.task-latest > p {
+  font-size: 14px;
+  line-height: 1.65;
+  margin-top: 8px;
+  color: var(--muted);
+}
+.task-next {
+  margin-top: 20px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+.task-next strong {
+  font-size: 14px;
+}
+.task-next p {
+  margin-top: 4px;
+}
+.task-current > .button {
+  margin-top: 18px;
+  font-size: 14px;
+  min-height: 44px;
+}
+.task-assignment,
+.task-latest {
+  padding: 24px 0;
+  border-bottom: 1px solid var(--border);
+}
+.assignment-heading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.assignment-heading > svg {
+  color: var(--accent);
+}
+.assignment-heading p {
+  font-size: 14px;
+  color: var(--muted);
+  margin-top: 3px;
+}
+.assignment-signal {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  margin-top: 16px;
+  color: var(--accent);
+}
+.assignment-signal.signal-warning {
+  color: #92531c;
+}
+.assignment-heartbeat {
+  color: var(--muted);
+  font-size: 13px;
+  margin-top: 6px;
+}
+.task-latest > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+  margin-bottom: 14px;
+}
+.task-latest time,
+.timeline-title time {
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.task-latest > strong {
+  font-size: 15px;
+}
+.task-latest .text-button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  min-height: 44px;
+  margin-top: 8px;
+}
+.task-technical summary,
+.event-payload summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 14px;
+  padding: 16px 0;
+}
+.task-technical dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  margin: 0 0 16px;
+}
+.task-technical dt {
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.task-technical dd {
+  font-size: 14px;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.inspector-body .timeline-title strong {
+  font-size: 15px;
+  max-width: none;
+}
+.inspector-body .timeline-event p,
+.inspector-body .section-description {
+  font-size: 14px;
+  line-height: 1.65;
+}
+.inspector-body .timeline-event {
+  padding-bottom: 24px;
+}
+.event-payload > code,
+.event-payload pre {
+  font-size: 13px;
+}
+.event-payload summary {
+  padding: 10px 0;
+}
+.inspector-body .artifact-row strong,
+.inspector-body .attempt-row {
+  font-size: 14px;
+}
+.inspector-body .artifact-row small,
+.inspector-body .attempt-row > span:last-child {
+  font-size: 13px;
+}
+.inspector-actions > .button {
+  min-height: 44px;
+  font-size: 14px;
+}
+.inspector-actions > small {
+  font-size: 13px;
+}
+@media (max-width: 600px) {
+  .inspector-body {
+    padding: 20px;
+  }
+  .inspector-heading,
+  .inspector-actions {
+    padding: 16px 20px;
+  }
+  .inspector-body .tabs {
+    gap: 20px;
+  }
+  .task-current {
+    padding: 18px;
+  }
+  .task-latest > div {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .task-technical dl {
+    grid-template-columns: 1fr;
+  }
+  .timeline-title {
+    flex-wrap: wrap;
+  }
+}

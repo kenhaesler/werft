@@ -1130,6 +1130,9 @@
 >
   {#if selected}<RunInspector
       run={selected}
+      activity={activityData}
+      {activityError}
+      {activityFetchedAt}
       message={notice}
       {demo}
       {busy}
