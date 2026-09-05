@@ -61,6 +61,17 @@ describe('api()', () => {
     await expect(api('/quota')).rejects.toBeInstanceOf(ApiError);
     await expect(api('/quota')).rejects.toMatchObject({ status: 401 });
   });
+
+  it('validates a replacement token without using the previously saved token', async () => {
+    setToken('old-token');
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    await api('/quota', { headers: { Authorization: 'Bearer replacement-token' } });
+    expect(new Headers(fetchMock.mock.calls[0][1].headers).get('Authorization')).toBe(
+      'Bearer replacement-token',
+    );
+    expect(getToken()).toBe('old-token');
+  });
 });
 
 describe('actions', () => {
@@ -124,9 +135,7 @@ describe('downloadArtifact', () => {
 
   it('fetches the artifact with the token in the header, never in the URL', async () => {
     const { click } = stubBlobPlumbing();
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValue(new Response('bytes', { status: 200 }));
+    const fetchMock = vi.fn().mockResolvedValue(new Response('bytes', { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
 
     await downloadArtifact('run-1', 'outputs/log file.jsonl');

@@ -598,6 +598,14 @@ def _project_out(project: Project) -> ProjectOut:
     )
 
 
+@api_router.get("/projects", response_model=list[ProjectOut])
+async def list_projects(
+    session: AsyncSession = Depends(get_session),  # noqa: B008 - FastAPI DI
+) -> list[ProjectOut]:
+    projects = (await session.execute(select(Project).order_by(Project.slug))).scalars().all()
+    return [_project_out(project) for project in projects]
+
+
 async def _get_run_for_mutation(session: AsyncSession, run_id: UUID) -> Run:
     run = await session.get(Run, run_id)
     if run is None:

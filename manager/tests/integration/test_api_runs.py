@@ -286,6 +286,24 @@ def auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {TOKEN}"}
 
 
+async def test_list_projects_includes_repositories_without_runs(
+    db_session, token_file, auth_headers
+) -> None:
+    first = await seed_project(db_session, owner="operator", repo="alpha")
+    second = await seed_project(db_session, owner="operator", repo="beta")
+    app = make_client_app(db_session, token_file=token_file)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        unauthorized = await client.get("/api/v1/projects")
+        response = await client.get("/api/v1/projects", headers=auth_headers)
+    assert unauthorized.status_code == 401
+    assert response.status_code == 200
+    projects = response.json()
+    assert [p["slug"] for p in projects] == sorted([first.slug, second.slug])
+    assert {p["repo"] for p in projects} == {"alpha", "beta"}
+    assert all(p["owner"] == "operator" for p in projects)
+    assert all(p["lifecycle"] == "bootstrap" for p in projects)
+
+
 # -- shape, ordering, latest_outcome, pr_url ------------------------------
 
 

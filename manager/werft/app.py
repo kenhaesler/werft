@@ -60,6 +60,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from werft.api.auth import make_require_token
 from werft.api.routes import api_router, healthz_router
+from werft.api.system import system_router
 from werft.config.dispatch import DispatchConfigCache, load_dispatch_config
 from werft.config.settings import Settings
 from werft.db.engine import create_engine_from_url
@@ -570,8 +571,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # tests that override `get_session` and never enter `lifespan_context`
     # (test_api_runs.py's style) still need a well-defined value.
     app.state.artifacts_root = resolved.artifacts_root
+    app.state.docker_url = resolved.docker_url
+    app.state.max_concurrent_runs = resolved.max_concurrent_runs
     app.include_router(healthz_router)
     app.include_router(api_router, prefix="/api/v1", dependencies=[Depends(require_token)])
+    app.include_router(system_router, prefix="/api/v1", dependencies=[Depends(require_token)])
 
     # B7: the built dashboard is served, conditionally, at `/ui` —
     # `StaticFiles` requires its directory to exist at construction time

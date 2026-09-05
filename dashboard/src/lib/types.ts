@@ -60,3 +60,54 @@ export interface Artifact {
 export interface ArtifactsResponse {
   artifacts: Artifact[];
 }
+
+export interface RunDetail extends RunSummary {
+  branch_name: string | null;
+  base_sha: string | null;
+  merge_commit_sha: string | null;
+  error_message: string | null;
+  result: Record<string, unknown> | null;
+  events: {
+    id: number;
+    event_type: string;
+    payload: Record<string, unknown>;
+    created_at: string;
+  }[];
+  attempts: {
+    attempt_no: number;
+    provider: string;
+    outcome: string | null;
+    duration_seconds: number | null;
+    started_at: string;
+    ended_at: string | null;
+  }[];
+  artifacts: Omit<Artifact, 'content_hash'>[];
+}
+
+export interface Project {
+  id: string;
+  slug: string;
+  owner: string;
+  repo: string;
+  lifecycle: string;
+  onboarded_at: string | null;
+  created_at: string;
+}
+
+export interface Machine {
+  name: string;
+  os: string;
+  architecture: string;
+  engine_version: string;
+  cpus: number;
+  memory_bytes: number;
+  max_concurrent_runs: number;
+  containers: {
+    id: string;
+    run_id: string;
+    name: string;
+    image: string;
+    state: string;
+    status: string;
+  }[];
+}

@@ -28,11 +28,15 @@ export class ApiError extends Error {
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const token = getToken();
   const headers = new Headers(init.headers);
-  if (token) {
+  if (token && !headers.has('Authorization')) {
     headers.set('Authorization', `Bearer ${token}`);
   }
 
-  const response = await fetch(`${API_PREFIX}${path}`, { ...init, headers });
+  const response = await fetch(`${API_PREFIX}${path}`, {
+    ...init,
+    headers,
+    signal: init.signal ?? AbortSignal.timeout(15_000),
+  });
 
   if (!response.ok) {
     throw new ApiError(response.status);

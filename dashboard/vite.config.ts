@@ -5,6 +5,15 @@ import tailwindcss from '@tailwindcss/vite';
 export default defineConfig({
   base: './',
   plugins: [svelte(), tailwindcss()],
+  server: {
+    host: '127.0.0.1',
+    proxy: {
+      '/api': {
+        target: process.env.WERFT_API_TARGET || 'http://127.0.0.1:8420',
+        changeOrigin: true,
+      },
+    },
+  },
   build: {
     outDir: 'dist',
   },
@@ -14,6 +23,7 @@ export default defineConfig({
   // component tests exercising the real client output.
   resolve: process.env.VITEST ? { conditions: ['browser'] } : undefined,
   test: {
+    exclude: ['e2e/**', 'node_modules/**', 'dist/**'],
     environment: 'jsdom',
     setupFiles: ['./src/test-setup.ts'],
   },

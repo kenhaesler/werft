@@ -41,7 +41,8 @@
       artifacts = response.artifacts;
     } catch (err) {
       artifacts = null;
-      artifactsError = err instanceof ApiError ? `failed to load (${err.status})` : 'failed to load';
+      artifactsError =
+        err instanceof ApiError ? `failed to load (${err.status})` : 'failed to load';
     } finally {
       artifactsLoading = false;
     }

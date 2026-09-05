@@ -35,6 +35,10 @@ Thumbs.db
 .claude/
 .superpowers/
 .playwright-mcp/
+.impeccable/review/
+.impeccable/mocks/
+test-results/
+playwright-report/
 
 # Screenshots & scratch images at root (v1 lesson)
 /*.png
