@@ -33,7 +33,11 @@
     onexpand?: () => void;
   } = $props();
   let now = $state(Date.now());
-  let stage = $state('all');
+  let selection = $state<string | null>(null);
+  let stage = $derived(selection ?? (compact ? 'sessions' : 'all'));
+  let workerErrors = $derived(
+    Object.values(data?.manager.workers ?? {}).filter((worker) => worker.state === 'error').length,
+  );
   let inspecting = $state('');
   let inspectError = $state('');
   let stale = $derived(!demo && (!!error || (fetchedAt > 0 && now - fetchedAt > 12_000)));
@@ -53,12 +57,33 @@
     (data?.active_runs ?? []).filter(
       (r) =>
         stage === 'all' ||
-        (stage === 'attention'
-          ? ['failed', 'parked', 'blocked_quota'].includes(r.status)
-          : selectedStages?.includes(r.status)),
+        (stage === 'sessions'
+          ? ['running', 'claimed'].includes(r.status) ||
+            !!data?.manager.live_driver_run_ids.includes(r.run_id)
+          : stage === 'attention'
+            ? ['failed', 'parked', 'blocked_quota'].includes(r.status)
+            : selectedStages?.includes(r.status)),
     ),
   );
-  let visible = $derived(compact ? filtered.slice(0, 2) : filtered);
+  let limit = $state(20);
+  $effect(() => {
+    void stage;
+    limit = 20;
+  });
+  let ordered = $derived(
+    [...filtered].sort((a, b) => {
+      const rank = (id: string, status: string) =>
+        data?.manager.live_driver_run_ids.includes(id)
+          ? 0
+          : status === 'running'
+            ? 1
+            : status === 'claimed'
+              ? 2
+              : 3;
+      return rank(a.run_id, a.status) - rank(b.run_id, b.status);
+    }),
+  );
+  let visible = $derived(ordered.slice(0, compact ? 6 : limit));
   let headline = $derived(
     !data
       ? 'Connecting to backend activity…'
@@ -67,10 +92,10 @@
         : !data.manager.available
           ? 'Scheduler activity unavailable.'
           : executing
-            ? `${executing === 1 ? 'One agent session is' : `${executing} agent sessions are`} active.`
+            ? `${executing} active ${executing === 1 ? 'session' : 'sessions'}`
             : working
               ? 'Running tasks need manager attention.'
-              : 'Werft is watching for the next step.',
+              : 'No active sessions',
   );
 
   onMount(() => {
@@ -94,18 +119,9 @@
 <section class="activity-monitor" class:compact aria-label="Backend activity">
   <div class="activity-heading">
     <div class="activity-title">
-      <span class="activity-symbol" class:watching={!executing || stale}
-        ><Icon name="activity" size={25} /></span
-      >
       <div>
         <h2>{headline}</h2>
-        <p>
-          {demo
-            ? 'Sample activity · connect your manager to follow real work.'
-            : stale
-              ? 'Showing the last received snapshot. Retrying automatically.'
-              : 'Tasks, background checks, and VM activity in one place.'}
-        </p>
+        {#if stale}<p>Showing the last received snapshot. Retrying automatically.</p>{/if}
       </div>
     </div>
     <div class="activity-freshness" class:stale>
@@ -144,7 +160,7 @@
           class:chosen={stage === item.label}
           class:occupied={count > 0}
           aria-pressed={stage === item.label}
-          onclick={() => (stage = stage === item.label ? 'all' : item.label)}
+          onclick={() => (selection = stage === item.label ? null : item.label)}
         >
           <span class="pipeline-node"><Icon name={item.icon} size={18} /></span>
           <span class="pipeline-label">{item.label}<strong>{count}</strong></span>
@@ -152,7 +168,7 @@
       {/each}
     </div>
     <div class="activity-scope">
-      <button class="text-button" aria-pressed={stage === 'all'} onclick={() => (stage = 'all')}
+      <button class="text-button" aria-pressed={stage === 'all'} onclick={() => (selection = 'all')}
         >{stage === 'all' ? 'Current tasks' : 'Show all current tasks'}<span
           >{data.active_runs_total}</span
         ></button
@@ -161,80 +177,110 @@
         {#if exceptions}<button
             class="exception-filter"
             aria-pressed={stage === 'attention'}
-            onclick={() => (stage = stage === 'attention' ? 'all' : 'attention')}
+            onclick={() => (selection = stage === 'attention' ? null : 'attention')}
             ><Icon name="warning" size={13} />{exceptions} blocked or failed</button
           >{/if}<span>{data.status_counts.merged ?? 0} completed</span>
       </div>
     </div>
+    <div class="session-columns" aria-hidden="true">
+      <span>Task</span><span>Status</span><span>Last signal</span><span></span>
+    </div>
     <div class="live-task-list">
       {#each visible as run (run.run_id)}
         {@const attended = data.manager.live_driver_run_ids.includes(run.run_id)}
-        <button class="live-task" disabled={!!inspecting} onclick={() => inspect(run.run_id)}>
-          <span class="live-task-icon"
-            ><Icon
-              name={run.status === 'running'
-                ? 'terminal'
-                : run.status === 'awaiting_ci'
-                  ? 'shield'
-                  : 'clock'}
-              size={19}
-            /></span
-          >
-          <span class="live-task-content"
-            ><span class="live-task-top"
-              ><strong>{run.issue_title}</strong><span class="status status-{run.status}"
-                ><i></i>{statusLabels[run.status]}</span
+        {@const expired =
+          run.status === 'running' &&
+          !!run.lease_expires_at &&
+          Date.parse(run.lease_expires_at) < clock}
+        <details class="session-row">
+          <summary class="live-task">
+            <span class="session-task"
+              ><strong>{run.issue_title}</strong><span
+                >{run.project_slug} · #{run.issue_number}{#if run.provider}
+                  · {run.provider}{/if}</span
               ></span
             >
-            <span class="live-task-project"
-              >{run.project_slug} · #{run.issue_number}{#if run.provider}
-                · {run.provider}{/if}</span
+            <span
+              class="status status-{run.status}"
+              class:signal-warning={expired || (run.status === 'running' && !attended)}
+              ><i></i>{expired
+                ? 'Lease expired'
+                : run.status === 'running' && !attended
+                  ? 'Unattended'
+                  : statusLabels[run.status]}</span
             >
-            <span class="live-task-step">{waitReason(run, attended)}</span>
-            <span class="live-task-telemetry">
-              {#if run.status === 'running'}<span
-                  class:heartbeat-expired={!!run.lease_expires_at &&
-                    Date.parse(run.lease_expires_at) < clock}
-                  >Heartbeat {timeAgo(
-                    run.last_heartbeat_at,
-                    clock,
-                  )}{#if run.lease_expires_at && Date.parse(run.lease_expires_at) < clock}
-                    · lease expired{/if}</span
-                >
-              {:else if ['queued', 'blocked_quota', 'failed'].includes(run.status)}<span
-                  >{nextCheck(run.next_attempt_at, clock)}</span
-                >
-              {:else}<span>Updated {timeAgo(run.updated_at, clock)}</span>{/if}
-              {#if run.container_id}<code title={run.container_id}
-                  >VM {run.container_id.slice(0, 12)}</code
-                >{/if}
-              {#if !compact && run.hard_deadline_at}<span
-                  title={new Date(run.hard_deadline_at).toLocaleString()}
-                  >Deadline {new Date(run.hard_deadline_at).toLocaleTimeString()}</span
-                >{/if}
-              {#if !compact && run.attempt_started_at}<span
-                  title={new Date(run.attempt_started_at).toLocaleString()}
-                  >Attempt started {timeAgo(run.attempt_started_at, clock)}</span
-                >{/if}
-              {#if !compact && run.lease_expires_at}<span
-                  title={new Date(run.lease_expires_at).toLocaleString()}
-                  >Lease until {new Date(run.lease_expires_at).toLocaleTimeString()}</span
-                >{/if}
-            </span>
-          </span><Icon name={inspecting === run.run_id ? 'clock' : 'chevron'} size={16} />
-        </button>
-      {:else}<div class="activity-empty">
-          <Icon name="check" size={21} /><span
-            >{stage === 'all'
-              ? 'No open tasks. The next accepted issue will appear here.'
-              : 'No tasks in this stage in the current snapshot.'}</span
-          >
-        </div>{/each}
+            <span class="session-signal" title={run.last_heartbeat_at ?? run.updated_at}
+              >{run.status === 'running'
+                ? run.last_heartbeat_at
+                  ? timeAgo(run.last_heartbeat_at, clock)
+                  : 'No heartbeat'
+                : timeAgo(run.updated_at, clock)}</span
+            >
+            <span class="session-chevron"><Icon name="down" size={16} /></span>
+          </summary>
+          <div class="session-runtime">
+            <div class="runtime-heading">
+              <p>{waitReason(run, attended)}</p>
+              <button
+                class="text-button"
+                disabled={!!inspecting}
+                onclick={() => inspect(run.run_id)}
+                >{inspecting === run.run_id ? 'Opening…' : 'Open task'}<Icon
+                  name="arrow"
+                  size={15}
+                /></button
+              >
+            </div>
+            <dl>
+              <div>
+                <dt>Backend status</dt>
+                <dd>{statusLabels[run.status]}</dd>
+              </div>
+              {#if run.status === 'running'}<div>
+                  <dt>Heartbeat</dt>
+                  <dd>{timeAgo(run.last_heartbeat_at, clock)}</dd>
+                </div>{/if}
+              {#if ['queued', 'blocked_quota', 'failed'].includes(run.status)}<div>
+                  <dt>Retry / scheduling</dt>
+                  <dd>{nextCheck(run.next_attempt_at, clock)}</dd>
+                </div>{/if}
+              {#if run.container_id}<div>
+                  <dt>Container</dt>
+                  <dd><code>{run.container_id}</code></dd>
+                </div>{/if}
+              {#if run.attempt_started_at}<div>
+                  <dt>Attempt started</dt>
+                  <dd>{new Date(run.attempt_started_at).toLocaleString()}</dd>
+                </div>{/if}
+              {#if run.lease_expires_at}<div>
+                  <dt>Lease expires</dt>
+                  <dd class:signal-warning={expired}>
+                    {new Date(run.lease_expires_at).toLocaleString()}
+                  </dd>
+                </div>{/if}
+              {#if run.hard_deadline_at}<div>
+                  <dt>Deadline</dt>
+                  <dd>{new Date(run.hard_deadline_at).toLocaleString()}</dd>
+                </div>{/if}
+            </dl>
+          </div>
+        </details>
+      {:else}<p class="activity-empty">
+          {stage === 'all' ? 'No open tasks.' : 'No tasks in this stage in the current snapshot.'}
+        </p>{/each}
     </div>
+    {#if !compact && visible.length < ordered.length}<button
+        class="activity-expand"
+        onclick={() => (limit += 20)}
+        >Show {Math.min(20, ordered.length - visible.length)} more tasks<Icon
+          name="down"
+          size={16}
+        /></button
+      >{/if}
     {#if inspectError}<p class="activity-warning" role="alert">{inspectError}</p>{/if}
     {#if compact && onexpand}<button class="activity-expand" onclick={onexpand}
-        >Open live activity{#if filtered.length > 2}
-          · {filtered.length - 2} more tasks{/if}<Icon name="arrow" size={15} /></button
+        >View all activity{#if filtered.length > 6}
+          · {filtered.length - 6} more tasks{/if}<Icon name="arrow" size={15} /></button
       >{/if}
     {#if !compact && data.active_runs.length < data.active_runs_total}<p
         class="activity-annotation"
@@ -243,71 +289,88 @@
         entire workspace. Use Agent workspace to browse every task.
       </p>{/if}
 
-    <div class="background-work">
-      <h3>Behind the scenes</h3>
+    <details class="background-work" open={!compact}>
+      <summary class="backend-summary"
+        ><h3>Backend processes</h3>
+        <span class:signal-warning={workerErrors > 0}
+          >{!data.manager.available
+            ? 'Unavailable'
+            : workerErrors
+              ? `${workerErrors} ${workerErrors === 1 ? 'error' : 'errors'}`
+              : `${Object.keys(data.manager.workers).length} processes`}</span
+        ><Icon name="down" size={16} /></summary
+      >
       <div class="worker-list">
         {#each Object.entries(data.manager.workers) as [key, worker] (key)}
-          <div class="worker" class:worker-error={worker.state === 'error'}>
-            <div>
-              <i class:busy={worker.state === 'running' && !stale && !demo}></i><strong
-                >{workerNames[key] ?? humanize(key)}</strong
-              ><span
-                >{!data.manager.available
-                  ? 'Unavailable'
-                  : stale
-                    ? 'Last known'
-                    : worker.state === 'running'
-                      ? 'Working'
-                      : worker.state === 'error'
-                        ? 'Retry pending'
-                        : worker.state === 'idle'
-                          ? 'Idle'
-                          : 'Watching'}</span
-              >
-            </div>
-            <p title={worker.current_operation?.key}>
-              {worker.current_operation
-                ? humanize(worker.current_operation.kind)
-                : worker.state === 'error'
-                  ? 'A check failed; the loop will retry.'
+          <details class="worker" class:worker-error={worker.state === 'error'}>
+            <summary
+              ><strong>{workerNames[key] ?? humanize(key)}</strong><span class="worker-action"
+                >{worker.current_operation
+                  ? humanize(worker.current_operation.kind)
                   : !data.manager.available
-                    ? 'No scheduler connected'
-                    : worker.state === 'idle'
-                      ? 'Waiting for first pass'
-                      : nextCheck(worker.waiting_until, clock)}
-            </p>
-            <small title={worker.last_completed_at ?? undefined}
-              >Last completed {timeAgo(worker.last_completed_at, clock)}</small
+                    ? 'Unavailable'
+                    : worker.state === 'error'
+                      ? 'Retry pending'
+                      : worker.state === 'idle'
+                        ? 'Idle'
+                        : nextCheck(worker.waiting_until, clock)}</span
+              ><span class="worker-state"
+                >{stale
+                  ? 'Last known'
+                  : worker.state === 'running'
+                    ? 'Working'
+                    : worker.state === 'error'
+                      ? 'Error'
+                      : worker.state === 'waiting'
+                        ? 'Waiting'
+                        : 'Idle'}</span
+              ><Icon name="down" size={15} /></summary
             >
-            {#if worker.last_error_at}<small class="worker-error-time"
-                >Last error {timeAgo(worker.last_error_at, clock)}</small
-              >{/if}
-          </div>
+            <dl>
+              <div>
+                <dt>Last completed</dt>
+                <dd>{timeAgo(worker.last_completed_at, clock)}</dd>
+              </div>
+              {#if worker.last_error_at}<div>
+                  <dt>Last error</dt>
+                  <dd class="signal-warning">{timeAgo(worker.last_error_at, clock)}</dd>
+                </div>{/if}
+              {#if worker.current_operation?.key}<div>
+                  <dt>Target</dt>
+                  <dd><code>{worker.current_operation.key}</code></dd>
+                </div>{/if}
+              {#if worker.waiting_until}<div>
+                  <dt>Next check</dt>
+                  <dd>{new Date(worker.waiting_until).toLocaleString()}</dd>
+                </div>{/if}
+            </dl>
+          </details>
         {/each}
       </div>
-    </div>
-    <div class="activity-event-heading">
-      <h3>Latest events</h3>
-      <span>{compact ? 'Recorded milestones' : 'Latest 25 recorded milestones'}</span>
-    </div>
-    <ol class="activity-event-list">
-      {#each data.recent_events.slice(0, compact ? 1 : 25) as event (event.id)}
-        <li>
-          <span class="event-dot"></span><button
-            onclick={() => inspect(event.run_id)}
-            disabled={!!inspecting}
-            ><span
-              ><strong>{eventLabel(event)}</strong><span>{event.issue_title}</span><small
-                >{event.project_slug} · #{event.issue_number}</small
-              ></span
-            ><time datetime={event.created_at} title={new Date(event.created_at).toLocaleString()}
-              >{timeAgo(event.created_at, clock)}</time
-            ></button
-          >
-        </li>
-      {:else}<li class="activity-empty">No recorded task events yet.</li>{/each}
-    </ol>
-    {#if !compact}<details class="operation-details">
+    </details>
+    {#if !compact}
+      <div class="activity-event-heading">
+        <h3>Latest events</h3>
+        <span>Last {data.recent_events.length}</span>
+      </div>
+      <ol class="activity-event-list">
+        {#each data.recent_events.slice(0, compact ? 1 : 25) as event (event.id)}
+          <li>
+            <span class="event-dot"></span><button
+              onclick={() => inspect(event.run_id)}
+              disabled={!!inspecting}
+              ><span
+                ><strong>{eventLabel(event)}</strong><span>{event.issue_title}</span><small
+                  >{event.project_slug} · #{event.issue_number}</small
+                ></span
+              ><time datetime={event.created_at} title={new Date(event.created_at).toLocaleString()}
+                >{timeAgo(event.created_at, clock)}</time
+              ></button
+            >
+          </li>
+        {:else}<li class="activity-empty">No recorded task events yet.</li>{/each}
+      </ol>
+      <details class="operation-details">
         <summary
           >Backend operation log <span
             >{data.manager.recent_operations.length} recent operations</span
@@ -323,20 +386,20 @@
               ><strong>{humanize(operation.kind)}</strong><small
                 >{workerNames[operation.worker] ?? operation.worker} · {operation.key}</small
               ></span
-            ><span class:heartbeat-expired={operation.outcome === 'failed'}
-              >{operation.outcome}</span
+            ><span class:signal-warning={operation.outcome === 'failed'}>{operation.outcome}</span
             ><time title={operation.completed_at}>{timeAgo(operation.completed_at, clock)}</time
             ><code>{Math.round(operation.duration_ms)} ms</code>
           </div>
         {:else}<p class="activity-annotation">
             No completed operations reported in this process.
           </p>{/each}
-      </details>{/if}
-    <p class="activity-annotation activity-source">
-      {demo
-        ? 'Illustrative snapshot. No background work is running in preview.'
-        : 'Refreshes every 3 seconds while visible. Milestones and runtime health; agent transcripts are available in task evidence.'}
-    </p>
+      </details>
+      <p class="activity-annotation">
+        {demo
+          ? 'Sample data'
+          : 'Refreshes every 3 seconds. Agent transcripts are available in task evidence.'}
+      </p>
+    {/if}
   {:else if !error}<div class="activity-empty">
       <span class="spinner"></span>Waiting for the first activity snapshot…
     </div>{/if}
@@ -347,320 +410,336 @@
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 14px;
-    padding: 26px;
+    padding: 24px;
     min-width: 0;
   }
-  .activity-heading,
-  .activity-title {
+  .activity-heading {
     display: flex;
     align-items: center;
-    gap: 14px;
-  }
-  .activity-heading {
     justify-content: space-between;
-    align-items: flex-start;
     gap: 20px;
   }
-  .activity-symbol {
-    color: var(--accent);
-    background: #edf3ff;
-    border-radius: 12px;
-    padding: 12px;
-  }
-  .activity-symbol.watching {
-    color: #52657e;
-    background: #f1f5fa;
-  }
   h2 {
-    font-size: 22px;
-    line-height: 1.3;
-    font-weight: 600;
-    letter-spacing: -0.025em;
     margin: 0;
-    text-wrap: balance;
+    font-size: 22px;
+    font-weight: 600;
+    line-height: 1.35;
+    letter-spacing: -0.02em;
+  }
+  h3 {
+    margin: 0 0 14px;
+    font-size: 16px;
+    font-weight: 600;
   }
   .activity-title p {
+    font-size: 14px;
     color: var(--muted);
-    margin: 7px 0 0;
-    font-size: 12px;
-    line-height: 1.6;
+    margin: 8px 0 0;
   }
   .activity-freshness {
+    color: var(--muted);
+    font-size: 13px;
     text-align: right;
     flex-shrink: 0;
-    font-size: 11px;
-    color: var(--muted);
   }
   .activity-freshness > span {
     display: flex;
+    gap: 7px;
     align-items: center;
     justify-content: flex-end;
-    gap: 6px;
-    font-weight: 600;
   }
   .activity-freshness small {
     display: block;
-    margin-top: 5px;
-    font-size: 10px;
+    font-size: 12px;
+    margin-top: 4px;
   }
-  .activity-freshness i,
-  .worker i {
+  .activity-freshness i {
     width: 6px;
     height: 6px;
+    display: inline-block;
     border-radius: 50%;
     background: #64748b;
-    display: inline-block;
-    flex-shrink: 0;
   }
-  .activity-freshness i.live,
-  .worker i.busy {
+  .activity-freshness i.live {
     background: var(--accent);
   }
   .stale,
-  .heartbeat-expired,
-  .worker-error-time {
-    color: #a34d20;
+  .signal-warning {
+    color: #9a481d;
   }
   .work-pipeline {
     display: grid;
     grid-template-columns: repeat(5, minmax(0, 1fr));
-    margin: 30px 0 22px;
+    margin: 26px 0;
+    gap: 8px;
   }
   .work-pipeline button {
-    position: relative;
     display: flex;
-    flex-direction: column;
+    gap: 8px;
     align-items: center;
-    gap: 9px;
-    background: transparent;
-    border: 0;
-    padding: 4px 0;
+    justify-content: center;
+    background: #f6f8fc;
+    padding: 12px 7px;
+    border: 1px solid transparent;
     border-radius: 8px;
   }
-  .work-pipeline button::before {
-    content: '';
-    position: absolute;
-    height: 1px;
-    background: var(--border);
-    left: -50%;
-    right: 50%;
-    top: 22px;
-  }
-  .work-pipeline button:first-child::before {
-    display: none;
+  .work-pipeline button:hover,
+  .work-pipeline button.chosen {
+    background: #eaf1ff;
+    border-color: #bfd2f7;
   }
   .pipeline-node {
-    position: relative;
-    z-index: 1;
-    display: grid;
-    place-items: center;
-    width: 38px;
-    height: 38px;
-    border-radius: 50%;
-    border: 1px solid var(--border);
-    background: white;
+    display: inline-flex;
     color: var(--muted);
   }
   .occupied .pipeline-node {
-    background: #eef4ff;
     color: var(--accent);
-    border-color: #b8ccf5;
-  }
-  .chosen .pipeline-node {
-    background: var(--accent);
-    color: white;
-    border-color: var(--accent);
-  }
-  .work-pipeline button:hover {
-    background: #f5f8fe;
   }
   .pipeline-label {
     display: flex;
-    gap: 7px;
-    font-size: 12px;
+    gap: 8px;
+    font-size: 14px;
     color: var(--muted);
   }
   .pipeline-label strong {
     color: var(--text);
+    font-weight: 600;
     font-variant-numeric: tabular-nums;
-    font-weight: 650;
   }
-  .activity-scope,
-  .activity-scope > div {
+  .activity-scope {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    flex-wrap: wrap;
     gap: 10px;
-    font-size: 11px;
+    padding-bottom: 18px;
     color: var(--muted);
+    font-size: 13px;
   }
-  .activity-scope {
-    padding-bottom: 12px;
+  .activity-scope > div {
+    display: flex;
+    gap: 14px;
+    align-items: center;
   }
-  .activity-scope .text-button {
-    font-size: 12px;
-    color: var(--text);
+  .activity-monitor .text-button {
+    font-size: 14px;
   }
   .activity-scope .text-button span {
+    margin-left: 5px;
     color: var(--muted);
-    margin-left: 7px;
   }
   .exception-filter {
     display: flex;
-    gap: 5px;
     align-items: center;
-    background: #fff5e9;
+    gap: 6px;
     color: #94511d;
-    border: 0;
-    padding: 5px 7px;
-    border-radius: 5px;
-    font-size: 11px;
+    background: #fff5e9;
+    padding: 7px 9px;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
   }
   .exception-filter[aria-pressed='true'] {
     outline: 1px solid currentColor;
   }
-  .live-task-list {
-    border-top: 1px solid var(--border);
+  .session-columns,
+  .live-task {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 115px 100px 16px;
+    gap: 16px;
+    align-items: center;
+  }
+  .session-columns {
+    color: var(--muted);
+    font-size: 12px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .session-row {
+    border-bottom: 1px solid var(--border);
   }
   .live-task {
-    display: flex;
-    align-items: center;
-    text-align: left;
-    gap: 13px;
-    width: 100%;
-    border: 0;
-    border-bottom: 1px solid var(--border);
+    list-style: none;
     padding: 17px 0;
-    background: none;
+    cursor: pointer;
+  }
+  .live-task::-webkit-details-marker {
+    display: none;
   }
   .live-task:hover {
     background: #f5f8fe;
   }
-  .live-task-icon {
-    align-self: flex-start;
-    margin-top: 2px;
-    color: var(--accent);
-    background: #eef4ff;
-    padding: 9px;
-    border-radius: 9px;
-  }
-  .live-task-content {
-    display: block;
+  .session-task {
     min-width: 0;
-    flex: 1;
   }
-  .live-task-top {
-    display: flex;
-    align-items: flex-start;
-    gap: 12px;
-    justify-content: space-between;
-  }
-  .live-task-top > strong {
-    font-size: 13px;
-    font-weight: 600;
-    line-height: 1.55;
+  .session-task strong {
+    display: block;
+    font-size: 15px;
+    font-weight: 550;
+    line-height: 1.45;
     overflow-wrap: anywhere;
   }
-  .live-task-top .status {
-    flex-shrink: 0;
-  }
-  .live-task-project,
-  .live-task-step {
+  .session-task > span {
     display: block;
-    line-height: 1.5;
-    font-size: 11px;
     color: var(--muted);
-    margin-top: 4px;
-  }
-  .live-task-step {
-    color: var(--text);
-    margin-top: 10px;
-    font-size: 12px;
-  }
-  .live-task-telemetry {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 5px 14px;
-    font-size: 10px;
-    line-height: 1.5;
+    font-size: 13px;
     margin-top: 5px;
+    line-height: 1.5;
+  }
+  .live-task .status {
+    font-size: 13px;
+    justify-self: start;
+    white-space: normal;
+    line-height: 1.4;
+  }
+  .session-signal {
     color: var(--muted);
+    font-size: 13px;
     font-variant-numeric: tabular-nums;
   }
-  .live-task-telemetry code {
-    font-size: 10px;
+  .session-chevron {
+    display: flex;
+  }
+  details[open] > summary .session-chevron {
+    transform: rotate(180deg);
+  }
+  .session-runtime {
+    padding: 0 0 20px;
+  }
+  .runtime-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+  .runtime-heading p {
+    font-size: 14px;
+    margin: 0;
+    line-height: 1.6;
+  }
+  .runtime-heading button {
+    flex-shrink: 0;
+  }
+  dl {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px 24px;
+    margin: 0;
+    padding: 16px;
+    background: #f6f8fc;
+    border-radius: 8px;
+  }
+  dl > div {
+    min-width: 0;
+  }
+  dt {
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 5px;
+  }
+  dd {
+    font-size: 14px;
+    margin: 0;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+  }
+  dd code {
+    font-size: 13px;
   }
   .activity-expand {
     display: flex;
-    align-items: center;
     justify-content: center;
-    gap: 8px;
-    border: none;
-    background: none;
-    color: var(--accent);
-    font-size: 12px;
-    padding: 14px 0 0;
+    align-items: center;
+    gap: 10px;
     width: 100%;
-  }
-  h3 {
-    font-size: 13px;
-    font-weight: 600;
-    margin: 0;
+    padding: 17px 0 0;
+    background: none;
+    border: 0;
+    color: var(--accent);
+    font-size: 14px;
   }
   .background-work {
-    margin-top: 28px;
+    margin-top: 24px;
+    border-top: 1px solid var(--border);
+    padding-top: 18px;
+  }
+  .backend-summary {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    cursor: pointer;
+    list-style: none;
+  }
+  .backend-summary::-webkit-details-marker {
+    display: none;
+  }
+  .backend-summary h3 {
+    margin: 0;
+    flex: 1;
+  }
+  .backend-summary > span {
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .backend-summary > span.signal-warning {
+    color: #9a481d;
   }
   .worker-list {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 16px;
-    margin-top: 13px;
+    padding-top: 14px;
   }
   .worker {
-    min-width: 0;
+    border-bottom: 1px solid var(--border);
   }
-  .worker > div {
-    display: flex;
-    flex-wrap: wrap;
+  .worker:last-child {
+    border-bottom: 0;
+  }
+  .worker summary {
+    list-style: none;
+    display: grid;
+    grid-template-columns: minmax(145px, 1fr) minmax(0, 1fr) 66px 16px;
+    gap: 16px;
     align-items: center;
-    gap: 5px;
-    font-size: 11px;
+    padding: 13px 0;
+    cursor: pointer;
+    font-size: 13px;
   }
-  .worker strong {
+  .worker summary::-webkit-details-marker {
+    display: none;
+  }
+  .worker summary:hover {
+    background: #f5f8fe;
+  }
+  .worker summary strong {
     font-weight: 550;
   }
-  .worker > div > span {
-    color: var(--muted);
-    font-size: 10px;
-  }
-  .worker p {
-    font-size: 11px;
-    margin: 7px 0 3px;
-    line-height: 1.5;
+  .worker-action,
+  .worker-state {
     color: var(--muted);
     overflow-wrap: anywhere;
   }
-  .worker small {
-    font-size: 10px;
-    color: var(--muted);
-    display: block;
-    line-height: 1.5;
+  .worker-state {
+    text-align: right;
   }
-  .worker.worker-error p,
-  .worker small.worker-error-time {
-    color: #a34d20;
+  .worker-error .worker-action,
+  .worker-error .worker-state {
+    color: #9a481d;
+  }
+  .worker dl {
+    margin: 0 0 14px;
   }
   .activity-event-heading {
     display: flex;
     justify-content: space-between;
-    gap: 15px;
     align-items: center;
-    margin-top: 28px;
-    margin-bottom: 13px;
+    margin: 30px 0 14px;
+  }
+  .activity-event-heading h3 {
+    margin: 0;
   }
   .activity-event-heading > span {
-    font-size: 10px;
     color: var(--muted);
+    font-size: 13px;
   }
   .activity-event-list {
     list-style: none;
@@ -668,252 +747,218 @@
     padding: 0;
   }
   .activity-event-list li {
-    display: flex;
-    position: relative;
-    gap: 13px;
+    border-bottom: 1px solid var(--border);
   }
   .event-dot {
-    width: 7px;
-    height: 7px;
-    flex-shrink: 0;
-    margin-top: 10px;
-    border: 1px solid #88a6d1;
-    background: white;
-    border-radius: 50%;
-  }
-  .activity-event-list li:not(:last-child)::before {
-    content: '';
-    position: absolute;
-    left: 3px;
-    width: 1px;
-    top: 18px;
-    bottom: 0;
-    background: var(--border);
+    display: none;
   }
   .activity-event-list button {
     display: flex;
-    flex: 1;
-    min-width: 0;
     justify-content: space-between;
-    align-items: flex-start;
-    gap: 16px;
+    gap: 20px;
+    width: 100%;
+    padding: 15px 0;
     border: 0;
     background: none;
-    padding: 4px 0 15px;
     text-align: left;
   }
-  .activity-event-list button:hover strong {
-    color: var(--accent);
+  .activity-event-list button:hover {
+    background: #f5f8fe;
   }
   .activity-event-list button > span {
     display: grid;
-    gap: 4px;
-    min-width: 0;
+    gap: 5px;
   }
   .activity-event-list strong {
-    font-size: 12px;
+    font-size: 14px;
     font-weight: 550;
   }
-  .activity-event-list button span span {
-    font-size: 11px;
+  .activity-event-list button span span,
+  .activity-event-list small {
+    font-size: 13px;
     color: var(--muted);
+    line-height: 1.5;
     overflow-wrap: anywhere;
   }
-  .activity-event-list small {
-    font-size: 10px;
-    color: var(--dim);
-  }
   time {
-    font-size: 10px;
     color: var(--muted);
+    font-size: 13px;
     white-space: nowrap;
-    font-variant-numeric: tabular-nums;
   }
   .activity-warning {
     display: flex;
     align-items: center;
-    gap: 9px;
-    font-size: 12px;
+    gap: 10px;
+    font-size: 14px;
     line-height: 1.6;
+    padding: 14px;
+    margin: 16px 0;
     color: #94511d;
     background: #fff5e9;
-    padding: 12px;
-    margin: 16px 0 0;
     border-radius: 8px;
   }
   .activity-warning > span {
     flex: 1;
   }
   .activity-empty {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 26px 0;
     color: var(--muted);
-    font-size: 12px;
+    font-size: 14px;
+    padding: 18px 0;
   }
   .activity-annotation {
-    font-size: 11px;
     color: var(--muted);
+    font-size: 13px;
     line-height: 1.7;
-    margin: 12px 0;
-  }
-  .activity-source {
-    border-top: 1px solid var(--border);
-    padding-top: 13px;
-    margin-bottom: 0;
-    font-size: 10px;
+    margin: 16px 0 0;
   }
   .operation-details {
-    margin-top: 18px;
+    margin-top: 24px;
     border-top: 1px solid var(--border);
-    padding-top: 18px;
+    padding-top: 20px;
   }
-  .operation-details summary {
+  .operation-details > summary {
+    font-size: 15px;
     cursor: pointer;
-    font-size: 13px;
-    font-weight: 600;
   }
-  .operation-details summary span {
-    margin-left: 8px;
-    font-size: 11px;
+  .operation-details > summary span {
+    font-size: 13px;
     color: var(--muted);
-    font-weight: 400;
+    margin-left: 12px;
   }
   .operation-row {
     display: flex;
     align-items: center;
-    gap: 12px;
-    padding: 11px 0;
-    border-top: 1px solid var(--border);
-    font-size: 11px;
+    gap: 14px;
+    padding: 14px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
   }
   .operation-row > span:first-of-type {
     flex: 1;
     min-width: 0;
   }
   .operation-row strong {
-    font-weight: 500;
+    font-weight: 550;
   }
   .operation-row small {
     display: block;
+    font-size: 13px;
     color: var(--muted);
     margin-top: 5px;
     overflow-wrap: anywhere;
   }
   .operation-row code {
+    font-size: 12px;
     color: var(--muted);
-    font-size: 10px;
   }
-  @media (min-width: 761px) {
-    .compact h2 {
-      font-size: 20px;
+  @media (max-width: 1100px) {
+    .compact .pipeline-node {
+      display: none;
     }
-    .compact .activity-heading {
-      flex-wrap: wrap;
+    .compact .session-columns,
+    .compact .live-task {
+      grid-template-columns: minmax(0, 1fr) 95px 75px 16px;
       gap: 10px;
     }
-    .compact .activity-freshness {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      margin-left: 63px;
+    .compact .worker summary {
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 16px;
+      gap: 10px;
     }
-    .compact .activity-freshness small {
-      margin: 0;
+    .compact .worker-state {
+      display: none;
     }
   }
   @media (max-width: 760px) {
     .activity-monitor {
-      padding: 18px 15px;
+      padding: 18px 16px;
     }
     .activity-heading {
-      flex-direction: column;
-      gap: 12px;
-    }
-    .activity-title {
-      gap: 10px;
       align-items: flex-start;
-    }
-    .activity-symbol {
-      padding: 8px;
-      border-radius: 9px;
+      gap: 12px;
     }
     h2 {
       font-size: 20px;
     }
-    .activity-title p {
-      font-size: 11px;
-    }
     .activity-freshness {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      padding-left: 51px;
+      font-size: 12px;
     }
     .activity-freshness small {
-      margin: 0;
+      max-width: 90px;
     }
     .work-pipeline {
-      margin: 23px 0 20px;
-    }
-    .pipeline-label {
       gap: 4px;
-      font-size: 10px;
+      margin: 22px 0;
+    }
+    .work-pipeline button {
+      padding: 11px 3px;
     }
     .pipeline-node {
-      width: 32px;
-      height: 32px;
+      display: none;
     }
-    .work-pipeline button::before {
-      top: 19px;
+    .pipeline-label {
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      font-size: 12px;
+    }
+    .pipeline-label strong {
+      font-size: 15px;
     }
     .activity-scope {
       align-items: flex-start;
-      gap: 6px;
     }
     .activity-scope > div {
-      flex-direction: column;
-      align-items: flex-end;
-      gap: 6px;
-    }
-    .activity-scope .text-button {
-      font-size: 11px;
-    }
-    .live-task {
+      flex-wrap: wrap;
       gap: 8px;
     }
-    .live-task-icon {
+    .session-columns {
       display: none;
     }
-    .live-task-top {
-      flex-direction: column-reverse;
-      gap: 6px;
+    .live-task,
+    .compact .live-task {
+      grid-template-columns: minmax(0, 1fr) auto 16px;
+      gap: 10px;
     }
-    .live-task-top > strong {
-      font-size: 13px;
+    .session-task {
+      grid-column: 1 / 3;
     }
-    .worker-list {
+    .session-chevron {
+      grid-column: 3;
+      grid-row: 1 / 3;
+    }
+    .live-task .status {
+      grid-column: 1;
+    }
+    .session-signal {
+      grid-column: 2;
+      text-align: right;
+    }
+    .runtime-heading {
+      align-items: flex-start;
+      flex-direction: column;
+      gap: 10px;
+    }
+    dl {
       grid-template-columns: 1fr;
-      gap: 12px;
+      gap: 14px;
     }
-    .worker {
-      border-bottom: 1px solid var(--border);
-      padding-bottom: 10px;
+    .worker summary,
+    .compact .worker summary {
+      grid-template-columns: minmax(0, 1fr) 16px;
+      gap: 6px 10px;
     }
-    .worker:last-child {
-      border: 0;
-      padding-bottom: 0;
+    .worker summary strong {
+      font-size: 14px;
     }
-    .worker > div {
-      font-size: 12px;
+    .worker-action {
+      grid-column: 1;
     }
-    .worker > div > span {
-      margin-left: auto;
+    .worker summary :global(svg) {
+      grid-column: 2;
+      grid-row: 1 / 3;
     }
-    .worker small {
-      display: inline;
-      margin-right: 8px;
+    .worker-state {
+      display: none;
     }
     .operation-row {
       flex-wrap: wrap;

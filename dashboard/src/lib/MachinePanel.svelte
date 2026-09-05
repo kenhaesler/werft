@@ -77,9 +77,6 @@
         style:width={`${Math.min(100, (machine.containers.filter((c) => c.state === 'running').length / Math.max(1, machine.max_concurrent_runs)) * 100)}%`}
       ></span>
     </div>
-    <p class="machine-caption">
-      <span class="live-dot"></span>Disposable environments. Persistent evidence.
-    </p>
     {#if compact}<button class="button full subtle" onclick={onmanage}
         >Manage machine<Icon name="arrow" size={16} /></button
       >{:else}

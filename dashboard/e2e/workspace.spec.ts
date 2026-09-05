@@ -1,10 +1,41 @@
 import { test, expect } from '@playwright/test';
 
+test('drills from phase to task to evidence without showing runtime metadata upfront', async ({
+  page,
+}) => {
+  await page.goto('/');
+  const monitor = page.getByRole('region', { name: 'Backend activity' });
+  await expect(page.getByText('Demo workspace', { exact: true })).toBeVisible();
+  await expect(
+    page.getByText('Showing sample tasks and machines. Connect a manager to view live activity.'),
+  ).toBeVisible();
+  expect(
+    await page
+      .locator('.preview-description')
+      .evaluate((el) => parseFloat(getComputedStyle(el).fontSize)),
+  ).toBeGreaterThanOrEqual(14);
+  await expect(page.locator('.session-row')).toHaveCount(1);
+  await expect(page.locator('.worker-list')).not.toBeVisible();
+  await monitor.getByRole('button', { name: /Review\s*1/ }).click();
+  const row = monitor.locator('.session-row');
+  await expect(row).toHaveCount(1);
+  await expect(row.locator('.session-runtime')).not.toBeVisible();
+  await row.locator('summary').click();
+  await expect(row.getByText('Waiting for your review decision')).toBeVisible();
+  await row.getByRole('button', { name: 'Open task' }).click();
+  const inspector = page.getByRole('dialog', { name: 'Run details' });
+  await inspector.getByRole('button', { name: /Evidence/ }).click();
+  await expect(inspector.getByRole('button', { name: /transcript.jsonl/ })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await monitor.locator('.backend-summary').click();
+  await expect(monitor.locator('.worker-list')).toBeVisible();
+});
+
 test('preview navigation, search, evidence, review, and task creation', async ({ page }) => {
   const errors: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
   await page.goto('/');
-  await expect(page.getByText('You’re exploring sample data.')).toBeVisible();
+  await expect(page.getByText('Demo workspace')).toBeVisible();
   await page.getByRole('button', { name: /Review work/ }).click();
   const inspector = page.getByRole('dialog', { name: 'Run details' });
   await expect(
@@ -21,13 +52,13 @@ test('preview navigation, search, evidence, review, and task creation', async ({
   await expect(page.getByRole('textbox', { name: 'Search commands and tasks' })).toBeFocused();
   await page.getByRole('textbox', { name: 'Search commands and tasks' }).fill('Virtual');
   await page.getByRole('dialog').getByRole('button', { name: 'Virtual machine' }).click();
-  await expect(page.getByRole('heading', { name: 'Your machine. Their workspace.' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Virtual machine' })).toBeVisible();
   await page.getByRole('button', { name: 'Inspect', exact: true }).first().click();
   await expect(
     inspector.getByRole('heading', { name: 'Build the new analytics workspace' }),
   ).toBeVisible();
   await page.keyboard.press('Escape');
-  await page.getByRole('button', { name: 'Agent workspace', exact: true }).click();
+  await page.getByRole('button', { name: 'Agents', exact: true }).click();
   await page.getByRole('textbox', { name: 'Search tasks', exact: true }).fill('timeout');
   await expect(page.locator('.run-item')).toHaveCount(1);
   await page.getByRole('button', { name: 'New task', exact: true }).click();
@@ -115,14 +146,20 @@ test('live connection, authenticated actions, conflict recovery, and disconnect'
     return route.fulfill({ json: { runs: [run()], total: 1 } });
   });
   await page.goto('/');
-  await page.getByRole('button', { name: 'Connect your manager' }).click();
+  await page.getByRole('button', { name: 'Connect manager' }).click();
   await page.getByLabel('Manager API token').fill('bad-token');
-  await page.getByRole('button', { name: 'Connect workspace', exact: true }).click();
+  await page
+    .getByRole('dialog')
+    .getByRole('button', { name: 'Connect manager', exact: true })
+    .click();
   await expect(page.getByRole('alert')).toContainText('did not accept');
   expect(await page.evaluate(() => localStorage.getItem('werft_token'))).toBeNull();
   await page.getByLabel('Manager API token').fill('live-token');
-  await page.getByRole('button', { name: 'Connect workspace', exact: true }).click();
-  await expect(page.getByText('You’re exploring sample data.')).toHaveCount(0);
+  await page
+    .getByRole('dialog')
+    .getByRole('button', { name: 'Connect manager', exact: true })
+    .click();
+  await expect(page.getByText('Demo workspace')).toHaveCount(0);
   await expect(page.getByRole('heading', { name: 'Machine unavailable' })).toBeVisible();
   await page.getByRole('button', { name: /Review work/ }).click();
   await page.getByRole('button', { name: 'Accept work' }).click();
@@ -139,7 +176,7 @@ test('live connection, authenticated actions, conflict recovery, and disconnect'
 test('desktop and mobile visual evidence, keyboard focus and overflow', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1050 });
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Your workspace, at a glance.' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible();
   await page.evaluate(() => document.fonts.ready);
   await page.screenshot({
     path: '../.impeccable/review/desktop.png',
@@ -161,7 +198,7 @@ test('desktop and mobile visual evidence, keyboard focus and overflow', async ({
   await expect(page.locator('.sidebar')).toHaveAttribute('inert', '');
   await page.getByRole('button', { name: 'Open navigation' }).click();
   await page.getByRole('button', { name: 'Projects', exact: true }).click();
-  await expect(page.getByRole('heading', { name: 'A home for every project.' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Projects' })).toBeVisible();
   await page.getByRole('button', { name: 'Add project' }).click();
   await page.getByLabel('GitHub repository').fill('sample/new-project');
   await page.getByLabel('Project name', { exact: true }).fill('new-project');

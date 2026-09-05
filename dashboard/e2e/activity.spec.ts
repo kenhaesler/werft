@@ -2,6 +2,71 @@ import { expect, test, type Page } from '@playwright/test';
 
 const now = () => new Date().toISOString();
 
+test('keeps many parallel sessions readable and exposes runtime details on demand', async ({
+  page,
+}) => {
+  const data = snapshot();
+  data.active_runs = Array.from({ length: 24 }, (_, i) => ({
+    ...data.active_runs[0],
+    run_id: `parallel-${i}`,
+    issue_number: 100 + i,
+    issue_title:
+      i === 0
+        ? 'Implement organization permissions across the analytics workspace, background exports, and shared dashboards'
+        : `Parallel task ${i + 1}`,
+    project_slug: i % 2 ? 'data-pipeline' : 'analytics-workspace',
+    container_id: `environment-${i}`,
+    status: 'running',
+  }));
+  data.active_runs_total = 24;
+  data.manager.live_driver_run_ids = data.active_runs.map((run) => run.run_id);
+  data.status_counts = {
+    queued: 0,
+    running: 24,
+    awaiting_ci: 0,
+    awaiting_review: 0,
+    merging: 0,
+    failed: 0,
+    parked: 0,
+    merged: 9,
+  };
+  await page.addInitScript(() => localStorage.setItem('werft_token', 'activity-token'));
+  await page.route('**/api/v1/**', (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith('/activity')) return route.fulfill({ json: data });
+    if (path.endsWith('/quota')) return route.fulfill({ json: { accounts: [] } });
+    if (path.endsWith('/projects')) return route.fulfill({ json: [] });
+    if (path.endsWith('/system')) return route.fulfill({ status: 503, json: {} });
+    return route.fulfill({ json: { runs: [], total: 0 } });
+  });
+  await page.setViewportSize({ width: 1784, height: 1214 });
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: '24 active sessions' })).toBeVisible();
+  await expect(page.locator('.session-row')).toHaveCount(6);
+  await expect(page.locator('.session-runtime').first()).not.toBeVisible();
+  await page.locator('.session-row summary').first().focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.session-runtime').first()).toBeVisible();
+  await expect(page.locator('.session-runtime').first()).toContainText('environment-0');
+  await page.keyboard.press('Enter');
+  await page.screenshot({
+    path: '../.impeccable/review/parallel-sessions-desktop.png',
+    fullPage: true,
+  });
+  await page.getByRole('button', { name: /View all activity/ }).click();
+  await expect(page.locator('.session-row')).toHaveCount(20);
+  await page.getByRole('button', { name: 'Show 4 more tasks' }).click();
+  await expect(page.locator('.session-row')).toHaveCount(24);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.locator('.session-row summary').first().click();
+  await expect(page.locator('.session-runtime').first()).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({
+    path: '../.impeccable/review/parallel-sessions-mobile.png',
+    fullPage: false,
+  });
+});
+
 function summary(id: string, title: string, status: 'queued' | 'running' | 'failed' = 'queued') {
   return {
     id,
@@ -156,15 +221,18 @@ function snapshot(version = 1) {
 
 async function connect(page: Page) {
   await page.goto('/');
-  await page.getByRole('button', { name: 'Connect your manager' }).click();
+  await page.getByRole('button', { name: 'Connect manager' }).click();
   await page.getByLabel('Manager API token').fill('activity-token');
-  await page.getByRole('button', { name: 'Connect workspace', exact: true }).click();
+  await page
+    .getByRole('dialog')
+    .getByRole('button', { name: 'Connect manager', exact: true })
+    .click();
   await expect(page.getByText('Loaded task stays visible')).toBeVisible();
   await page
     .getByRole('navigation', { name: 'Main navigation' })
     .getByRole('button', { name: 'Activity' })
     .click();
-  await expect(page.getByRole('heading', { name: 'What Werft is doing.' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Activity' })).toBeVisible();
 }
 
 test('shows authenticated backend activity, global stages, workers, and event inspection', async ({
@@ -220,9 +288,21 @@ test('shows authenticated backend activity, global stages, workers, and event in
   await expect(monitor.getByText('Loaded task stays visible')).toHaveCount(0);
   await monitor.getByRole('button', { name: /Show all current tasks/ }).click();
   await expect(monitor.getByText('lease renewal')).toBeVisible();
+  await monitor
+    .locator('.session-row')
+    .filter({ hasText: 'Loaded task stays visible' })
+    .locator('summary')
+    .click();
   await expect(monitor.getByText('Manager is attending this agent session')).toBeVisible();
-  await expect(monitor.getByText('Next check in', { exact: false }).first()).toBeVisible();
+  await expect(
+    monitor.locator('.worker summary').getByText('Next check in', { exact: false }).first(),
+  ).toBeVisible();
   await expect(monitor.getByText('Retry pending')).toBeVisible();
+  await monitor
+    .locator('.worker')
+    .filter({ hasText: 'CI & merge checks' })
+    .locator('summary')
+    .click();
   await expect(monitor.getByText('Last error', { exact: false })).toBeVisible();
 
   await monitor.getByRole('button', { name: /Failed Inspect a run absent/ }).click();
@@ -276,9 +356,7 @@ test('preserves the last activity snapshot through a transient failure, then rec
   await monitor.getByRole('button', { name: 'Retry' }).click();
   await expect(monitor.getByText('Snapshot refreshed live')).toBeVisible();
   await expect(monitor.getByRole('status')).toHaveCount(0);
-  await expect(
-    monitor.getByRole('heading', { name: 'One agent session is active.' }),
-  ).toBeVisible();
+  await expect(monitor.getByRole('heading', { name: '1 active session' })).toBeVisible();
 });
 
 test('asks to reconnect when activity polling receives an expired credential', async ({ page }) => {
@@ -299,7 +377,7 @@ test('asks to reconnect when activity polling receives an expired credential', a
 
   await connect(page);
   await page.getByRole('button', { name: 'Refresh activity' }).click();
-  await expect(page.getByRole('dialog', { name: 'Connect your workspace' })).toBeVisible();
+  await expect(page.getByRole('dialog', { name: 'Connect manager' })).toBeVisible();
   await expect(
     page.getByRole('dialog').getByText('Your connection has expired. Enter a valid manager token.'),
   ).toBeVisible();

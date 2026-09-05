@@ -298,23 +298,6 @@ kbd {
   margin-top: auto;
   padding-top: 45px;
 }
-.autonomy-note {
-  display: flex;
-  gap: 9px;
-  align-items: flex-start;
-  padding: 0 12px 25px;
-  font-size: 10px;
-  color: #344d70;
-}
-.autonomy-note .live-dot {
-  margin-top: 4px;
-}
-.autonomy-note small {
-  display: block;
-  color: var(--dim);
-  font-size: 9px;
-  margin-top: 7px;
-}
 .profile-button {
   display: flex;
   align-items: center;
@@ -436,7 +419,7 @@ kbd {
   padding: 9px 34px;
   color: #344d70;
   background: #edf3fb;
-  font-size: 10px;
+  font-size: 14px;
   border-bottom: 1px solid #dce5f0;
 }
 .preview-banner > span {
@@ -445,20 +428,28 @@ kbd {
   gap: 8px;
   flex-wrap: wrap;
 }
+.preview-banner strong {
+  color: #172b4d;
+  font-weight: 600;
+}
 .preview-banner .preview-description {
   color: #526a88;
-  margin-left: -4px;
+  margin-left: 2px;
 }
 .preview-banner button {
-  background: transparent;
+  background: #2463eb;
   border: 0;
+  border-radius: 7px;
   display: flex;
   align-items: center;
   gap: 7px;
-  color: #172b4d;
-  font-size: 10px;
-  padding: 2px 0;
+  color: #ffffff;
+  font-size: 13px;
+  padding: 9px 12px;
   white-space: nowrap;
+}
+.preview-banner button:hover {
+  background: #1d50c4;
 }
 .page-content {
   padding: 37px 36px 24px;
@@ -1046,20 +1037,6 @@ kbd {
   height: 100%;
   background: #edf3fb;
   border-radius: 2px;
-}
-.machine-caption {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: #526a88;
-  font-size: 8px;
-  margin: 11px 0 22px;
-  line-height: 1.6;
-}
-.machine-caption .live-dot {
-  width: 3px;
-  height: 3px;
-  flex-basis: 3px;
 }
 .compact .button {
   font-size: 10px;
@@ -1989,7 +1966,7 @@ pre {
   color: #4c6486;
 }
 .preview-banner button {
-  color: #245dc2;
+  color: #ffffff;
 }
 .workspace-summary {
   border-top: 0;
@@ -2129,9 +2106,6 @@ pre {
 .capacity-heading,
 .quota-headroom {
   font-size: 11px;
-}
-.machine-caption {
-  font-size: 9px;
 }
 .provider-heading strong {
   font-size: 12px;
@@ -2345,9 +2319,6 @@ pre {
   .review-callout strong {
     font-size: 10px;
   }
-  .machine-caption {
-    font-size: 8px;
-  }
   .toast {
     left: calc(50% + 105px);
   }
@@ -2384,9 +2355,6 @@ pre {
   }
   .environment-policy {
     padding: 20px 0;
-  }
-  .preview-description {
-    display: none;
   }
   .quota-page-grid {
     gap: 30px;
@@ -2440,10 +2408,13 @@ pre {
   }
   .preview-banner {
     padding: 10px 20px;
-    font-size: 9px;
+    align-items: flex-start;
+    font-size: 14px;
+    flex-wrap: wrap;
   }
   .preview-banner button {
-    font-size: 9px;
+    font-size: 13px;
+    margin-left: 22px;
   }
   .page-content {
     padding: 30px 22px 20px;
@@ -2507,11 +2478,15 @@ pre {
 }
 @media (max-width: 480px) {
   .preview-banner > span {
-    max-width: 150px;
+    max-width: none;
     gap: 5px;
   }
   .preview-banner > span > svg {
-    display: none;
+    flex-shrink: 0;
+  }
+  .preview-banner .preview-description {
+    flex-basis: 100%;
+    margin-left: 22px;
   }
   .page-heading {
     flex-wrap: wrap;
@@ -2618,13 +2593,7 @@ pre {
   .compact .machine-specs > div {
     font-size: 11px;
   }
-  .machine-caption {
-    font-size: 10px;
-  }
-  .compact .machine-caption {
-    font-size: 9px;
-  }
-  .quota-panel.compact {
+  .compact .quota-panel.compact {
     padding-top: 28px;
     border-top: 1px solid var(--border);
   }
@@ -2695,4 +2664,8 @@ pre {
     transition: none !important;
     scroll-behavior: auto !important;
   }
+}
+
+.machine-panel.compact > .button {
+  margin-top: 16px;
 }

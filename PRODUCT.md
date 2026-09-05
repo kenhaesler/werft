@@ -27,6 +27,10 @@ The dashboard's Activity Monitor polls `/activity` every three seconds while vis
 - Distinguish live observations, unavailable capabilities, and illustrative demo data.
 - Make VM capacity and active workloads visible beside agent work.
 
+## Information Hierarchy
+
+Show overall status first, then let the operator drill into a phase, a task, its runtime details, and its evidence. Overview lists active sessions first; other phases are explicit filters. Keep backend processes collapsed with error counts visible in their summary. Use aligned session rows that scale to parallel work. Remove slogans and generic subtitles; copy must identify a function, report a fact, or explain an action. Explain demo mode clearly with readable text and a connection action.
+
 ## Brand Commitment
 
 The operator explicitly prefers a predominantly white interface with blue AI-inspired accents. Green and olive are not the brand palette. Preserve the approved Werft logo geometry and lettering. Warning and error states retain distinct warm semantic colors. Clear visual guidance is essential: human review first, active agents next, activity last; machine and quota information remain quieter supporting context.

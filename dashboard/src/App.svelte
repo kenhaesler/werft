@@ -22,12 +22,12 @@
 
   const navigation = [
     { id: 'overview', label: 'Overview', icon: 'overview' },
-    { id: 'agents', label: 'Agent workspace', icon: 'agent' },
+    { id: 'agents', label: 'Agents', icon: 'agent' },
     { id: 'projects', label: 'Projects', icon: 'projects' },
-    { id: 'review', label: 'Review queue', icon: 'review' },
+    { id: 'review', label: 'Review', icon: 'review' },
     { id: 'machines', label: 'Virtual machine', icon: 'vm' },
     { id: 'activity', label: 'Activity', icon: 'activity' },
-    { id: 'quotas', label: 'Usage & quotas', icon: 'quota' },
+    { id: 'quotas', label: 'Usage', icon: 'quota' },
   ];
   let page = $state('overview');
   let demo = $state(true);
@@ -566,11 +566,6 @@
         >{/each}
     </nav>
     <div class="sidebar-bottom">
-      <div class="autonomy-note">
-        <span class="live-dot"></span><span
-          >Your agents. Your machine.<small>Built to work on your terms.</small></span
-        >
-      </div>
       <button
         class="nav-item"
         class:active={page === 'settings'}
@@ -633,13 +628,12 @@
     </header>
     {#if demo}<div class="preview-banner">
         <span
-          ><Icon name="spark" size={14} />A look inside your next workspace.<span
+          ><Icon name="spark" size={14} /><strong>Demo workspace</strong><span
             class="preview-description"
-          >
-            You’re exploring sample data.</span
+            >Showing sample tasks and machines. Connect a manager to view live activity.</span
           ></span
         ><button onclick={() => openModal('connect')}
-          >Connect your manager<Icon name="arrow" size={14} /></button
+          >Connect manager<Icon name="arrow" size={14} /></button
         >
       </div>{/if}
     {#if loadError}<div class="notice warning" role="alert">
@@ -660,12 +654,7 @@
       {#if page === 'overview'}
         <div class="page-heading">
           <div>
-            <h1>Your workspace, at a glance.</h1>
-            <p>
-              {reviewRuns.length
-                ? 'Live work, backend health, and decisions that need you.'
-                : 'Follow your agents and keep the next step in sight.'}
-            </p>
+            <h1>Overview</h1>
           </div>
           <button
             class="button"
@@ -714,8 +703,7 @@
       {:else if page === 'activity'}
         <div class="page-heading simple">
           <div>
-            <h1>What Werft is doing.</h1>
-            <p>Follow each task from intake to merge, with the backend in view.</p>
+            <h1>Activity</h1>
           </div>
           <button class="button" onclick={refreshActivity}
             ><Icon name="refresh" size={16} />Refresh activity</button
@@ -733,19 +721,8 @@
         <div class="page-heading simple">
           <div>
             <h1>
-              {page === 'agents'
-                ? 'Agent workspace'
-                : page === 'review'
-                  ? 'Ready for your review'
-                  : 'Workspace activity'}
+              {page === 'agents' ? 'Agents' : 'Review'}
             </h1>
-            <p>
-              {page === 'agents'
-                ? 'Follow the work, inspect the evidence, and steer what happens next.'
-                : page === 'review'
-                  ? 'A human decision for work that needs a human perspective.'
-                  : 'The full trail of work across your projects.'}
-            </p>
           </div>
           <button class="button primary" onclick={() => openModal('task')}
             ><Icon name="plus" size={17} />New task</button
@@ -785,7 +762,7 @@
             ? 'No tasks match these filters'
             : page === 'review'
               ? 'You’re all caught up'
-              : 'Your workspace is ready'}
+              : 'No tasks found'}
         />
         <div class="list-footer">
           <span>{filteredRuns.length} matching · {runs.length} of {total} runs loaded</span
@@ -798,8 +775,7 @@
       {:else if page === 'machines'}
         <div class="page-heading simple">
           <div>
-            <h1>Your machine. Their workspace.</h1>
-            <p>A dedicated host, capable agents, and a clear view of every environment.</p>
+            <h1>Virtual machine</h1>
           </div>
           <button class="button" disabled={loading} onclick={() => refresh()}
             ><Icon name="refresh" size={16} />Refresh host</button
@@ -829,7 +805,7 @@
             </div>
             <div class="policy-item">
               <span class="policy-icon"><Icon name="terminal" /></span>
-              <h3>Room to do real work</h3>
+              <h3>Agent environments</h3>
               <p>
                 Agents can install tools, build applications, and run services inside their
                 disposable environments.
@@ -837,7 +813,7 @@
             </div>
             <div class="policy-item">
               <span class="policy-icon"><Icon name="file" /></span>
-              <h3>Evidence stays with you</h3>
+              <h3>Run evidence</h3>
               <p>
                 Transcripts, diffs, and collected artifacts remain attached to the run after its
                 environment is gone.
@@ -851,8 +827,7 @@
       {:else if page === 'projects'}
         <div class="page-heading simple">
           <div>
-            <h1>A home for every project.</h1>
-            <p>Connected repositories, their work, and the path from idea to verified change.</p>
+            <h1>Projects</h1>
           </div>
           <button class="button primary" onclick={() => openModal('project')}
             ><Icon name="plus" size={17} />Add project</button
@@ -884,11 +859,11 @@
                 onclick={() => {
                   navigate('agents');
                   projectFilter = project.slug;
-                }}>Open workspace<Icon name="arrow" size={16} /></button
+                }}>Open agents<Icon name="arrow" size={16} /></button
               >
             </article>{:else}<div class="empty-state">
               <Icon name="projects" size={32} />
-              <h3>Give your agents a place to start</h3>
+              <h3>No projects connected</h3>
               <p>Connect a GitHub repository to bring its approved work into Werft.</p>
               <button class="button primary" onclick={() => openModal('project')}
                 >Add your first project</button
@@ -898,8 +873,7 @@
       {:else if page === 'quotas'}
         <div class="page-heading simple">
           <div>
-            <h1>Stay within your limits.</h1>
-            <p>Provider usage, reserved capacity, and the headroom your agents can use.</p>
+            <h1>Usage</h1>
           </div>
           <button class="button" onclick={() => refresh()} disabled={loading}
             ><Icon name="refresh" size={16} />Refresh usage</button
@@ -932,8 +906,7 @@
       {:else if page === 'settings'}
         <div class="page-heading simple">
           <div>
-            <h1>Make yourself at home.</h1>
-            <p>Your connection and workspace preferences.</p>
+            <h1>Settings</h1>
           </div>
         </div>
         <section class="settings-section">
@@ -992,7 +965,7 @@
           : syncedAt
             ? `Last synced ${syncedAt}`
             : 'Connecting to manager'}</span
-      ><span>Werft<span class="meta-dot">/</span>Your autonomous workspace</span>
+      >
     </footer>
   </div>
 </div>
@@ -1008,22 +981,19 @@
   <div class="dialog-heading">
     <h2 id="modal-title">
       {modal === 'connect'
-        ? 'Connect your workspace'
+        ? 'Connect manager'
         : modal === 'command'
           ? 'Jump to anything'
           : modal === 'project'
             ? 'Add a project'
-            : 'What’s next?'}
+            : 'Create task'}
     </h2>
     <button class="icon-button" aria-label="Close dialog" onclick={() => (modal = null)}
       ><Icon name="close" /></button
     >
   </div>
   {#if modal === 'connect'}<form onsubmit={connect} class="dialog-form">
-      <p>
-        Enter the API token from your Werft manager. Your workspace will connect to the manager
-        serving this app.
-      </p>
+      <p>Enter the API token from your Werft manager to connect this dashboard.</p>
       <label for="api-token">Manager API token</label><input
         id="api-token"
         type="password"
@@ -1035,7 +1005,7 @@
       >{#if formError}<p class="form-error" role="alert">{formError}</p>{/if}<button
         class="button primary full"
         disabled={busy}
-        >{busy ? 'Connecting…' : 'Connect workspace'}<Icon name="arrow" size={16} /></button
+        >{busy ? 'Connecting…' : 'Connect manager'}<Icon name="arrow" size={16} /></button
       >
     </form>
   {:else if modal === 'command'}<div class="command-body">
