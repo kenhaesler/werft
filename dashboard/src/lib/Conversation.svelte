@@ -434,6 +434,7 @@
     font-weight: 550;
   }
   .conversation-composer textarea {
+    margin-bottom: 9px;
     background: white;
     min-height: 76px;
     font-size: 14px;
