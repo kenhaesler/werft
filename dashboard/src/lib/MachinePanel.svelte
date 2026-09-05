@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
+  import MachineModel from './MachineModel.svelte';
   import { bytes } from './format';
   import type { Machine, RunSummary } from './types';
   let {
@@ -47,17 +48,7 @@
     <span class="tiny-label">{demo ? 'SAMPLE' : 'DOCKER HOST'}</span>
   </div>
   {#if machine}
-    <div class="machine-visual" aria-hidden="true">
-      <div class="server-unit">
-        <div class="server-top"><span class="server-mark">W</span><span>WERFT ENGINE</span></div>
-        <div class="server-front">
-          <span class="server-slits"></span><span class="server-light"></span><span
-            class="server-light second"
-          ></span><span class="server-port"></span>
-        </div>
-      </div>
-      <span class="machine-orbit orbit-one"></span><span class="machine-orbit orbit-two"></span>
-    </div>
+    <MachineModel {compact} />
     <div class="machine-identity">
       <div>
         <h3>{machine.name}</h3>
