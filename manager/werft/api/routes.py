@@ -24,11 +24,14 @@ from uuid import UUID, uuid4
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from werft.api.schemas import (
+    ActivityEvent,
+    ActivityResponse,
+    ActivityRun,
     ArtifactOut,
     ArtifactsResponse,
     ArtifactSummary,
@@ -192,6 +195,136 @@ async def list_runs(
 
     runs = [_row_to_run_summary(row) for row in rows]
     return RunsListResponse(runs=runs, total=total)
+
+
+@api_router.get("/activity", response_model=ActivityResponse)
+async def get_activity(
+    request: Request,
+    session: AsyncSession = Depends(get_session),  # noqa: B008 - FastAPI DI pattern
+) -> ActivityResponse:
+    """A compact snapshot of this manager's live work and durable run facts.
+
+    The manager portion is intentionally process-local: after a restart it
+    reports a new ``started_at`` and no invented history.  The remaining
+    fields are read from Postgres and therefore remain useful across restarts.
+    Event payloads are reduced to the three display-safe state fields rather
+    than exposing arbitrary historical JSON.
+    """
+    status_rows = (
+        await session.execute(select(Run.status, func.count()).group_by(Run.status))
+    ).all()
+    status_counts = {row.status: row.count for row in status_rows}
+
+    event_rows = (
+        await session.execute(
+            select(
+                RunEvent.id,
+                RunEvent.run_id,
+                Project.slug.label("project_slug"),
+                BacklogItem.github_issue_number.label("issue_number"),
+                BacklogItem.title.label("issue_title"),
+                Run.status.label("run_status"),
+                RunEvent.event_type,
+                RunEvent.payload,
+                RunEvent.created_at,
+            )
+            .join(Run, Run.id == RunEvent.run_id)
+            .join(Project, Project.id == Run.project_id)
+            .join(BacklogItem, BacklogItem.id == Run.backlog_item_id)
+            .order_by(RunEvent.id.desc())
+            .limit(25)
+        )
+    ).all()
+    recent_events = [
+        ActivityEvent(
+            id=row.id,
+            run_id=row.run_id,
+            project_slug=row.project_slug,
+            issue_number=row.issue_number,
+            issue_title=row.issue_title,
+            run_status=row.run_status,
+            event_type=row.event_type,
+            phase=row.payload.get("phase") if isinstance(row.payload, dict) else None,
+            from_status=row.payload.get("from") if isinstance(row.payload, dict) else None,
+            to_status=row.payload.get("to") if isinstance(row.payload, dict) else None,
+            created_at=row.created_at,
+        )
+        for row in event_rows
+    ]
+
+    open_attempt_started_at = (
+        select(RunAttempt.started_at)
+        .where(RunAttempt.run_id == Run.id, RunAttempt.ended_at.is_(None))
+        .order_by(RunAttempt.attempt_no.desc())
+        .limit(1)
+        .correlate(Run)
+        .scalar_subquery()
+    )
+    inactive_statuses = tuple(status.value for status in TERMINAL_STATUSES)
+    active_runs_limit = 200
+    active_runs_total = (
+        await session.execute(
+            select(func.count()).select_from(Run).where(Run.status.not_in(inactive_statuses))
+        )
+    ).scalar_one()
+    execution_order = case(
+        (Run.status == RunStatus.RUNNING.value, 0),
+        (Run.status == RunStatus.CLAIMED.value, 1),
+        else_=2,
+    )
+    run_rows = (
+        await session.execute(
+            select(
+                Run.id.label("run_id"),
+                Project.slug.label("project_slug"),
+                BacklogItem.github_issue_number.label("issue_number"),
+                BacklogItem.title.label("issue_title"),
+                Run.status,
+                Run.parked_reason,
+                Run.provider,
+                Run.container_id,
+                open_attempt_started_at.label("attempt_started_at"),
+                Run.last_heartbeat_at,
+                Run.lease_expires_at,
+                Run.hard_deadline_at,
+                Run.next_attempt_at,
+                Run.updated_at,
+            )
+            .join(Project, Project.id == Run.project_id)
+            .join(BacklogItem, BacklogItem.id == Run.backlog_item_id)
+            .where(Run.status.not_in(inactive_statuses))
+            .order_by(execution_order, Run.priority.desc(), Run.updated_at.desc(), Run.id.desc())
+            .limit(active_runs_limit)
+        )
+    ).all()
+    active_runs = [
+        ActivityRun(
+            run_id=row.run_id,
+            project_slug=row.project_slug,
+            issue_number=row.issue_number,
+            issue_title=row.issue_title,
+            status=row.status,
+            parked_reason=row.parked_reason,
+            provider=row.provider,
+            container_id=row.container_id,
+            attempt_started_at=row.attempt_started_at,
+            last_heartbeat_at=row.last_heartbeat_at,
+            lease_expires_at=row.lease_expires_at,
+            hard_deadline_at=row.hard_deadline_at,
+            next_attempt_at=row.next_attempt_at,
+            updated_at=row.updated_at,
+        )
+        for row in run_rows
+    ]
+    return ActivityResponse(
+        generated_at=datetime.now(UTC),
+        manager=request.app.state.activity.snapshot(),
+        status_counts=status_counts,
+        recent_events=recent_events,
+        active_runs_total=active_runs_total,
+        active_runs_limit=active_runs_limit,
+        active_runs=active_runs,
+    )
 
 
 async def _get_run_or_404(session: AsyncSession, run_id: UUID) -> None:

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import Icon from './Icon.svelte';
   import { api, downloadArtifact } from './api';
   import { demoDetail } from './demo';
@@ -25,25 +26,72 @@
   let downloading = $state('');
   let tab = $state('Timeline');
   let retry = $state(0);
+  let syncError = $state('');
+  let lastSuccessfulUpdate = $state('');
+  const runId = $derived(run.id);
   $effect(() => {
-    const id = run.id;
+    const id = runId;
+    const initialRun = demo ? run : untrack(() => run);
     void retry;
     const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let wake: (() => void) | undefined;
     detail = null;
     error = '';
-    if (demo) detail = demoDetail(run);
-    else
-      api<RunDetail>(`/runs/${id}`, {
-        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]),
-      })
-        .then((data) => {
-          detail = data;
-        })
-        .catch((err) => {
-          if (!controller.signal.aborted) error = err.message || 'Could not load this run.';
-        });
-    return () => controller.abort();
+    syncError = '';
+    lastSuccessfulUpdate = '';
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        if (timer) clearTimeout(timer);
+        wake?.();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    const wait = (ms: number) =>
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, ms);
+        wake = () => {
+          if (timer) clearTimeout(timer);
+          timer = undefined;
+          wake = undefined;
+          resolve();
+        };
+      });
+    const refresh = async (initial = false) => {
+      try {
+        const data = demo
+          ? demoDetail(initialRun)
+          : await api<RunDetail>(`/runs/${id}`, {
+              signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]),
+            });
+        if (controller.signal.aborted) return;
+        detail = data;
+        error = '';
+        syncError = '';
+        lastSuccessfulUpdate = new Date().toISOString();
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        if (initial) error = err instanceof Error ? err.message : 'Could not load this run.';
+        else syncError = err instanceof Error ? err.message : 'Live update failed.';
+      }
+    };
+    const poll = async () => {
+      await refresh(true);
+      while (!controller.signal.aborted && !demo) {
+        await wait(document.visibilityState === 'visible' ? 3000 : 60_000);
+        if (!controller.signal.aborted && document.visibilityState === 'visible') await refresh();
+      }
+    };
+    void poll();
+    return () => {
+      controller.abort();
+      if (timer) clearTimeout(timer);
+      wake?.();
+      wake = undefined;
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
   });
+  const displayed = $derived(detail ?? run);
   async function download(path: string) {
     downloadError = '';
     downloading = path;
@@ -76,28 +124,29 @@
 </div>
 <div class="inspector-body">
   <div class="inspector-meta">
-    <span class="status status-{run.status}"><i></i>{statusLabels[run.status]}</span><span
-      >{run.project_slug} / #{run.issue_number}</span
-    >
+    <span class="status status-{displayed.status}"><i></i>{statusLabels[displayed.status]}</span
+    ><span>{displayed.project_slug} / #{displayed.issue_number}</span>
   </div>
-  <h2>{run.issue_title}</h2>
+  <h2>{displayed.issue_title}</h2>
   <div class="detail-facts">
-    <div><span>Attempts</span><strong>{run.attempt_count} / {run.max_attempts}</strong></div>
-    <div><span>Last updated</span><strong>{relativeTime(run.updated_at)}</strong></div>
+    <div>
+      <span>Attempts</span><strong>{displayed.attempt_count} / {displayed.max_attempts}</strong>
+    </div>
+    <div><span>Last updated</span><strong>{relativeTime(displayed.updated_at)}</strong></div>
     <div>
       <span>Outcome</span><strong
-        >{run.latest_outcome?.replaceAll('_', ' ') ?? 'In progress'}</strong
+        >{displayed.latest_outcome?.replaceAll('_', ' ') ?? 'In progress'}</strong
       >
     </div>
   </div>
-  {#if run.parked_reason}<p class="notice warning">
-      <Icon name="warning" />{run.parked_reason.replaceAll('_', ' ')}
+  {#if displayed.parked_reason}<p class="notice warning">
+      <Icon name="warning" />{displayed.parked_reason.replaceAll('_', ' ')}
     </p>{/if}
-  {#if safeExternalUrl(run.pr_url)}<a
+  {#if safeExternalUrl(displayed.pr_url)}<a
       class="button"
       href={safeExternalUrl(run.pr_url)}
       target="_blank"
-      rel="noreferrer">View pull request #{run.pr_number}<Icon name="external" size={15} /></a
+      rel="noreferrer">View pull request #{displayed.pr_number}<Icon name="external" size={15} /></a
     >{/if}
   {#if detail?.branch_name}<div class="branch-line">
       <Icon name="branch" size={15} /><code>{detail.branch_name}</code>
@@ -111,6 +160,11 @@
           >{/if}</button
       >{/each}
   </div>
+  {#if syncError && detail}<p class="notice warning" role="status">
+      Live updates interrupted: {syncError}. Retrying automatically. Last successful update{lastSuccessfulUpdate
+        ? `: ${new Date(lastSuccessfulUpdate).toLocaleTimeString()}`
+        : ''}.
+    </p>{/if}
   {#if error}<div class="empty-state">
       <p role="alert">{error}</p>
       <button class="button" onclick={() => retry++}>Retry</button>
@@ -183,19 +237,19 @@
 </div>
 <div class="inspector-actions">
   {#if message}<p class="muted" role="status">{message}</p>{/if}
-  {#if run.status === 'awaiting_review'}<button
+  {#if displayed.status === 'awaiting_review'}<button
       class="button primary"
       disabled={busy}
       onclick={() => onaction('accept', run)}><Icon name="check" size={16} />Accept work</button
     ><button class="button" disabled={busy} onclick={() => onaction('reject', run)}>Reject</button
-    >{/if}{#if run.status === 'parked'}<button
+    >{/if}{#if displayed.status === 'parked'}<button
       class="button primary"
       disabled={busy}
       onclick={() => onaction('requeue', run)}><Icon name="refresh" size={16} />Requeue run</button
-    >{/if}{#if !['merged', 'canceled'].includes(run.status)}<button
+    >{/if}{#if !['merged', 'canceled'].includes(displayed.status)}<button
       class="button danger"
       disabled={busy}
       onclick={() => onaction('cancel', run)}><Icon name="stop" size={14} />Cancel run</button
-    >{:else}<span class="muted">This run is {statusLabels[run.status].toLowerCase()}.</span
+    >{:else}<span class="muted">This run is {statusLabels[displayed.status].toLowerCase()}.</span
     >{/if}{#if demo}<small>Actions affect this preview only.</small>{/if}
 </div>

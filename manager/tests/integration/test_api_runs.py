@@ -304,6 +304,74 @@ async def test_list_projects_includes_repositories_without_runs(
     assert all(p["lifecycle"] == "bootstrap" for p in projects)
 
 
+async def test_activity_endpoint_combines_safe_manager_and_run_observations(
+    db_session, token_file, auth_headers
+) -> None:
+    project = await seed_project(db_session)
+    queued_item = await seed_backlog_item(db_session, project, 1, title="queued work")
+    running_item = await seed_backlog_item(db_session, project, 2, title="running work")
+    parked_item = await seed_backlog_item(db_session, project, 3, title="parked work")
+    queued = await seed_run(db_session, project, queued_item, status="queued")
+    running = await seed_run(db_session, project, running_item, status="running")
+    parked = await seed_run(
+        db_session,
+        project,
+        parked_item,
+        status="parked",
+        parked_reason="review_rejected",
+    )
+    await seed_attempt(db_session, running, ended=False)
+    await db_session.execute(
+        text(
+            "UPDATE runs SET provider = 'claude', container_id = 'c1', "
+            "last_heartbeat_at = now(), lease_expires_at = now() + interval '1 minute', "
+            "hard_deadline_at = now() + interval '1 hour' WHERE id = :id"
+        ),
+        {"id": running.id},
+    )
+    await db_session.execute(
+        text(
+            "INSERT INTO run_events (run_id, event_type, payload) "
+            'VALUES (:id, \'dispatch\', \'{"phase": "container_started", '
+            '"secret": "must_not_escape"}\'::jsonb)'
+        ),
+        {"id": running.id},
+    )
+    await db_session.commit()
+
+    app = make_client_app(db_session, token_file=token_file)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        unauthorized = await client.get("/api/v1/activity")
+        response = await client.get("/api/v1/activity", headers=auth_headers)
+
+    assert unauthorized.status_code == 401
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {
+        "generated_at",
+        "manager",
+        "status_counts",
+        "recent_events",
+        "active_runs_total",
+        "active_runs_limit",
+        "active_runs",
+    }
+    assert body["manager"]["available"] is False
+    assert body["manager"]["unavailable_reason"] == "manager_not_started"
+    assert body["status_counts"] == {"queued": 1, "running": 1, "parked": 1}
+    assert body["active_runs_total"] == 3
+    assert body["active_runs_limit"] == 200
+    active = {row["run_id"]: row for row in body["active_runs"]}
+    assert set(active) == {str(queued.id), str(running.id), str(parked.id)}
+    assert active[str(running.id)]["attempt_started_at"] is not None
+    assert active[str(running.id)]["container_id"] == "c1"
+    assert active[str(parked.id)]["parked_reason"] == "review_rejected"
+    event = next(row for row in body["recent_events"] if row["run_id"] == str(running.id))
+    assert event["phase"] == "container_started"
+    assert "secret" not in event
+
+
 # -- shape, ordering, latest_outcome, pr_url ------------------------------
 
 

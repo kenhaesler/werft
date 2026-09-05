@@ -73,6 +73,23 @@ test('live connection, authenticated actions, conflict recovery, and disconnect'
           { id: 'p1', slug: 'live-project', owner: 'owner', repo: 'repo', lifecycle: 'bootstrap' },
         ],
       });
+    if (path.endsWith('/activity'))
+      return route.fulfill({
+        json: {
+          generated_at: new Date().toISOString(),
+          manager: {
+            available: true,
+            started_at: new Date().toISOString(),
+            workers: {},
+            recent_operations: [],
+            live_driver_run_ids: [],
+          },
+          status_counts: { awaiting_review: 1 },
+          recent_events: [],
+          active_runs: [],
+          active_runs_total: 0,
+        },
+      });
     if (path.endsWith('/system'))
       return route.fulfill({ status: 503, json: { detail: 'unavailable' } });
     if (path.endsWith('/review/accept')) {
@@ -107,7 +124,7 @@ test('live connection, authenticated actions, conflict recovery, and disconnect'
   await page.getByRole('button', { name: 'Connect workspace', exact: true }).click();
   await expect(page.getByText('You’re exploring sample data.')).toHaveCount(0);
   await expect(page.getByRole('heading', { name: 'Machine unavailable' })).toBeVisible();
-  await page.locator('.run-item').click();
+  await page.getByRole('button', { name: /Review work/ }).click();
   await page.getByRole('button', { name: 'Accept work' }).click();
   await expect(page.getByRole('status')).toContainText('changed state');
   await page.getByRole('button', { name: 'Accept work' }).click();
@@ -122,7 +139,7 @@ test('live connection, authenticated actions, conflict recovery, and disconnect'
 test('desktop and mobile visual evidence, keyboard focus and overflow', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1050 });
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'A little less busywork.' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Your workspace, at a glance.' })).toBeVisible();
   await page.evaluate(() => document.fonts.ready);
   await page.screenshot({
     path: '../.impeccable/review/desktop.png',

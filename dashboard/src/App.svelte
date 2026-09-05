@@ -5,10 +5,20 @@
   import MachinePanel from './lib/MachinePanel.svelte';
   import QuotaPanel from './lib/QuotaPanel.svelte';
   import RunInspector from './lib/RunInspector.svelte';
+  import ActivityMonitor from './lib/ActivityMonitor.svelte';
+  import { previewActivity } from './lib/activity';
   import { api, actions, ApiError, getToken, setToken } from './lib/api';
   import { demoMachine, demoProjects, demoQuota, demoRuns } from './lib/demo';
-  import { activeStatuses, relativeTime, statusLabels } from './lib/format';
-  import type { Machine, Project, QuotaResponse, RunSummary, RunsResponse } from './lib/types';
+  import { activeStatuses } from './lib/format';
+  import type {
+    ActivitySnapshot,
+    Machine,
+    Project,
+    QuotaResponse,
+    RunDetail,
+    RunSummary,
+    RunsResponse,
+  } from './lib/types';
 
   const navigation = [
     { id: 'overview', label: 'Overview', icon: 'overview' },
@@ -32,6 +42,11 @@
   let loadError = $state('');
   let notice = $state('');
   let syncedAt = $state('');
+  let activity = $state<ActivitySnapshot | null>(null);
+  let activityError = $state('');
+  let activityFetchedAt = $state(0);
+  let refreshActivity = $state<() => void>(() => {});
+  let activityData = $derived(demo ? previewActivity(runs) : activity);
   let filter = $state('all');
   let projectFilter = $state('all');
   let search = $state('');
@@ -53,12 +68,11 @@
   let taskProject = $state('');
   let repoInput = $state('');
   let slugInput = $state('');
-  let session = 0;
+  let session = $state(0);
   let refreshCount = 0;
   let refreshCompletion: Promise<void> = Promise.resolve();
   let activeRuns = $derived(runs.filter((run) => activeStatuses.includes(run.status)));
   let reviewRuns = $derived(runs.filter((run) => run.status === 'awaiting_review'));
-  let completedRuns = $derived(runs.filter((run) => run.status === 'merged'));
   let filteredRuns = $derived(
     runs.filter(
       (run) =>
@@ -118,6 +132,16 @@
     notice = '';
     modal = null;
     selected = run;
+  }
+  async function inspectActivityRun(id: string) {
+    if (demo) {
+      const run = runs.find((run) => run.id === id);
+      if (run) openRun(run);
+      return;
+    }
+    const requestSession = session;
+    const run = await api<RunDetail>(`/runs/${encodeURIComponent(id)}`);
+    if (requestSession === session) openRun(run);
   }
   function preview() {
     session++;
@@ -415,6 +439,61 @@
     return () => clearInterval(timer);
   });
   $effect(() => {
+    const requestSession = session;
+    activity = null;
+    activityFetchedAt = 0;
+    activityError = '';
+    if (demo) return;
+    const controller = new AbortController();
+    let pending = false;
+    async function poll() {
+      if (pending || document.hidden || !getToken() || controller.signal.aborted) return;
+      pending = true;
+      try {
+        const snapshot = await api<ActivitySnapshot>('/activity', {
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(6000)]),
+        });
+        if (controller.signal.aborted || requestSession !== session) return;
+        if (!snapshot.manager || !Array.isArray(snapshot.active_runs))
+          throw new Error('Invalid activity response');
+        activity = snapshot;
+        activityFetchedAt = Date.now();
+        activityError = '';
+      } catch (err) {
+        if (controller.signal.aborted || requestSession !== session) return;
+        if (err instanceof ApiError && [401, 403].includes(err.status)) {
+          localStorage.removeItem('werft_token');
+          modal = 'connect';
+          formError = 'Your connection has expired. Enter a valid manager token.';
+          activityError = 'Connection expired. Reconnect to resume live activity.';
+        } else
+          activityError =
+            err instanceof ApiError && err.status === 404
+              ? 'This manager does not expose activity yet. Update the manager to enable live monitoring.'
+              : 'Backend activity could not be refreshed. Check the manager connection.';
+      } finally {
+        pending = false;
+      }
+    }
+    refreshActivity = () => {
+      void poll();
+    };
+    void poll();
+    const timer = setInterval(() => void poll(), 3000);
+    const resume = () => {
+      if (!document.hidden) {
+        void poll();
+        void refresh();
+      }
+    };
+    document.addEventListener('visibilitychange', resume);
+    return () => {
+      controller.abort();
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', resume);
+    };
+  });
+  $effect(() => {
     if (!dialog) return;
     if (modal) {
       if (!dialog.open) dialog.showModal();
@@ -433,7 +512,7 @@
 <svelte:head
   ><title>{currentNav?.label ?? 'Settings'} · Werft</title><meta
     name="theme-color"
-    content="#111312"
+    content="#f7f9fc"
   /></svelte:head
 >
 
@@ -518,21 +597,33 @@
         >
       </div>
       <div class="topbar-right">
-        <span class="connection-state"
-          ><span class="live-dot" class:preview-dot={demo}></span>{demo
+        <button
+          class="connection-state"
+          onclick={() => navigate('activity')}
+          title="Open backend activity"
+          ><span
+            class="live-dot"
+            class:preview-dot={demo || !!activityError || !activity?.manager.available}
+          ></span>{demo
             ? 'Preview mode'
-            : loadError
-              ? 'Connection interrupted'
-              : loading
-                ? 'Syncing'
-                : 'Manager connected'}</span
+            : activityError || loadError
+              ? 'Updates interrupted'
+              : !activity
+                ? 'Connecting'
+                : !activity.manager.available
+                  ? 'Scheduler unavailable'
+                  : activity.manager.live_driver_run_ids.length
+                    ? `${activity.manager.live_driver_run_ids.length} active agent sessions`
+                    : 'Watching for work'}</button
         ><span class="topbar-divider"></span><button
           class="icon-button"
           aria-label="Refresh workspace"
           title="Refresh workspace"
           disabled={loading}
-          onclick={() => refresh()}
-          ><span class:spinning={loading}><Icon name="refresh" size={16} /></span></button
+          onclick={() => {
+            refreshActivity();
+            void refresh();
+          }}><span class:spinning={loading}><Icon name="refresh" size={16} /></span></button
         ><button
           class="topbar-avatar"
           aria-label="Account settings"
@@ -569,106 +660,46 @@
       {#if page === 'overview'}
         <div class="page-heading">
           <div>
-            <h1>A little less busywork.<br /><span>A lot more momentum.</span></h1>
-            <p>Your agents are on it. Here’s what’s moving in your workspace.</p>
+            <h1>Your workspace, at a glance.</h1>
+            <p>
+              {reviewRuns.length
+                ? 'Live work, backend health, and decisions that need you.'
+                : 'Follow your agents and keep the next step in sight.'}
+            </p>
           </div>
-          <button class="button primary" onclick={() => openModal('task')}
-            ><Icon name="plus" size={17} />New task</button
+          <button
+            class="button"
+            class:primary={!reviewRuns.length}
+            onclick={() => openModal('task')}><Icon name="plus" size={17} />New task</button
           >
         </div>
         <div class="overview-layout">
           <div class="overview-work">
-            <div class="workspace-summary">
-              <div>
-                <span class="summary-dot mint"></span><strong>{activeRuns.length}</strong><span
-                  >agents working</span
-                >
+            {#if reviewRuns.length}
+              <div class="section-heading attention-heading">
+                <h2>Needs your attention <span class="count-label">{reviewRuns.length}</span></h2>
               </div>
-              <button onclick={() => navigate('review')}
-                ><span class="summary-dot amber"></span><strong>{reviewRuns.length}</strong><span
-                  >needs review</span
-                ><Icon name="chevron" size={13} /></button
-              >
-              <div>
-                <Icon name="check" size={15} /><strong>{completedRuns.length}</strong><span
-                  >completed</span
-                >
-              </div>
-              <span class="summary-scope"
-                >{demo ? 'Sample workspace' : `${runs.length} loaded runs`}</span
-              >
-            </div>
-            <div class="section-heading active-heading">
-              <h2>In motion <span class="count-label">{activeRuns.length}</span></h2>
-              <button class="text-button" onclick={() => navigate('agents')}
-                >All agents<Icon name="arrow" size={14} /></button
-              >
-            </div>
-            <div class="active-grid">
-              {#each activeRuns.slice(0, 2) as run, index (run.id)}<button
-                  class="agent-card"
-                  onclick={() => openRun(run)}
-                  ><div class="agent-card-top">
-                    <span class="agent-avatar" class:orange={index === 1}
-                      ><Icon name={index === 0 ? 'agent' : 'terminal'} size={21} /></span
-                    ><span class="status status-{run.status}"
-                      ><i></i>{statusLabels[run.status]}</span
-                    ><Icon name="external" size={14} />
-                  </div>
-                  <h3>{run.issue_title}</h3>
-                  <p>{run.project_slug}<span>·</span>#{run.issue_number}</p>
-                  <div class="agent-stage">
-                    <span class="agent-stage-icon"
-                      ><Icon
-                        name={run.status === 'awaiting_ci' ? 'shield' : 'terminal'}
-                        size={14}
-                      /></span
-                    ><span
-                      >{run.status === 'awaiting_ci'
-                        ? 'Waiting for CI verification'
-                        : run.status === 'merging'
-                          ? 'Merging verified changes'
-                          : run.status === 'claimed'
-                            ? 'Preparing the environment'
-                            : 'Agent is working in its environment'}</span
-                    >
-                  </div>
-                  <div class="agent-card-footer">
-                    <span
-                      ><Icon name="branch" size={13} />Attempt {run.attempt_count} of {run.max_attempts}</span
-                    ><span><Icon name="clock" size={13} />{relativeTime(run.created_at)}</span>
-                  </div></button
-                >{:else}<div class="empty-state active-empty">
-                  <Icon name="agent" size={30} />
-                  <h3>Room for your next idea</h3>
-                  <p>Queue an approved task and your agents will take it from here.</p>
-                  <button class="button" onclick={() => openModal('task')}
-                    >Create a task<Icon name="plus" size={16} /></button
-                  >
-                </div>{/each}
-            </div>
-            {#if reviewRuns.length}<button
-                class="review-callout"
-                onclick={() => openRun(reviewRuns[0])}
-                ><span class="review-callout-icon"><Icon name="review" size={21} /></span><span
-                  ><strong>A second set of eyes. Yours.</strong><small
-                    >{reviewRuns.length}
+              <button class="review-callout" onclick={() => openRun(reviewRuns[0])}>
+                <span class="review-callout-icon"><Icon name="review" size={23} /></span>
+                <span class="review-task"
+                  ><strong>{reviewRuns[0].issue_title}</strong><small
+                    >{reviewRuns[0].project_slug} · {reviewRuns.length}
                     {reviewRuns.length === 1 ? 'task is' : 'tasks are'} ready for your review.</small
                   ></span
-                ><span class="review-link">Review work<Icon name="arrow" size={16} /></span></button
-              >{/if}
-            <div class="section-heading recent-heading">
-              <h2>Recent activity</h2>
-              <button class="text-button" onclick={() => navigate('activity')}
-                >View all<Icon name="arrow" size={14} /></button
-              >
-            </div>
-            <RunList runs={runs.slice(0, 5)} onselect={openRun} />
-            <div class="workspace-footnote">
-              <Icon name="shield" size={14} /><span
-                >Every change has a trail. Every merge earns its place.</span
-              >
-            </div>
+                >
+                <span class="review-link">Review work<Icon name="arrow" size={16} /></span>
+              </button>
+            {/if}
+            <ActivityMonitor
+              data={activityData}
+              error={activityError}
+              fetchedAt={activityFetchedAt}
+              {demo}
+              compact
+              oninspect={inspectActivityRun}
+              onrefresh={refreshActivity}
+              onexpand={() => navigate('activity')}
+            />
           </div>
           <aside class="overview-insights">
             <MachinePanel
@@ -680,7 +711,25 @@
             /><QuotaPanel accounts={quota.accounts} compact />
           </aside>
         </div>
-      {:else if page === 'agents' || page === 'review' || page === 'activity'}
+      {:else if page === 'activity'}
+        <div class="page-heading simple">
+          <div>
+            <h1>What Werft is doing.</h1>
+            <p>Follow each task from intake to merge, with the backend in view.</p>
+          </div>
+          <button class="button" onclick={refreshActivity}
+            ><Icon name="refresh" size={16} />Refresh activity</button
+          >
+        </div>
+        <ActivityMonitor
+          data={activityData}
+          error={activityError}
+          fetchedAt={activityFetchedAt}
+          {demo}
+          oninspect={inspectActivityRun}
+          onrefresh={refreshActivity}
+        />
+      {:else if page === 'agents' || page === 'review'}
         <div class="page-heading simple">
           <div>
             <h1>

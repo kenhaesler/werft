@@ -111,3 +111,65 @@ export interface Machine {
     status: string;
   }[];
 }
+
+export interface ActivityWorker {
+  state: 'idle' | 'running' | 'waiting' | 'error';
+  current_operation: { kind: string; key: string } | null;
+  last_started_at: string | null;
+  last_completed_at: string | null;
+  last_error_at: string | null;
+  waiting_until: string | null;
+}
+
+export interface ActivityRun {
+  run_id: string;
+  project_slug: string;
+  issue_number: number;
+  issue_title: string;
+  status: RunStatus;
+  provider: string | null;
+  container_id: string | null;
+  attempt_started_at: string | null;
+  last_heartbeat_at: string | null;
+  lease_expires_at: string | null;
+  hard_deadline_at: string | null;
+  next_attempt_at: string;
+  parked_reason: string | null;
+  updated_at: string;
+}
+
+export interface ActivitySnapshot {
+  generated_at: string;
+  manager: {
+    available: boolean;
+    unavailable_reason?: string | null;
+    started_at: string | null;
+    workers: Record<string, ActivityWorker>;
+    recent_operations: {
+      worker: string;
+      kind: string;
+      key: string;
+      outcome: 'succeeded' | 'failed';
+      started_at: string;
+      completed_at: string;
+      duration_ms: number;
+    }[];
+    live_driver_run_ids: string[];
+  };
+  status_counts: Partial<Record<RunStatus, number>>;
+  recent_events: {
+    id: number;
+    run_id: string;
+    project_slug: string;
+    issue_number: number;
+    issue_title: string;
+    run_status: RunStatus;
+    event_type: string;
+    phase: string | null;
+    from_status: string | null;
+    to_status: string | null;
+    created_at: string;
+  }[];
+  active_runs: ActivityRun[];
+  active_runs_total: number;
+}

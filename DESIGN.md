@@ -2,25 +2,25 @@
 name: Werft
 description: A quiet workstation for supervising agent work and its host environment.
 colors:
-  canvas: "#111312"
-  sidebar: "#151715"
-  panel: "#191c19"
-  panel-hover: "#202520"
-  border: "#2a2f2a"
-  text: "#e7eae7"
-  muted: "#9aa29a"
-  dim: "#848e84"
-  mint: "#b8e5a0"
-  mint-ink: "#172311"
-  amber: "#ddb889"
-  primary-hover: "#cbefb6"
-  button: "#222720"
-  button-text: "#d7dfd2"
-  input: "#141714"
+  canvas: "#f7f9fc"
+  sidebar: "#ffffff"
+  panel: "#ffffff"
+  panel-hover: "#eef4ff"
+  border: "#dce5f0"
+  text: "#172b4d"
+  muted: "#52657e"
+  dim: "#63758c"
+  accent: "#2463eb"
+  accent-ink: "#ffffff"
+  amber: "#97601b"
+  primary-hover: "#1d50c4"
+  button: "#ffffff"
+  button-text: "#344d70"
+  input: "#ffffff"
 typography:
   headline:
     fontFamily: "Geist Variable, sans-serif"
-    fontSize: "clamp(28px, 2.7vw, 39px)"
+    fontSize: "32px"
     fontWeight: 520
     lineHeight: 1.25
     letterSpacing: "-0.035em"
@@ -54,8 +54,8 @@ spacing:
   page-padding: "37px 36px 24px"
 components:
   button-primary:
-    backgroundColor: "{colors.mint}"
-    textColor: "{colors.mint-ink}"
+    backgroundColor: "{colors.accent}"
+    textColor: "{colors.accent-ink}"
     typography: "{typography.button}"
     rounded: "{rounded.control}"
     padding: "{spacing.button-padding}"
@@ -80,28 +80,28 @@ components:
 
 **Creative North Star: "The Agent Workstation"**
 
-A restrained operational workspace with charcoal and olive surfaces, pale sage actions, and warm review signals. Dense supporting information surrounds readable task titles; state and evidence carry more visual weight than decoration. This is a record of the implemented code, not an approved image composition.
+A clear operational workspace with white and cool gray surfaces, focused blue actions, and warm review signals. The overview leads with work requiring human review, then active agents, then recent activity. Machine and quota details are quieter supporting context. The operator approved the logo geometry and lettering; preserve both. This is a record of the implemented code, not an approved image composition.
 
 The design supports an operator supervising approved work. Live observations, illustrative preview data, and unavailable capabilities remain visibly distinct. The source of truth is `dashboard/src/app.css` and the Svelte components; `PRODUCT.md` defines product constraints.
 
 **Key Characteristics:**
 
 - Tonal surfaces with quiet borders.
-- Compact Geist typography and restrained sage emphasis.
+- Compact Geist typography and restrained blue emphasis.
 - Work, review, and machine capacity visible together.
 - Explicit state labels and keyboard access.
 
 ## Colors
 
-The palette combines cool charcoal structure with olive surfaces and soft botanical accents.
+The palette combines cool white surfaces and cool gray structure with precise blue accents.
 
 ### Primary
 
-**Sage (`mint`)** marks primary actions, focus, and selection; its dark ink keeps filled buttons readable. Brighter sage appears on primary hover.
+**Blue (`accent`)** marks primary actions, focus, and selection; its white text keeps filled buttons readable. Deeper blue appears on primary hover.
 
 ### Secondary
 
-**Warm amber** identifies review, pending CI, and quota attention. Review callouts use a subdued brown-olive fill. Failed and parked statuses use muted salmon; running and merging statuses use pale green. Always accompany status color with text.
+**Warm amber** identifies review, pending CI, and quota attention. Review callouts are blue priority callouts with a pale blue fill. Failed and parked statuses use muted salmon; running and merging statuses use ice blue. Always accompany status color with text.
 
 ### Neutral
 
@@ -141,15 +141,17 @@ Small rounded rectangles establish a practical, compact form language. Controls 
 
 ## Components
 
-**Buttons.** Sage primary actions use dark text; secondary actions use an olive fill and outlined edge. Default minimum height is 36px, with a 30px small variant. Danger actions use salmon text and border, with a dark warm hover fill. Disabled controls dim to half opacity and retain native disabled behavior. Icon buttons have explicit accessible names.
+**Buttons.** Blue primary actions use white text; secondary actions use a pale blue fill and outlined edge. Default minimum height is 36px, with a 30px small variant. Danger actions use salmon text and border, with a warm pale hover fill. Disabled controls dim to half opacity and retain native disabled behavior. Icon buttons have explicit accessible names.
 
-**Inputs.** Dark inset fields use a quiet border, sage caret, and sage focus border. Labels accompany form fields; failures appear as readable inline text. All focus-visible elements receive a sage outline (2px) with offset (4px).
+**Inputs.** White inset fields use a quiet border, blue caret, and blue focus border. Labels accompany form fields; failures appear as readable inline text. All focus-visible elements receive a blue outline (2px) with offset (4px).
 
-**Navigation.** Compact rows combine an icon, label, and optional count. The active row gains an olive fill and pale text, with `aria-current="page"`. On mobile, the drawer traps Tab, closes with Escape or its backdrop, restores focus to the trigger, and makes the background inert. The closed drawer is inert as well.
+**Navigation.** Compact rows combine an icon, label, and optional count. The active row gains a pale blue fill and blue text, with `aria-current="page"`. On mobile, the drawer traps Tab, closes with Escape or its backdrop, restores focus to the trigger, and makes the background inert. The closed drawer is inert as well.
 
-**Agent cards and review callout.** Whole-card buttons show status, task title, project, current stage, and compact run metadata. Hover lightens the surface and border. Warm review callouts make human decisions visible without overwhelming active work.
+**Activity rows and review callout.** Task rows show status, title, project, current stage, and runtime metadata. Hover highlights the row. Blue priority callouts make human decisions visible without overwhelming active work.
 
-**Run list and inspector.** Rows open a native modal side panel, up to 640px wide and full viewport height. Timeline, Evidence, and Attempts use buttons with pressed state. Evidence supports authenticated downloads, loading, empty, and error states. Available lifecycle actions follow the run state; a workload is canceled through its run, not by inventing host controls.
+**Run list and inspector.** Rows open a native modal side panel, up to 640px wide and full viewport height. Timeline, Evidence, and Attempts use buttons with pressed state. A selected live run polls while visible and keeps its last successful detail through transient reconnect failures, showing stale status and the last update time. Evidence supports authenticated downloads, loading, empty, and error states. Available lifecycle actions follow the refreshed run state; a workload is canceled through its run, not by inventing host controls.
+
+**Activity monitor.** The activity page polls every three seconds while visible and refreshes immediately when visibility returns. It reports stale data and heartbeat state; process-local worker operations are separate from durable backend run milestones. Live tool stdout is unavailable until it appears in an existing artifact.
 
 **Dialogs and command menu.** Native `dialog.showModal()` provides modal behavior and Escape dismissal. Standard dialogs are 510px wide; command search is 580px, both constrained to the viewport. Ctrl/Cmd+K opens search and focuses its input. Results use Tab and Enter, as the footer states; this is not an arrow-key listbox.
 
@@ -157,7 +159,7 @@ Small rounded rectangles establish a practical, compact form language. Controls 
 
 ## Do's and Don'ts
 
-- **Do** keep primary actions sage, review attention warm, and ordinary surfaces quiet.
+- **Do** keep primary actions and review attention blue, semantic warnings warm, and ordinary surfaces quiet.
 - **Do** pair color with status text, preserve visible focus, and respect reduced motion.
 - **Do** keep preview, live, stale, empty, and unavailable states explicit.
 - **Do** use real run evidence and capacity data to establish hierarchy.
