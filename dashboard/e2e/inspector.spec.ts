@@ -1,5 +1,40 @@
 import { test, expect } from '@playwright/test';
 
+for (const viewport of [
+  { width: 1440, height: 1000 },
+  { width: 390, height: 844 },
+]) {
+  test(`closes an active Session with the close button and Escape at ${viewport.width}px`, async ({
+    page,
+  }) => {
+    const errors: string[] = [];
+    page.on('pageerror', (error) => errors.push(error.message));
+    await page.setViewportSize(viewport);
+    await page.goto('/');
+    const row = page.locator('.session-row').first();
+    await row.locator('summary').click();
+    const opener = row.getByRole('button', { name: 'Open task' });
+    const panel = page.getByRole('dialog', { name: 'Run details' });
+
+    for (const method of ['button', 'escape']) {
+      await opener.click();
+      await panel.getByRole('button', { name: 'Session', exact: true }).click();
+      const output = panel.locator('.session pre');
+      await expect(output).toContainText('Sample session output');
+      expect((await output.innerText()).match(/Sample session output/g)).toHaveLength(1);
+      if (method === 'button') {
+        await panel.getByRole('button', { name: 'Close run details' }).click();
+      } else {
+        await page.keyboard.press('Escape');
+      }
+      await expect(panel).not.toBeVisible();
+      await expect(page.locator('.inspector-dialog .session')).toHaveCount(0);
+      await expect(opener).toBeFocused();
+    }
+    expect(errors).toEqual([]);
+  });
+}
+
 test('task inspector explains the agent and keeps technical evidence behind drilldowns', async ({
   page,
 }) => {
