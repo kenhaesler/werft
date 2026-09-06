@@ -7,7 +7,7 @@ mode they exist for.
 """
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -339,3 +339,191 @@ def test_read_usage_extracts_the_display_only_numbers(spec):
 
 def test_read_usage_is_none_without_an_envelope(spec):
     assert spec.read_usage(None) is None
+
+
+# --- distillation: cleanups over the raw winning diff --------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "5-hour limit reached, resets 6pm",
+        "Opus limit reached · resets 6pm",
+        "You've hit your limit · resets 3pm (Europe/Zurich)",
+    ],
+)
+def test_informal_hard_stop_phrasings_on_a_short_envelope_are_quota_exhausted(spec, text):
+    """The subject before the verb/noun form varies — a window length, a model
+    name, or nothing named at all — and none of that changes that a one-turn
+    envelope with no tool use is a real stop, not an agent's summary."""
+    envelope = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "num_turns": 1,
+        "result": text,
+    }
+    result = spec.classify(envelope=envelope, stderr="", exit_code=0)
+    assert result.outcome == AttemptOutcome.QUOTA_EXHAUSTED, f"missed: {text!r}"
+    assert result.status == ResultStatus.QUOTA_EXHAUSTED
+
+
+def test_a_many_turn_summary_opening_with_limit_words_is_success_with_no_outcome(spec):
+    """`_looks_like_a_stop`'s num_turns gate: a real stop truncates the run at a
+    turn or two with no tool use, so a long run whose summary merely *opens*
+    with limit wording must not be filed as a stop."""
+    envelope = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "num_turns": 18,
+        "result": "Session limit reached is now surfaced to the operator instead of being "
+        "swallowed.",
+    }
+    result = spec.classify(envelope=envelope, stderr="", exit_code=0)
+    assert result.status == ResultStatus.SUCCESS
+    assert result.outcome is None
+
+
+def test_stderr_429_retry_chatter_and_benign_auth_warning_with_success_envelope(spec):
+    """A retry-and-recovered 429 plus a "authentication cache dir not writable"
+    warning are both incidental chatter once the CLI actually finished clean —
+    the clean_success guard, not the stderr text, decides."""
+    stderr = (
+        "API Error (429 rate_limit_error: this request would exceed your "
+        "organization's rate limit) · Retrying in 8 seconds… (attempt 1/10)\n"
+        "warning: authentication cache dir not writable, falling back to memory\n"
+    )
+    envelope = {"type": "result", "subtype": "success", "is_error": False, "result": "Done."}
+    result = spec.classify(envelope=envelope, stderr=stderr, exit_code=0)
+    assert result.status == ResultStatus.SUCCESS
+    assert result.outcome is None
+
+
+def test_same_stderr_on_a_failed_run_with_no_envelope_still_classifies(spec):
+    """Precedence intact: without a clean success envelope, the same stderr text
+    is authoritative again and must classify by its first pattern match rather
+    than falling through to a bare parse failure."""
+    stderr = (
+        "API Error (429 rate_limit_error: this request would exceed your "
+        "organization's rate limit) · Retrying in 8 seconds… (attempt 1/10)\n"
+        "warning: authentication cache dir not writable, falling back to memory\n"
+    )
+    result = spec.classify(envelope=None, stderr=stderr, exit_code=1)
+    assert result.outcome == AttemptOutcome.AUTH_FAILURE
+    assert result.status == ResultStatus.AUTH_FAILURE
+
+
+def test_permission_error_403_is_policy_block(spec):
+    stderr = (
+        'API Error: 403 {"type":"error","error":{"type":"permission_error",'
+        '"message":"Your plan does not include this feature."}}\n'
+    )
+    result = spec.classify(envelope=None, stderr=stderr, exit_code=1)
+    assert result.outcome == AttemptOutcome.POLICY_BLOCK
+    assert result.status == ResultStatus.POLICY_BLOCK
+
+
+def test_revoked_oauth_token_is_auth_failure(spec):
+    result = spec.classify(
+        envelope=None,
+        stderr="OAuth token revoked. Please run /login to re-authenticate.\n",
+        exit_code=1,
+    )
+    assert result.outcome == AttemptOutcome.AUTH_FAILURE
+    assert result.status == ResultStatus.AUTH_FAILURE
+
+
+def test_please_run_docker_login_on_a_failed_run_is_agent_failure_not_auth(spec):
+    """The re-anchored `please run` pattern accepts only the Claude CLI's own
+    prompt (`/login` or `claude login`) — a *different* tool's login
+    instructions must not masquerade as an account credential problem."""
+    result = spec.classify(
+        envelope=None,
+        stderr="failed to pull image: please run docker login\n",
+        exit_code=1,
+    )
+    assert result.outcome == AttemptOutcome.AGENT_FAILURE
+    assert result.outcome != AttemptOutcome.AUTH_FAILURE
+
+
+def test_pipe_epoch_reset_is_an_aware_utc_datetime(spec):
+    """A freshly computed epoch so the assertion never rots: a reset a few
+    minutes from now is exactly the near-term instant the ledger should
+    trust."""
+    epoch = int((datetime.now(UTC) + timedelta(minutes=10)).timestamp())
+    envelope = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "num_turns": 1,
+        "result": f"Claude AI usage limit reached|{epoch}",
+    }
+    result = spec.classify(envelope=envelope, stderr="", exit_code=0)
+    assert result.outcome == AttemptOutcome.QUOTA_EXHAUSTED
+    assert isinstance(result.exhausted_until, datetime)
+    assert result.exhausted_until.tzinfo is not None
+    assert result.exhausted_until.utcoffset() == timedelta(0)
+
+
+def test_a_far_future_epoch_reset_is_still_parsed_as_the_given_instant(spec):
+    """The adapter has no clock of its own to second-guess the epoch against —
+    admission (quota/admission.py) is what decides whether an exhausted_until
+    is still binding by comparing it to its own `now`. So a distant epoch is
+    parsed as-given rather than being silently discarded here."""
+    epoch = int((datetime.now(UTC) + timedelta(days=90)).timestamp())
+    envelope = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "num_turns": 1,
+        "result": f"Claude AI usage limit reached|{epoch}",
+    }
+    result = spec.classify(envelope=envelope, stderr="", exit_code=0)
+    assert result.outcome == AttemptOutcome.QUOTA_EXHAUSTED
+    assert result.exhausted_until == datetime.fromtimestamp(epoch, tz=UTC)
+
+
+def test_an_11_digit_epoch_reset_is_rejected_not_coerced(spec):
+    """The CLI emits exactly seconds (10 digits) or milliseconds (13 digits);
+    an 11-digit run is not a shape it produces and must not be guessed at
+    as either unit."""
+    envelope = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "num_turns": 1,
+        "result": "Claude AI usage limit reached|17540730001",
+    }
+    result = spec.classify(envelope=envelope, stderr="", exit_code=0)
+    assert result.outcome == AttemptOutcome.QUOTA_EXHAUSTED
+    assert result.exhausted_until is None
+
+
+def test_parse_stream_counts_rate_limit_error_spelling_and_bare_429_not_overloaded(spec):
+    lines = [
+        json.dumps({"type": "system", "subtype": "init", "session_id": "s"}),
+        json.dumps(
+            {
+                "type": "system",
+                "subtype": "api_retry",
+                "error": "rate_limit_error",
+                "error_status": 429,
+            }
+        ),
+        json.dumps(
+            {
+                "type": "system",
+                "subtype": "api_retry",
+                "error": "too many requests",
+                "error_status": 429,
+            }
+        ),
+        json.dumps(
+            {"type": "system", "subtype": "api_retry", "error": "overloaded", "error_status": 529}
+        ),
+        json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "Done."}),
+    ]
+    parsed = parse_stream(lines)
+    assert parsed.result is not None
+    assert len(parsed.rate_limit_signals) == 2
